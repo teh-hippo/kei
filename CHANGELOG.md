@@ -9,9 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [0.13.2] - 2026-05-03
+
+### Added
+
+- **`[download.retry] max_download_attempts` TOML key.** Mirrors the existing `--max-download-attempts` CLI flag (default `10`, lifetime cap across syncs). `0` disables the cap. Resolution order matches every other config key: CLI > TOML > default. ([#344])
+- **`kei list --library` is now repeatable and accepts the v0.13 selector grammar.** `kei sync --library` already took multi-value `primary` / `shared` / `all` / raw zone names / `!name` exclusions; `kei list --library` was typed `Option<String>`, so a second flag silently won and users couldn't list across multiple libraries. Both `kei list albums` and `kei list libraries` accept the same grammar. ([#344])
+
+### Changed
+
+- **`kei status --failed` and `kei status --pending` now stream pages instead of loading every matching row.** `kei status --downloaded` already paginated; the inconsistency approached OOM on libraries with 100k pending or failed assets. On-screen output is unchanged. ([#344])
+- **State DB schema migrates v9 -> v10 on first sync.** Adds `enumeration_errors INTEGER NOT NULL DEFAULT 0` to `sync_runs`; existing rows backfill to `0` (they predate the counter). One-way, idempotent on re-entry. ([#337])
+
 ### Deprecated
 
-- **`[metrics]` TOML section and `KEI_METRICS_PORT` env var.** Both are folded into `[server]` (TOML) and `KEI_HTTP_PORT` (env). The deprecation warning for `[metrics]` has shipped since v0.13.0; pre-fix it only fired when `[metrics] port` was actually being used to resolve `http_port`, so a config with both `[server]` and `[metrics]` set kept `[metrics]` silently around. The `KEI_METRICS_PORT` env var has the same problem and now warns whenever it is set, even if a higher-precedence value (CLI / `[server]` TOML / `KEI_HTTP_PORT`) wins. Both surfaces are scheduled for removal in v0.20.0; rename `[metrics]` to `[server]` and `KEI_METRICS_PORT` to `KEI_HTTP_PORT` to clear the warnings.
+- **`[metrics]` TOML section and `KEI_METRICS_PORT` env var.** Both are folded into `[server]` (TOML) and `KEI_HTTP_PORT` (env). The deprecation warning for `[metrics]` has shipped since v0.13.0; pre-fix it only fired when `[metrics] port` was actually being used to resolve `http_port`, so a config with both `[server]` and `[metrics]` set kept `[metrics]` silently around. The `KEI_METRICS_PORT` env var had the same gap. Both warnings now fire whenever the deprecated input is set, even when shadowed by a higher-precedence value (CLI / `[server]` TOML / `KEI_HTTP_PORT`). Removal target: v0.20.0; rename `[metrics]` to `[server]` and `KEI_METRICS_PORT` to `KEI_HTTP_PORT` to clear the warnings. ([#344])
+
+### Fixed
+
+- **`fetch_folders` now follows CloudKit's `continuationMarker` so accounts with >200 user albums no longer silently lose the tail.** CloudKit `records/query` defaults to `resultsLimit=200` and returns a `continuationMarker` when more records exist; pre-fix `fetch_folders` issued one POST and trusted the response was complete. Tail-album members routed into the unfiled pass instead of `{album}` paths, `--album all '!TailAlbum'` exclusions bailed "Excluded album not found" even when the album existed in iCloud, and the truncation replayed every cycle. The loop is capped at 64 pages (~12,800 albums) with a warn on cap-fire so a server pathology stays loud. ([#336])
+- **`--smart-folder` against a shared-only library set now bails at startup instead of running silently.** CloudKit shared zones don't expose smart folders, so `--library shared --smart-folder Favorites` previously warn-and-skipped every smart-folder pass and exited 0. Users looked at primary-library Favorites and assumed shared-Favorites came along. A pre-flight in `sync_loop` now bails when the resolved library set has zero zones that support smart folders AND `--smart-folder` is set. Mixed sets (primary + shared) still pass through: primary handles smart folders, shared zones' lack of smart-folder passes is documented and expected. ([#336])
+- **Atomic install now fsyncs the parent directory after rename.** ext4 default `data=ordered` doesn't guarantee directory entry durability after `rename` returns Ok; a power loss between rename and the kernel committing the dir block could leave the file absent on reboot. The credentials and session-file path already did this; the data path was strictly weaker. `rename_part_to_final` now mirrors the pattern (warn-and-continue on fsync failure, since worst case is one redundant re-download next sync). ([#337])
+- **`log_sync_summary` now surfaces `enumeration_errors`.** The error-counters line previously printed EXIF write failure(s) and state write failure(s) but skipped enumeration errors, so an operator chasing exit code 2 from a `PartialFailure` driven purely by enumeration errors saw no count. Line two of the summary now appends "Z enumeration error(s)" when nonzero. ([#337])
+- **`kei <sync-only-flag> <non-sync-subcommand>` now errors instead of silently running the subcommand with the flag swallowed.** `kei` accepts a bare invocation as shorthand for `kei sync`, so sync flags like `--skip-videos` are wired at the top level. clap then accepted `kei --skip-videos=true status`: the flag was consumed, the status command ran, and the user thought their flag had been honored. Same trap applied to every top-level sync flag (download paths, threads, dry-run, the deprecated `--auth-only` / `--list-albums` aliases). The new validator names every offender. Bare `kei`, `kei sync`, and `kei retry-failed` continue to accept the flags. ([#343])
+- **`kei reset sync-token` now requires confirmation.** A typo or muscle memory after `reset state` could clear the sync token on a 100k-asset library and force a full re-enumeration on the next sync. `reset state` shipped `--yes` plus a TTY prompt; `reset sync-token` shipped neither. Now prompts on a TTY (warning that the next sync re-enumerates every asset) and errors under non-interactive use without `--yes`. The hidden legacy alias `kei reset-sync-token` keeps its auto-confirm behavior so shell scripts and Docker callers don't break before the v0.20 removal. ([#343])
+
+[#336]: https://github.com/rhoopr/kei/pull/336
+[#337]: https://github.com/rhoopr/kei/pull/337
+[#343]: https://github.com/rhoopr/kei/pull/343
+[#344]: https://github.com/rhoopr/kei/pull/344
 
 ---
 
