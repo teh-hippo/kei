@@ -6,6 +6,7 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 #[cfg(unix)]
 use anyhow::Context;
@@ -15,7 +16,24 @@ use crate::systemd::SystemdNotifier;
 
 /// How long to wait for graceful shutdown before force-exiting.
 /// Aligned with `stop_grace_period` in docker-compose.yml.
-const GRACEFUL_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The exit code emitted when graceful shutdown drains exceed the
+/// timeout. 130 matches the conventional "killed by SIGINT" code so
+/// shell users see a familiar number instead of a kei-specific one.
+const FORCE_EXIT_CODE: i32 = 130;
+
+/// Wait `timeout`, then invoke `on_timeout` with [`FORCE_EXIT_CODE`].
+/// The warn line is part of the contract: an operator chasing a
+/// SIGKILL'd run greps for it.
+pub(crate) async fn wait_then_force_exit<F>(timeout: Duration, on_timeout: F)
+where
+    F: FnOnce(i32),
+{
+    tokio::time::sleep(timeout).await;
+    tracing::warn!("Graceful shutdown timed out, forcing exit");
+    on_timeout(FORCE_EXIT_CODE);
+}
 
 /// Install signal handlers and return a [`CancellationToken`] that is
 /// cancelled on the first SIGINT / SIGTERM / SIGHUP.  A second signal
@@ -72,14 +90,12 @@ pub(crate) fn install_signal_handler(
                 // dead CDN connection). Matches docker-compose
                 // stop_grace_period so the app exits cleanly before Docker
                 // sends SIGKILL.
-                tokio::spawn(async {
-                    tokio::time::sleep(GRACEFUL_SHUTDOWN_TIMEOUT).await;
-                    tracing::warn!("Graceful shutdown timed out, forcing exit");
-                    std::process::exit(130);
-                });
+                tokio::spawn(wait_then_force_exit(GRACEFUL_SHUTDOWN_TIMEOUT, |code| {
+                    std::process::exit(code)
+                }));
             } else {
                 tracing::warn!("Force exit requested");
-                std::process::exit(130);
+                std::process::exit(FORCE_EXIT_CODE);
             }
         }
     });
@@ -112,5 +128,48 @@ mod tests {
         let notifier = SystemdNotifier::new(false);
         let token = install_signal_handler(notifier).unwrap();
         assert!(!token.is_cancelled());
+    }
+
+    /// `start_paused = true` lets tokio auto-advance the clock when
+    /// nothing else can make progress, so awaiting the helper runs the
+    /// sleep to completion without wall-clock delay.
+    #[tracing_test::traced_test]
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_grace_period_elapses_invokes_exit_callback() {
+        let exited: Arc<std::sync::Mutex<Option<i32>>> = Arc::new(std::sync::Mutex::new(None));
+        let exited_clone = Arc::clone(&exited);
+
+        wait_then_force_exit(Duration::from_secs(30), move |code| {
+            *exited_clone.lock().unwrap() = Some(code);
+        })
+        .await;
+
+        assert_eq!(*exited.lock().unwrap(), Some(FORCE_EXIT_CODE));
+        assert!(
+            logs_contain("Graceful shutdown timed out"),
+            "warn line must accompany the timeout fire so operators can grep for it"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_then_force_exit_does_not_fire_before_timeout() {
+        let exited: Arc<std::sync::Mutex<Option<i32>>> = Arc::new(std::sync::Mutex::new(None));
+        let exited_clone = Arc::clone(&exited);
+
+        let handle = tokio::spawn(wait_then_force_exit(Duration::from_secs(30), move |code| {
+            *exited_clone.lock().unwrap() = Some(code);
+        }));
+
+        tokio::time::advance(Duration::from_secs(15)).await;
+        assert_eq!(
+            *exited.lock().unwrap(),
+            None,
+            "callback must not fire before the configured timeout elapses"
+        );
+
+        // Drain the rest so the spawned task completes cleanly.
+        tokio::time::advance(Duration::from_secs(20)).await;
+        handle.await.unwrap();
+        assert_eq!(*exited.lock().unwrap(), Some(FORCE_EXIT_CODE));
     }
 }

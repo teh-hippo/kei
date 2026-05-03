@@ -54,6 +54,18 @@ struct LibraryState {
 /// data dir the next time it's used.
 const SHARED_LIBRARY_NOTICE_KEY: &str = "shared_library_notice_shown_v1";
 
+/// Metadata key holding the SHA-256 of the enumeration-affecting subset of
+/// the user's download config. Distinct from the path-affecting
+/// `config_hash` consumed by the download pipeline; using a single key for
+/// both would cause each cycle to overwrite the other's value and
+/// permanently invalidate incremental sync.
+const ENUM_CONFIG_HASH_KEY: &str = "enum_config_hash";
+
+/// Prefix for every per-zone CloudKit sync token row in the metadata
+/// table. Cleared en masse when [`ENUM_CONFIG_HASH_KEY`] changes so the
+/// next cycle falls back to full enumeration.
+const SYNC_TOKEN_PREFIX: &str = "sync_token:";
+
 /// Classify whether an error from `init_photos_service` or
 /// `resolve_libraries` indicates a stale session / routing state that
 /// an SRP re-auth would fix.
@@ -1286,6 +1298,55 @@ type BuildDownloadConfigFn<'a> = dyn Fn(
     ) -> Arc<download::DownloadConfig>
     + 'a;
 
+/// Outcome of [`check_and_persist_enum_config_hash`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnumConfigHashOutcome {
+    /// No prior hash; current hash persisted. Sync tokens left alone:
+    /// a first-run DB must not invalidate tokens another process may
+    /// have written.
+    Initial,
+    Unchanged,
+    /// Hash drifted; sync tokens cleared and new hash persisted so the
+    /// next cycle falls back to full enumeration.
+    Changed,
+}
+
+/// Compare the current download-config hash against the one stored in
+/// the state DB and react to drift. Storage failures are logged at warn
+/// and swallowed (a partial write here can't corrupt the user's data;
+/// next cycle re-tries).
+pub(crate) async fn check_and_persist_enum_config_hash(
+    db: &dyn state::StateDb,
+    current_hash: &str,
+) -> EnumConfigHashOutcome {
+    let stored_hash = db.get_metadata(ENUM_CONFIG_HASH_KEY).await.unwrap_or(None);
+    let outcome = match stored_hash.as_deref() {
+        Some(h) if h == current_hash => return EnumConfigHashOutcome::Unchanged,
+        Some(_) => EnumConfigHashOutcome::Changed,
+        None => EnumConfigHashOutcome::Initial,
+    };
+
+    if matches!(outcome, EnumConfigHashOutcome::Changed) {
+        tracing::info!("Download config changed since last sync, clearing sync tokens");
+        match db.delete_metadata_by_prefix(SYNC_TOKEN_PREFIX).await {
+            Ok(n) if n > 0 => {
+                tracing::debug!(cleared = n, "Cleared stale sync tokens");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to clear sync tokens"
+                );
+            }
+            _ => {}
+        }
+    }
+    if let Err(e) = db.set_metadata(ENUM_CONFIG_HASH_KEY, current_hash).await {
+        tracing::warn!(error = %e, "Failed to persist enum_config_hash");
+    }
+    outcome
+}
+
 /// Run one sync cycle: iterate all libraries, download photos, store sync tokens.
 async fn run_cycle(
     library_states: &[LibraryState],
@@ -1315,49 +1376,27 @@ async fn run_cycle(
         );
     }
 
+    // Check if the download config changed since last sync. If so, clear
+    // sync tokens so the subsequent lookup falls back to full enumeration
+    // -- the stored incremental token would miss assets that are newly
+    // eligible under the changed config (e.g. a user switching --size or
+    // adding --skip-videos). The hash is cycle-invariant across libraries,
+    // so this runs once per cycle, not once per library.
+    //
+    // The metadata key `enum_config_hash` is distinct from the download
+    // pipeline's `config_hash` (which tracks path-affecting fields only).
+    // Using a single key for both would cause the two hashes to overwrite
+    // each other every cycle, permanently preventing incremental sync.
+    if !config.dry_run {
+        if let Some(db) = state_db {
+            let config_hash = download::compute_config_hash(config);
+            let _ = check_and_persist_enum_config_hash(db, &config_hash).await;
+        }
+    }
+
     for lib_state in library_states {
         if shutdown_token.is_cancelled() {
             break;
-        }
-
-        // Check if the download config changed since last sync. If so,
-        // clear sync tokens so the subsequent lookup falls back to full
-        // enumeration -- the stored incremental token would miss assets
-        // that are newly eligible under the changed config (e.g. a
-        // user switching --size or adding --skip-videos).
-        if !config.dry_run {
-            if let Some(db) = state_db {
-                // Use a separate key from the download-path's "config_hash"
-                // (which tracks path-affecting fields only). This hash is a
-                // superset that also includes enumeration filters (albums,
-                // library, skip_live_photos). Using the same key would cause
-                // the two hashes to overwrite each other every cycle,
-                // permanently preventing incremental sync.
-                let config_hash = download::compute_config_hash(config);
-                let stored_hash = db.get_metadata("enum_config_hash").await.unwrap_or(None);
-                if stored_hash.as_deref() != Some(&config_hash) {
-                    if stored_hash.is_some() {
-                        tracing::info!(
-                            "Download config changed since last sync, clearing sync tokens"
-                        );
-                        match db.delete_metadata_by_prefix("sync_token:").await {
-                            Ok(n) if n > 0 => {
-                                tracing::debug!(cleared = n, "Cleared stale sync tokens");
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "Failed to clear sync tokens"
-                                );
-                            }
-                            _ => {}
-                        }
-                    }
-                    if let Err(e) = db.set_metadata("enum_config_hash", &config_hash).await {
-                        tracing::warn!(error = %e, "Failed to persist enum_config_hash");
-                    }
-                }
-            }
         }
 
         // Determine sync mode per-library
@@ -3732,5 +3771,95 @@ mod tests {
         let err: anyhow::Error = anyhow::anyhow!("network unreachable");
         assert!(!should_wait_for_2fa(false, &err));
         assert!(!should_wait_for_2fa(true, &err));
+    }
+
+    // ── check_and_persist_enum_config_hash ─────────────────────────────
+
+    #[tokio::test]
+    async fn enum_config_hash_initial_persists_only() {
+        let db = state::SqliteStateDb::open_in_memory().expect("open in-memory state DB");
+        db.set_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"), "tok-abc")
+            .await
+            .expect("set token");
+
+        let outcome = check_and_persist_enum_config_hash(&db, "hash-1").await;
+
+        assert_eq!(outcome, EnumConfigHashOutcome::Initial);
+        assert_eq!(
+            db.get_metadata(ENUM_CONFIG_HASH_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("hash-1"),
+        );
+        // First run must NOT clear pre-existing sync tokens.
+        assert_eq!(
+            db.get_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("tok-abc"),
+        );
+    }
+
+    #[tokio::test]
+    async fn enum_config_hash_drift_clears_tokens_and_persists() {
+        let db = state::SqliteStateDb::open_in_memory().expect("open in-memory state DB");
+        db.set_metadata(ENUM_CONFIG_HASH_KEY, "old-hash")
+            .await
+            .expect("seed old hash");
+        db.set_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"), "tok-primary")
+            .await
+            .expect("seed primary token");
+        db.set_metadata(
+            &format!("{SYNC_TOKEN_PREFIX}SharedSync-AAAA1111"),
+            "tok-shared",
+        )
+        .await
+        .expect("seed shared token");
+
+        let outcome = check_and_persist_enum_config_hash(&db, "new-hash").await;
+
+        assert_eq!(outcome, EnumConfigHashOutcome::Changed);
+        assert_eq!(
+            db.get_metadata(ENUM_CONFIG_HASH_KEY)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("new-hash"),
+        );
+        // Every sync_token:* row must clear, including shared zones.
+        assert!(db
+            .get_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(db
+            .get_metadata(&format!("{SYNC_TOKEN_PREFIX}SharedSync-AAAA1111"))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn enum_config_hash_unchanged_is_noop() {
+        let db = state::SqliteStateDb::open_in_memory().expect("open in-memory state DB");
+        db.set_metadata(ENUM_CONFIG_HASH_KEY, "stable-hash")
+            .await
+            .expect("seed stable hash");
+        db.set_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"), "tok-keep")
+            .await
+            .expect("seed token");
+
+        let outcome = check_and_persist_enum_config_hash(&db, "stable-hash").await;
+
+        assert_eq!(outcome, EnumConfigHashOutcome::Unchanged);
+        assert_eq!(
+            db.get_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("tok-keep"),
+        );
     }
 }
