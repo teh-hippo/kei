@@ -88,6 +88,12 @@ pub(crate) struct TomlRetry {
     /// Deprecated v0.13: initial retry delay is now derived from
     /// `max_retries` via a smart table. Removed in v0.20.
     pub delay: Option<u64>,
+    /// Lifetime cap on download attempts per asset across syncs (default
+    /// `10`). The same value as the `--max-download-attempts` CLI flag /
+    /// `KEI_MAX_DOWNLOAD_ATTEMPTS` env var; CLI > TOML > default. Distinct
+    /// from `max_retries`, which only caps retries within a single
+    /// download. `0` disables the cap.
+    pub max_download_attempts: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -697,6 +703,11 @@ pub struct Config {
     // 4-byte primitives
     pub recent: Option<u32>,
     pub max_retries: u32,
+    /// Lifetime cap on download attempts per asset across syncs. `0`
+    /// disables the cap. Resolved CLI > TOML `[download.retry]
+    /// max_download_attempts` > 10. Distinct from `max_retries`, which
+    /// only caps retries within a single download.
+    pub max_download_attempts: u32,
 
     // 8-byte primitives (cont.)
     pub bandwidth_limit: Option<u64>,
@@ -1427,6 +1438,15 @@ impl Config {
             max_retries <= 100,
             "retry max_retries must be <= 100, got {max_retries}"
         );
+        // Lifetime cap on download attempts per asset (0 disables). CLI >
+        // TOML > 10, matching every other resolved value. The runtime
+        // skip check in download::pipeline::process_asset short-circuits
+        // when this is 0, so 0 is a valid (cap-off) sentinel.
+        let max_download_attempts = resolve(
+            sync.max_download_attempts,
+            toml_retry.and_then(|r| r.max_download_attempts),
+            10,
+        );
         // Retry delay is now derived from `max_retries` via a smart table
         // (higher max => more patient initial delay). `--retry-delay` and
         // `[download.retry] delay` are deprecated; setting either still
@@ -1719,27 +1739,34 @@ impl Config {
         // HTTP server port — CLI > [server] TOML > [metrics] TOML (deprecated) > KEI_METRICS_PORT
         // env (deprecated) > default 9090.
         const DEFAULT_HTTP_PORT: u16 = 9090;
+        // Warn early when the deprecated env var is set, regardless of
+        // whether a higher-precedence value shadows it. Pre-fix the
+        // warning only fired in the env-var arm of the `or_else` chain,
+        // so a user who set both `KEI_HTTP_PORT` and `KEI_METRICS_PORT`
+        // got no signal that their `KEI_METRICS_PORT` was being silently
+        // ignored. Same pattern we use for the `[metrics]` TOML section
+        // below.
+        let kei_metrics_port_env = std::env::var("KEI_METRICS_PORT").ok();
+        if kei_metrics_port_env.is_some() {
+            tracing::warn!(
+                "KEI_METRICS_PORT is deprecated and will be removed in v0.20.0; \
+                 use KEI_HTTP_PORT instead"
+            );
+        }
+        if toml_metrics.and_then(|m| m.port).is_some() {
+            tracing::warn!(
+                "[metrics] port in TOML is deprecated and will be removed in v0.20.0; \
+                 rename the section to [server]"
+            );
+        }
         let http_port = sync
             .http_port
             .or_else(|| toml_server.and_then(|s| s.port))
+            .or_else(|| toml_metrics.and_then(|m| m.port))
             .or_else(|| {
-                toml_metrics.and_then(|m| m.port).inspect(|_port| {
-                    tracing::warn!(
-                        "[metrics] port in TOML is deprecated and will be removed in v0.20.0; \
-                         rename the section to [server]"
-                    );
-                })
-            })
-            .or_else(|| {
-                std::env::var("KEI_METRICS_PORT")
-                    .ok()
+                kei_metrics_port_env
+                    .as_deref()
                     .and_then(|v| v.parse::<u16>().ok())
-                    .inspect(|_port| {
-                        tracing::warn!(
-                            "KEI_METRICS_PORT is deprecated and will be removed in v0.20.0; \
-                             use KEI_HTTP_PORT instead"
-                        );
-                    })
             })
             .unwrap_or(DEFAULT_HTTP_PORT);
 
@@ -1808,6 +1835,7 @@ impl Config {
             reconcile_every_n_cycles,
             recent,
             max_retries,
+            max_download_attempts,
             bandwidth_limit,
             threads_num,
             size,
@@ -1934,6 +1962,15 @@ impl Config {
                         None
                     } else {
                         Some(self.retry_delay_secs)
+                    },
+                    // Emit `max_download_attempts` only when the user has
+                    // overridden the default of 10. Keeps the round-trip
+                    // clean for the common case and surfaces explicit
+                    // overrides in `kei config show`.
+                    max_download_attempts: if self.max_download_attempts == 10 {
+                        None
+                    } else {
+                        Some(self.max_download_attempts)
                     },
                 }),
             }),
@@ -4241,6 +4278,138 @@ mod tests {
         assert_eq!(config.http_port, 8080);
     }
 
+    /// Serialize KEI_METRICS_PORT env var across the deprecation tests so
+    /// they don't race each other or leak state. Mirrors the
+    /// `scrub_auth_env` pattern in `cli.rs`.
+    fn scrub_metrics_port_env() -> MetricsPortEnvGuard {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("KEI_METRICS_PORT").ok();
+        // SAFETY: the static mutex serializes every other caller of
+        // scrub_metrics_port_env; the suite does not read this env var
+        // from a separate thread.
+        unsafe {
+            std::env::remove_var("KEI_METRICS_PORT");
+        }
+        MetricsPortEnvGuard { _lock: guard, prev }
+    }
+
+    struct MetricsPortEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev: Option<String>,
+    }
+
+    impl Drop for MetricsPortEnvGuard {
+        fn drop(&mut self) {
+            if let Some(v) = self.prev.take() {
+                // SAFETY: still holding the static mutex; restoration is
+                // exclusive under the same "no cross-thread readers" rule.
+                unsafe {
+                    std::env::set_var("KEI_METRICS_PORT", v);
+                }
+            } else {
+                // SAFETY: same as above.
+                unsafe {
+                    std::env::remove_var("KEI_METRICS_PORT");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_kei_metrics_port_env_warns_when_set_even_if_shadowed() {
+        // KEI_METRICS_PORT is set, but [server] port wins. Pre-fix the
+        // warning was inside the env-var arm of the or_else chain so it
+        // never fired in this case; users had no signal that their
+        // KEI_METRICS_PORT was being silently ignored.
+        let _guard = scrub_metrics_port_env();
+        // SAFETY: the guard above holds the static lock for the duration
+        // of this test, so no other thread is reading the env var.
+        unsafe {
+            std::env::set_var("KEI_METRICS_PORT", "9999");
+        }
+        let toml_str = r#"
+            [auth]
+            username = "user@example.com"
+            [download]
+            directory = "/photos"
+            [server]
+            port = 9090
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let config = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
+        // [server] port still wins.
+        assert_eq!(config.http_port, 9090);
+        // ...but the deprecation warning fires anyway.
+        assert!(
+            logs_contain("KEI_METRICS_PORT is deprecated"),
+            "deprecation warning should fire whenever KEI_METRICS_PORT is set"
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_kei_metrics_port_env_resolves_when_no_higher_value() {
+        // No CLI / [server] / [metrics] value: env var still wins, with a
+        // warning. Confirms the migration path stays usable for one minor
+        // cycle while users move to KEI_HTTP_PORT.
+        let _guard = scrub_metrics_port_env();
+        // SAFETY: the guard above holds the static lock for the duration
+        // of this test, so no other thread is reading the env var.
+        unsafe {
+            std::env::set_var("KEI_METRICS_PORT", "8765");
+        }
+        let config = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(config.http_port, 8765);
+        assert!(logs_contain("KEI_METRICS_PORT is deprecated"));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_metrics_toml_warns_even_when_shadowed_by_server() {
+        // [metrics] port is shadowed by [server] port; the deprecation
+        // warning still fires so config-driven users learn that the
+        // section is on its way out.
+        let _guard = scrub_metrics_port_env();
+        let toml_str = r#"
+            [auth]
+            username = "user@example.com"
+            [download]
+            directory = "/photos"
+            [server]
+            port = 9090
+            [metrics]
+            port = 9999
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let config = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
+        assert_eq!(config.http_port, 9090);
+        assert!(
+            logs_contain("[metrics] port in TOML is deprecated"),
+            "deprecation warning should fire whenever [metrics] port is set"
+        );
+    }
+
     #[test]
     fn test_default_http_port() {
         // Without any explicit config, http_port should be 9090.
@@ -4653,6 +4822,99 @@ mod tests {
         let cfg =
             Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
         assert_eq!(cfg.max_retries, 10);
+    }
+
+    #[test]
+    fn test_build_max_download_attempts_default() {
+        // Neither CLI nor TOML set: hardcoded fallback of 10 fires.
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(cfg.max_download_attempts, 10);
+    }
+
+    #[test]
+    fn test_build_max_download_attempts_from_toml() {
+        // TOML-only: resolved value matches the TOML setting.
+        let toml_str = r#"
+            [download.retry]
+            max_download_attempts = 25
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
+        assert_eq!(cfg.max_download_attempts, 25);
+    }
+
+    #[test]
+    fn test_build_max_download_attempts_cli_overrides_toml() {
+        // CLI flag wins over TOML, mirroring every other resolved value.
+        let toml_str = r#"
+            [download.retry]
+            max_download_attempts = 25
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let mut sync = default_sync();
+        sync.max_download_attempts = Some(7);
+        let cfg =
+            Config::build(&default_globals(), &default_password(), sync, Some(&toml)).unwrap();
+        assert_eq!(cfg.max_download_attempts, 7);
+    }
+
+    #[test]
+    fn test_build_max_download_attempts_zero_disables_cap() {
+        // `0` is the documented "disable the cap" sentinel; resolution
+        // must accept it through TOML the same as through CLI.
+        let toml_str = r#"
+            [download.retry]
+            max_download_attempts = 0
+        "#;
+        let toml: TomlConfig = toml::from_str(toml_str).unwrap();
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            Some(&toml),
+        )
+        .unwrap();
+        assert_eq!(cfg.max_download_attempts, 0);
+    }
+
+    #[test]
+    fn test_to_toml_omits_default_max_download_attempts() {
+        // Default 10 is elided from the round-trip so config dumps stay
+        // clean for the common case.
+        let cfg = Config::build(
+            &default_globals(),
+            &default_password(),
+            default_sync(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(cfg.max_download_attempts, 10);
+        let toml = cfg.to_toml();
+        let retry = toml.download.unwrap().retry.unwrap();
+        assert_eq!(retry.max_download_attempts, None);
+    }
+
+    #[test]
+    fn test_to_toml_includes_non_default_max_download_attempts() {
+        // User overrides round-trip back into the dump.
+        let mut sync = default_sync();
+        sync.max_download_attempts = Some(42);
+        let cfg = Config::build(&default_globals(), &default_password(), sync, None).unwrap();
+        let toml = cfg.to_toml();
+        let retry = toml.download.unwrap().retry.unwrap();
+        assert_eq!(retry.max_download_attempts, Some(42));
     }
 
     #[test]
@@ -6573,6 +6835,43 @@ mod tests {
 
         let content = std::fs::read_to_string(&config_path).unwrap();
         assert!(!content.contains("secret123"));
+    }
+
+    /// Regression guard: even when the resolved Config got its
+    /// `cookie_directory` from the deprecated `[auth] cookie_directory`
+    /// TOML key, `persist_first_run_config` (and `Config::to_toml` under
+    /// it) must never echo the deprecated key back out. Pairs with
+    /// `setup::tests::test_generate_toml_*` to cover both wizard-generated
+    /// and auto-persisted first-run configs.
+    #[test]
+    fn test_persist_first_run_never_emits_deprecated_cookie_directory() {
+        let (td, config_path) = persist_test_dir("no_cookie_directory");
+
+        // Build a config with cookie_directory explicitly set, the way
+        // `--cookie-directory /some/path` or `[auth] cookie_directory`
+        // would land it in the resolved Config. Use a writable temp dir
+        // because `Config::build` actually creates `cookie_directory`.
+        let cookie_dir = td.path().join("legacy_cookies");
+        let mut globals = default_globals();
+        globals.username = Some("test@example.com".to_string());
+        globals.cookie_directory = Some(cookie_dir.to_string_lossy().to_string());
+        let mut sync = default_sync();
+        sync.directory = Some("/photos".to_string());
+        let config = Config::build(&globals, &default_password(), sync, None).unwrap();
+
+        persist_first_run_config(&config_path, &config, None).unwrap();
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        // Strip comment lines to avoid false positives on hint comments.
+        let active: String = content
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !active.contains("cookie_directory"),
+            "persisted config must not emit deprecated [auth].cookie_directory; got:\n{content}"
+        );
     }
 
     #[test]
