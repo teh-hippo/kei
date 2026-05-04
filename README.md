@@ -18,7 +18,7 @@
 - Parallel downloads with incremental sync (seconds on large libraries after the first run)
 - Resumable transfers verified by size and content hash
 - Watch mode, systemd integration, headless 2FA, Docker-ready
-- iCloud Photos supported today. Google Takeout and Immich next.
+- iCloud Photos supported today. NextCloud, Immich, Ente, and Google Takeout next.
 
 ---
 
