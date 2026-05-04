@@ -38,8 +38,6 @@
 > | `--folder-structure-albums` | `{album}` |
 > | `--folder-structure-smart-folders` | `{smart-folder}` |
 
-> [!TIP]
-> Coming from `icloudpd`? The [Migration Guide](docs/migration-from-python.md) shows how to `kei sync` without re-downloading.
 
 ---
 
@@ -69,6 +67,9 @@ kei sync -u you@example.com -d ~/Photos/iCloud --save-password
 You'll be prompted for your password, then asked to approve 2FA on a trusted device. Downloads start right after. After the first run, just `kei sync` - username, directory, and password are all remembered.
 
 For a guided walkthrough, run `kei config setup` instead.
+
+> [!TIP]
+> Coming from `icloudpd`? The [Migration Guide](docs/migration-from-python.md) shows how to `kei sync` without re-downloading.
 
 ---
 
