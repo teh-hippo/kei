@@ -588,10 +588,14 @@ impl PhotoAlbum {
                         return;
                     }
                 };
-                tracing::debug!(
+                // Body emitted at TRACE only -- pretty-printing it at DEBUG
+                // ran `serde_json::to_string_pretty` per page (~MB allocation)
+                // because tracing field expressions are evaluated eagerly.
+                tracing::debug!(album = %name, "Fetcher response");
+                tracing::trace!(
                     album = %name,
-                    response = %serde_json::to_string_pretty(&response).unwrap_or_default(),
-                    "Fetcher response"
+                    response = %response,
+                    "Fetcher response body",
                 );
 
                 let query: super::cloudkit::QueryResponse = match serde_json::from_value(response) {

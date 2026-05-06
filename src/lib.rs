@@ -78,22 +78,27 @@ impl<W: std::io::Write> std::io::Write for RedactingWriter<W> {
             .password
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(pw) = &*password {
-            let pw_str = pw.expose_secret();
-            if !pw_str.is_empty() {
-                // A buffer shorter than the password can't contain it,
-                // avoiding the lossy UTF-8 conversion for short log fragments.
-                if buf.len() >= pw_str.len() {
-                    let s = String::from_utf8_lossy(buf);
-                    if s.contains(pw_str) {
-                        let redacted = s.replace(pw_str, "********");
-                        self.inner.write_all(redacted.as_bytes())?;
-                        return Ok(buf.len());
-                    }
-                }
-            }
+
+        // Fast path: short-circuit before allocating a `String`. Under
+        // trace-level logging the redaction path runs on every event,
+        // and `String::from_utf8_lossy` per event dominates the heap churn.
+        let Some(pw) = &*password else {
+            self.inner.write_all(buf)?;
+            return Ok(buf.len());
+        };
+        let pw_bytes = pw.expose_secret().as_bytes();
+        if pw_bytes.is_empty() || buf.len() < pw_bytes.len() {
+            self.inner.write_all(buf)?;
+            return Ok(buf.len());
         }
-        self.inner.write_all(buf)?;
+        if memchr::memmem::find(buf, pw_bytes).is_none() {
+            self.inner.write_all(buf)?;
+            return Ok(buf.len());
+        }
+
+        let s = String::from_utf8_lossy(buf);
+        let redacted = s.replace(pw.expose_secret(), "********");
+        self.inner.write_all(redacted.as_bytes())?;
         Ok(buf.len())
     }
 
@@ -102,17 +107,19 @@ impl<W: std::io::Write> std::io::Write for RedactingWriter<W> {
     }
 }
 
-/// A `MakeWriter` implementation that produces `RedactingWriter` instances.
+/// A `MakeWriter` implementation that produces `RedactingWriter` instances
+/// fronting the non-blocking channel that wraps stderr.
 struct RedactingMakeWriter {
     password: Arc<std::sync::Mutex<Option<SecretString>>>,
+    inner: tracing_appender::non_blocking::NonBlocking,
 }
 
 impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RedactingMakeWriter {
-    type Writer = RedactingWriter<std::io::Stderr>;
+    type Writer = RedactingWriter<tracing_appender::non_blocking::NonBlocking>;
 
     fn make_writer(&'a self) -> Self::Writer {
         RedactingWriter {
-            inner: std::io::stderr(),
+            inner: self.inner.clone(),
             password: Arc::clone(&self.password),
         }
     }
@@ -490,13 +497,36 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     // starts as None and is populated once the password is known.
     let redact_password: Arc<std::sync::Mutex<Option<SecretString>>> =
         Arc::new(std::sync::Mutex::new(None));
+
+    // Non-blocking writer with `lossy(true)`: when the consumer of stderr
+    // (Docker stdout pipe, screen PTY, journald) drains slower than events
+    // are emitted, drop events instead of blocking the producing task.
+    // Without this, every tracing call parks on the writer mutex behind a
+    // synchronous `Stderr::write_all` and the runtime wedges while
+    // spawn-blocking workers continue. Silent log loss under saturation is
+    // strictly preferable to a hung scan loop.
+    //
+    // `_writer_guard` MUST live until `run` returns: the guard's `Drop`
+    // signals the background worker to flush remaining events before the
+    // process exits. A `static`-stored guard would never drop (Rust skips
+    // static destructors), so subprocess tests that read stderr after
+    // kei exits would race against unflushed events on fast process
+    // teardown (observed on macOS CI).
+    let (non_blocking, _writer_guard) =
+        tracing_appender::non_blocking::NonBlockingBuilder::default()
+            .lossy(true)
+            .finish(std::io::stderr());
+
+    let make_writer = RedactingMakeWriter {
+        password: Arc::clone(&redact_password),
+        inner: non_blocking,
+    };
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter)),
         )
-        .with_writer(RedactingMakeWriter {
-            password: Arc::clone(&redact_password),
-        })
+        .with_writer(make_writer)
         .init();
 
     // Log migration warnings now that tracing is initialized.
@@ -805,6 +835,80 @@ mod tests {
             password,
         };
         writer.flush().unwrap();
+    }
+
+    /// Password set but the buffer doesn't contain it. The pre-redaction
+    /// byte-level scan must short-circuit and pass the buffer through
+    /// unchanged, without allocating a `String` for UTF-8 lossy
+    /// conversion -- under heavy trace-level logging most events do NOT
+    /// contain the password, so the no-allocation path is the hot one.
+    #[test]
+    fn redacting_writer_password_absent_passthrough() {
+        use std::io::Write;
+
+        let password = Arc::new(std::sync::Mutex::new(Some(SecretString::from("s3cret"))));
+        let mut buf = Vec::new();
+        {
+            let mut writer = RedactingWriter {
+                inner: &mut buf,
+                password: Arc::clone(&password),
+            };
+            writer
+                .write_all(b"long line of trace output without any sensitive value")
+                .unwrap();
+        }
+        let output = String::from_utf8(buf).unwrap();
+        assert_eq!(
+            output,
+            "long line of trace output without any sensitive value"
+        );
+    }
+
+    /// A buffer containing arbitrary non-UTF-8 bytes (e.g. binary protocol
+    /// trace output from `hyper`) and no password match must pass through
+    /// byte-for-byte. The original implementation forced `from_utf8_lossy`
+    /// on every event, which would have replaced invalid sequences with
+    /// U+FFFD even when no redaction was needed.
+    #[test]
+    fn redacting_writer_non_utf8_passthrough_preserves_bytes() {
+        use std::io::Write;
+
+        let password = Arc::new(std::sync::Mutex::new(Some(SecretString::from("s3cret"))));
+        let bytes: Vec<u8> = vec![0xff, 0xfe, 0xfd, b'o', b'k', 0x00, 0x80];
+        let mut buf = Vec::new();
+        {
+            let mut writer = RedactingWriter {
+                inner: &mut buf,
+                password: Arc::clone(&password),
+            };
+            writer.write_all(&bytes).unwrap();
+        }
+        assert_eq!(buf, bytes);
+    }
+
+    /// Password match in a non-UTF-8 buffer: the slow path is taken,
+    /// `from_utf8_lossy` runs, and the password substring is redacted.
+    /// Trailing invalid bytes get the U+FFFD replacement, but that is
+    /// the same behavior as the original implementation when redaction
+    /// fires.
+    #[test]
+    fn redacting_writer_non_utf8_with_password_redacts() {
+        use std::io::Write;
+
+        let password = Arc::new(std::sync::Mutex::new(Some(SecretString::from("s3cret"))));
+        let mut bytes: Vec<u8> = b"prefix s3cret suffix ".to_vec();
+        bytes.push(0xff);
+        let mut buf = Vec::new();
+        {
+            let mut writer = RedactingWriter {
+                inner: &mut buf,
+                password: Arc::clone(&password),
+            };
+            writer.write_all(&bytes).unwrap();
+        }
+        let output = String::from_utf8_lossy(&buf).into_owned();
+        assert!(!output.contains("s3cret"));
+        assert!(output.contains("********"));
     }
 
     #[test]
