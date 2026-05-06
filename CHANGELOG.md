@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.3] - 2026-05-06
+
 ### Added
 
 - **`import-existing` 30-second heartbeat log line.** The existing `Matched N files so far...` progress only ticked every 100 *matches*, so a long ExcludedAlbum or filtered run left INFO-level output silent for many minutes and users (#347) read silence as a hang. The heartbeat prints total scanned, matched, skipped-re-hash, filtered, unmatched, hash errors, and the last-seen asset id. ([#348])
