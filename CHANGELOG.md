@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Docker image now honors `PUID` and `PGID` environment variables.** When both are set, the container's entrypoint chowns ownership-mismatched files in `/config` and `/photos` to that UID:GID and drops privileges via `gosu` before running kei. Setting only one is rejected; setting neither preserves the prior root-default. The chown uses `find -not -uid` so a multi-TB volume only pays for stragglers, not the full tree, on every restart. Unblocks NAS deployments (Synology Container Manager, Unraid, TrueNAS Scale) where downstream indexers like Synology Photos can't see root-owned files. ([Synology wiki](https://github.com/rhoopr/kei/wiki/Synology), [Docker wiki](https://github.com/rhoopr/kei/wiki/Docker))
+
+---
+
 ## [0.13.3] - 2026-05-06
 
 ### Added
