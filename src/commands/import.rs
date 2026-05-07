@@ -3365,4 +3365,85 @@ mod heartbeat_tests {
             "Drop must flip the cancellation token",
         );
     }
+
+    /// 5 ms-per-write sink is realistic stderr-pipe latency, not
+    /// pathological saturation: pathological loads exhaust the lossy
+    /// buffer before the worker drains on shutdown, conflating the bug
+    /// under test with teardown timing.
+    #[tokio::test]
+    async fn heartbeat_fires_under_writer_load() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct PipeSink {
+            buf: Arc<std::sync::Mutex<Vec<u8>>>,
+            delay: std::time::Duration,
+        }
+        impl Write for PipeSink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                std::thread::sleep(self.delay);
+                self.buf
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = PipeSink {
+            buf: Arc::clone(&buf),
+            delay: std::time::Duration::from_millis(5),
+        };
+        let (make_writer, writer_guard, _pw) = crate::build_redacting_writer(sink);
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
+            .with_writer(make_writer)
+            .with_ansi(false)
+            .finish();
+        let _dispatch_guard = tracing::subscriber::set_default(subscriber);
+
+        let state = Arc::new(super::HeartbeatState::default());
+        let hb = super::HeartbeatGuard::spawn(
+            Arc::clone(&state),
+            "test-lib".to_string(),
+            std::time::Duration::from_millis(50),
+        );
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_c = Arc::clone(&stop);
+        let scan = tokio::spawn(async move {
+            while !stop_c.load(Ordering::Relaxed) {
+                tracing::info!(target: "kei::scan_test", "scan loop fake event");
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        });
+
+        // 300 ms covers 5 heartbeat intervals (first tick skipped; emits
+        // land at t≈50, 100, 150, 200, 250 ms). Asserting >= 3 still
+        // survives one missed tick from CI jitter without giving a real
+        // chokepoint regression a way through.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        stop.store(true, Ordering::Relaxed);
+        scan.await.unwrap();
+
+        drop(hb);
+        drop(_dispatch_guard);
+        drop(writer_guard);
+
+        let captured = buf
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let captured_str = String::from_utf8_lossy(&captured);
+        let heartbeat_count = captured_str.matches("import scan heartbeat").count();
+        assert!(
+            heartbeat_count >= 3,
+            "heartbeat fired {heartbeat_count} times in 300 ms under concurrent \
+             scan-loop traffic (expected >= 3); the watchdog is sharing the data \
+             plane's chokepoint or otherwise stalled. Captured: {captured_str}",
+        );
+    }
 }
