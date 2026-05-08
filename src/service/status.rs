@@ -1,16 +1,26 @@
 //! `kei service status` dispatcher.
 //!
 //! Reports whether kei is registered as a service on this host and how
-//! long it has been running. The platform queries (`systemctl --user
+//! long it has been running. Per-platform queries (`systemctl --user
 //! show`, `launchctl print`, `Get-Service`) live in the per-platform
-//! backend modules introduced by PR 3+; until those land this command
-//! returns a placeholder error rather than a misleading "not installed".
+//! backend modules. Linux is wired up; macOS and Windows currently
+//! return a placeholder error rather than a misleading "not installed".
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 
 pub(crate) async fn run() -> Result<()> {
-    Err(anyhow!(
-        "`kei service status` is not yet implemented; \
-         status reporting lands alongside the per-platform install backends"
+    dispatch().await
+}
+
+#[cfg(target_os = "linux")]
+async fn dispatch() -> Result<()> {
+    crate::service::linux::status().await
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn dispatch() -> Result<()> {
+    Err(anyhow::anyhow!(
+        "`kei service status` is not yet implemented on this platform; \
+         macOS launchd and Windows SCM backends are still in flight"
     ))
 }

@@ -1,11 +1,12 @@
-//! CLI parsing + container-guard tests for `kei install`, `kei uninstall`,
+//! Cross-platform CLI parsing tests for `kei install`, `kei uninstall`,
 //! and `kei service {run,status}`.
 //!
-//! The per-platform install backends (launchd, systemd, Windows SCM) land
-//! in PRs 3-5; until then `install` / `uninstall` / `service status`
-//! return a clean "not yet implemented" error and the tests below assert
-//! the contract: subcommand parsing, `--help` rendering, mutually
-//! exclusive flags, and a friendly stub error rather than a panic.
+//! Tests in this file must hold on every target. Platform-specific
+//! behavior (actually writing a unit file or invoking systemctl) lives
+//! in `tests/service_linux.rs` and analogous suites for the other
+//! platforms. The "not yet implemented" assertions are gated to
+//! targets without a backend so they auto-deactivate as each platform
+//! ships.
 
 #![allow(
     clippy::unwrap_used,
@@ -102,20 +103,13 @@ fn install_user_and_system_are_mutually_exclusive() {
         .stderr(predicate::str::contains("cannot be used with"));
 }
 
-#[test]
-fn uninstall_accepts_purge_flag() {
-    // Stub returns NotImplemented (exit 1); the relevant assertion is
-    // that --purge parses cleanly, which the failure mode at exit 1
-    // (vs. a clap parse error at exit 2) confirms.
-    cmd()
-        .args(["uninstall", "--purge"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("not yet implemented"));
-}
+// ── Stub error contract (non-Linux only) ────────────────────────────────
+//
+// On targets where the platform backend has shipped, these tests
+// auto-deactivate via cfg. They guard the macOS / Windows stubs until
+// those backends land.
 
-// ── Stub error contract ─────────────────────────────────────────────────
-
+#[cfg(not(target_os = "linux"))]
 #[test]
 fn install_returns_clean_not_implemented_error() {
     cmd()
@@ -125,6 +119,7 @@ fn install_returns_clean_not_implemented_error() {
         .stderr(predicate::str::contains("not yet implemented"));
 }
 
+#[cfg(not(target_os = "linux"))]
 #[test]
 fn uninstall_returns_clean_not_implemented_error() {
     cmd()
@@ -134,6 +129,7 @@ fn uninstall_returns_clean_not_implemented_error() {
         .stderr(predicate::str::contains("not yet implemented"));
 }
 
+#[cfg(not(target_os = "linux"))]
 #[test]
 fn service_status_returns_clean_not_implemented_error() {
     cmd()

@@ -736,6 +736,13 @@ pub struct InstallArgs {
     /// Windows the per-platform default is used regardless of this flag.
     #[arg(long, conflicts_with = "user")]
     pub system: bool,
+
+    /// Render the service file and report what would happen, without
+    /// invoking the platform service manager (no `systemctl daemon-reload`,
+    /// no `launchctl bootstrap`, no SCM `CreateService`). The unit file is
+    /// still written to disk so it can be inspected.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 /// Arguments for `kei uninstall`.
@@ -1947,6 +1954,35 @@ mod tests {
             } => assert!(yes),
             _ => panic!("Expected Reset State"),
         }
+    }
+
+    #[test]
+    fn install_dry_run_parses_with_user_flag() {
+        let cli = Cli::try_parse_from(["kei", "install", "--user", "--dry-run"]).unwrap();
+        let args = match cli.effective_command() {
+            Command::Install(a) => a.clone(),
+            other => panic!("expected Install, got {other:?}"),
+        };
+        assert!(args.user);
+        assert!(args.dry_run);
+        assert!(!args.system);
+    }
+
+    #[test]
+    fn install_user_and_system_conflict_at_parse_time() {
+        // clap rejects mutually exclusive flags during parse; this guards
+        // the `conflicts_with` annotation on InstallArgs.
+        let err = Cli::try_parse_from(["kei", "install", "--user", "--system"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn uninstall_purge_parses_to_struct_field() {
+        let cli = Cli::try_parse_from(["kei", "uninstall", "--purge"]).unwrap();
+        assert!(matches!(
+            cli.effective_command(),
+            Command::Uninstall(UninstallArgs { purge: true })
+        ));
     }
 
     #[test]
