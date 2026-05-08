@@ -35,6 +35,7 @@ use crate::service::env::{
     current_executable, kei_state_dir_dotted, purge_kei_state, SERVICE_DESCRIPTION,
     SERVICE_IDENTIFIER,
 };
+use crate::service::status::ServiceState;
 
 /// SCM service name (matches `SERVICE_IDENTIFIER` so `sc.exe query
 /// com.rhoopr.kei` works for ad-hoc inspection).
@@ -130,6 +131,26 @@ pub(crate) async fn status() -> Result<()> {
     let line = render_status(scm_impl::probe().await?);
     println!("{line}");
     Ok(())
+}
+
+/// `service_state()` for the `Service:` section in `kei status`. SCM
+/// does not expose a service-start timestamp via `QueryServiceStatusEx`,
+/// so `since` is always `None`; the lifecycle label and PID are
+/// sufficient signal for the status line.
+pub(crate) async fn service_state() -> Result<ServiceState> {
+    Ok(match scm_impl::probe().await? {
+        StatusInputs::NotInstalled => ServiceState::NotInstalled,
+        StatusInputs::ScmUnavailable => ServiceState::BackendUnavailable {
+            backend: "windows scm",
+            reason: "SCM unavailable",
+        },
+        StatusInputs::Probed { state, pid } => ServiceState::Installed {
+            backend: "windows scm",
+            state_label: state.label(),
+            since: None,
+            pid,
+        },
+    })
 }
 
 /// `kei service run` entry on Windows.
