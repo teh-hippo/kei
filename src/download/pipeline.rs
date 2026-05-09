@@ -696,8 +696,15 @@ fn create_progress_bar(
     // already gated those paths above to ProgressBar::hidden so this is
     // conservative). Cap at 200 so the rule line doesn't grow unbounded.
     let cols_for_template = cols.unwrap_or(80).min(200);
-    let bar_template =
-        crate::personality::theme::download_bar_template(mode, tier, cols_for_template, total);
+    // iCloud is the only backend today; when Immich/Nextcloud land, plumb
+    // the source through `download::Config` and pass it here.
+    let bar_template = crate::personality::theme::download_bar_template(
+        mode,
+        tier,
+        cols_for_template,
+        total,
+        crate::personality::theme::Source::Icloud,
+    );
     let chars = crate::personality::theme::progress_chars(mode);
     if let Ok(mut style) = ProgressStyle::with_template(&bar_template.template) {
         style = style.progress_chars(chars);
@@ -807,14 +814,25 @@ fn create_progress_bar(
                     }
                 },
             );
+            // Per-bar EtaPhrasing carries the "calculating..." -> "still
+            // calculating..." escalation across redraws. Shared state via
+            // Arc<Mutex<>> because indicatif::with_key requires Send+Sync;
+            // contention is nil (single-bar, single draw thread, ~10Hz).
+            let phrasing = std::sync::Arc::new(std::sync::Mutex::new(
+                crate::personality::pace::EtaPhrasing::new(),
+            ));
+            let phrasing_for_key = std::sync::Arc::clone(&phrasing);
             style = style.with_key(
                 "smart_eta",
-                |state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
+                move |state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
                     let secs = state.eta().as_secs();
+                    let mut p = phrasing_for_key
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if secs == 0 && state.pos() < state.len().unwrap_or(u64::MAX) {
-                        let _ = write!(w, "calculating...");
+                        let _ = write!(w, "{}", p.unknown());
                     } else {
-                        let _ = write!(w, "{}", crate::personality::pace::format_known_eta(secs));
+                        let _ = write!(w, "{}", p.known(secs));
                     }
                 },
             );
@@ -990,7 +1008,18 @@ where
     // album that's entirely already-on-disk would advance the bar via the
     // producer's skip path (which doesn't set_message) and leave the
     // wide_msg blank for the whole pass.
-    pb.set_message(format!("{} \u{00b7} scanning...", config.pass_label()));
+    //
+    // In friendly mode, the cycler also rotates a verb pool every ~600ms so
+    // the line stays alive during the listing/scan gap before the first
+    // file completes; in off mode it seeds the same static "scanning..."
+    // string and skips spawning a task. The consumer's first per-file
+    // `set_message` cancels the cycler so verbs and filenames don't race.
+    let listing_cycler = crate::personality::cycler::PhaseCycler::spawn(
+        pb.clone(),
+        config.pass_label().to_string(),
+        config.personality_mode,
+        crate::personality::verbs::Phase::Listing,
+    );
 
     if config.only_print_filenames {
         // Load state DB context so we skip already-downloaded assets,
@@ -1719,6 +1748,9 @@ where
             .file_name()
             .and_then(|f| f.to_str())
             .unwrap_or("");
+        // Stop the listing cycler so we don't fight it for the wide_msg
+        // slot. Idempotent atomic store; cheap to call every iteration.
+        listing_cycler.cancel();
         // Prefix the active filename with the pass's album label so the user
         // can tell which album's items are downloading.
         pb.set_message(format!("{} \u{00b7} {filename}", config.pass_label()));

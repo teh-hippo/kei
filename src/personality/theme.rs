@@ -79,10 +79,12 @@ pub fn progress_chars(mode: Mode) -> &'static str {
 /// Off mode reproduces v0.13's exact template byte-for-byte so anyone parsing
 /// the bar (e.g. from a recorded asciinema) sees no difference.
 ///
-/// Friendly mode wraps a five-line "card" around the work whose top and
-/// bottom rules are sized to the terminal so the box stays a true rectangle:
+/// Friendly mode wraps a six-row "card" around the work (one blank row of
+/// breathing room above a five-row box) whose top and bottom rules are
+/// sized to the terminal so the box stays a true rectangle:
 /// ```text
-/// ╭── downloading ─────────────────────────
+///
+/// ╭── kei · downloading from iCloud ───────
 /// │  IMG_4521.HEIC
 /// │  ████████████████░░░░░░ 62%
 /// │   4.2/s  ▁▂▃▅▇█▇▅  18/30  ·  about 1 minute
@@ -115,8 +117,35 @@ pub struct BarTemplate {
     pub bottom_rule: String,
 }
 
+/// Where the bytes are coming from. Drives the friendly card's header
+/// (`kei - downloading from iCloud`). Off mode and narrow tier ignore it.
+///
+/// New backends add a variant + a `label` arm; no other plumbing required.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    Icloud,
+}
+
+impl Source {
+    /// Human-readable backend name as it appears in the bar header.
+    /// Match the casing the backend is widely written as (`iCloud`,
+    /// `Immich`, `Google Photos`) - this string is user-facing.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Icloud => "iCloud",
+        }
+    }
+}
+
 #[must_use]
-pub fn download_bar_template(mode: Mode, tier: WidthTier, cols: u16, total: u64) -> BarTemplate {
+pub fn download_bar_template(
+    mode: Mode,
+    tier: WidthTier,
+    cols: u16,
+    total: u64,
+    source: Source,
+) -> BarTemplate {
     match (mode, tier) {
         (Mode::Off, _) => BarTemplate {
             template: "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}"
@@ -125,10 +154,10 @@ pub fn download_bar_template(mode: Mode, tier: WidthTier, cols: u16, total: u64)
             bottom_rule: String::new(),
         },
         (Mode::Friendly, WidthTier::Wide) => {
-            friendly_card(cols, total, friendly_bar_width(cols), true)
+            friendly_card(cols, total, friendly_bar_width(cols), true, source)
         }
         (Mode::Friendly, WidthTier::Medium) => {
-            friendly_card(cols, total, friendly_bar_width(cols), false)
+            friendly_card(cols, total, friendly_bar_width(cols), false, source)
         }
         (Mode::Friendly, WidthTier::Narrow) => BarTemplate {
             template: "{bar:16.cyan/blue} {pos}/{len}".to_string(),
@@ -169,17 +198,23 @@ pub fn friendly_sparkline_width(cols: u16) -> u16 {
     (cols / 3).clamp(16, 48)
 }
 
-/// Build a friendly five-line card sized to `cols`.
+/// Build a friendly six-row card (1 blank + 5 content) sized to `cols`.
 ///
 /// Returns the indicatif template (referencing custom keys `{top_rule}`,
 /// `{bottom_rule}`, `{bar_animated}`, `{spinner}`) plus the rendered rule
 /// strings the closures will pulse-color on each redraw.
-fn friendly_card(cols: u16, total: u64, bar_width: u16, with_smart_eta: bool) -> BarTemplate {
+fn friendly_card(
+    cols: u16,
+    total: u64,
+    bar_width: u16,
+    with_smart_eta: bool,
+    source: Source,
+) -> BarTemplate {
     // Rule width: cols - 1 so a final newline / cursor reset doesn't bump the
     // bar onto a phantom line on terminals that auto-wrap at exactly cols.
     let rule_total = cols.saturating_sub(1).max(20) as usize;
-    let header = " downloading ";
-    // Top rule: ╭── downloading ───...─╮
+    let header = format!(" kei \u{00b7} downloading from {} ", source.label());
+    // Top rule: ╭── kei · downloading from <source> ───...─╮
     // Layout pieces: ╭ + 2 dashes + header + N dashes + ╮.
     let top_dashes_after_header = rule_total
         .saturating_sub(4) // ╭ + 2 leading dashes + ╮
@@ -208,13 +243,19 @@ fn friendly_card(cols: u16, total: u64, bar_width: u16, with_smart_eta: bool) ->
     //
     // We embed bar_width into the placeholder name so a future caller could
     // look it up if needed; the closure ignores it but it documents intent.
+    // Leading `\n` on the template gives the card one blank line of
+    // breathing room above the top rule, separating it from prior
+    // scrollback (greeting, narration, the previous cycle's sign-off)
+    // without the user having to read a wall of stacked content. The
+    // empty line is part of the bar's tracked draw region so it scrolls
+    // with the bar instead of accumulating.
     let template = if with_smart_eta {
         format!(
-            "{{top_rule}}\n│  {{wide_msg}}\n│  {{bar_animated}} {{percent:>3}}% {{spinner}}\n│  {{rate_sparkline}}  {{pos:>{pos_width}}}/{{len}}  ·  {{smart_eta}}\n{{bottom_rule}}"
+            "\n{{top_rule}}\n│  {{wide_msg}}\n│  {{bar_animated}} {{percent:>3}}% {{spinner}}\n│  {{rate_sparkline}}  {{pos:>{pos_width}}}/{{len}}  ·  {{smart_eta}}\n{{bottom_rule}}"
         )
     } else {
         format!(
-            "{{top_rule}}\n│  {{wide_msg}}\n│  {{bar_animated}} {{percent:>3}}% {{spinner}}\n│  {{rate_sparkline}}  {{pos:>{pos_width}}}/{{len}}\n{{bottom_rule}}"
+            "\n{{top_rule}}\n│  {{wide_msg}}\n│  {{bar_animated}} {{percent:>3}}% {{spinner}}\n│  {{rate_sparkline}}  {{pos:>{pos_width}}}/{{len}}\n{{bottom_rule}}"
         )
     };
     let _ = bar_width; // captured via pipeline.rs closure; no template slot.
@@ -256,18 +297,20 @@ mod tests {
     #[test]
     fn off_template_matches_v013_exactly() {
         let v013 = "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}";
-        let off = download_bar_template(Mode::Off, WidthTier::Wide, 80, 100);
+        let off = download_bar_template(Mode::Off, WidthTier::Wide, 80, 100, Source::Icloud);
         assert_eq!(off.template, v013);
         assert!(off.top_rule.is_empty());
         assert!(off.bottom_rule.is_empty());
         // Off mode ignores tier so machine-output stability is unconditional.
-        let off_narrow = download_bar_template(Mode::Off, WidthTier::Narrow, 80, 100);
+        let off_narrow =
+            download_bar_template(Mode::Off, WidthTier::Narrow, 80, 100, Source::Icloud);
         assert_eq!(off_narrow.template, v013);
     }
 
     #[test]
     fn friendly_narrow_drops_elapsed_and_eta() {
-        let narrow = download_bar_template(Mode::Friendly, WidthTier::Narrow, 50, 30);
+        let narrow =
+            download_bar_template(Mode::Friendly, WidthTier::Narrow, 50, 30, Source::Icloud);
         assert!(!narrow.template.contains("elapsed"));
         assert!(!narrow.template.contains("eta"));
         assert!(narrow.template.contains("{bar:"));
@@ -279,7 +322,7 @@ mod tests {
 
     #[test]
     fn friendly_wide_card_top_and_bottom_rules_match_width() {
-        let wide = download_bar_template(Mode::Friendly, WidthTier::Wide, 80, 30);
+        let wide = download_bar_template(Mode::Friendly, WidthTier::Wide, 80, 30, Source::Icloud);
         // Top and bottom rules are now stored separately on BarTemplate so
         // pipeline.rs can wrap them in pulse-color closures. Width must still
         // match between the two so the box reads as a true rectangle.
@@ -310,10 +353,20 @@ mod tests {
             wide.bottom_rule,
         );
         assert!(
-            wide.top_rule.contains("downloading"),
-            "top rule should embed phase header: {:?}",
+            wide.top_rule.contains("downloading from iCloud"),
+            "top rule should embed source-aware header: {:?}",
             wide.top_rule,
         );
+        assert!(
+            wide.top_rule.contains("kei"),
+            "top rule should brand the box with kei: {:?}",
+            wide.top_rule,
+        );
+    }
+
+    #[test]
+    fn source_label_is_user_facing_casing() {
+        assert_eq!(Source::Icloud.label(), "iCloud");
     }
 
     #[test]
@@ -375,14 +428,14 @@ mod tests {
     #[test]
     fn friendly_wide_card_pos_pads_to_len_digit_count() {
         // total=999 -> 3 digits -> pos formatted as `{pos:>3}`.
-        let bt = download_bar_template(Mode::Friendly, WidthTier::Wide, 80, 999);
+        let bt = download_bar_template(Mode::Friendly, WidthTier::Wide, 80, 999, Source::Icloud);
         assert!(
             bt.template.contains("{pos:>3}/{len}"),
             "pos should be padded to 3 digits for total=999, got: {}",
             bt.template,
         );
         // total=10000 -> 5 digits.
-        let bt = download_bar_template(Mode::Friendly, WidthTier::Wide, 80, 10_000);
+        let bt = download_bar_template(Mode::Friendly, WidthTier::Wide, 80, 10_000, Source::Icloud);
         assert!(
             bt.template.contains("{pos:>5}/{len}"),
             "pos should be padded to 5 digits for total=10000, got: {}",
@@ -391,14 +444,20 @@ mod tests {
     }
 
     #[test]
-    fn friendly_wide_is_five_line_card_with_animated_keys() {
-        let wide = download_bar_template(Mode::Friendly, WidthTier::Wide, 80, 100);
+    fn friendly_wide_is_six_line_card_with_animated_keys() {
+        let wide = download_bar_template(Mode::Friendly, WidthTier::Wide, 80, 100, Source::Icloud);
         let template = &wide.template;
-        // Top rule key, three content lines, bottom rule key. Four `\n`s.
+        // Leading blank line + top rule + three content rows + bottom
+        // rule = six rows, joined by five `\n`s. The blank gives the
+        // card breathing room from prior scrollback.
         assert_eq!(
             template.matches('\n').count(),
-            4,
-            "wide template should be five lines, got: {template:?}",
+            5,
+            "wide template should be six rows (1 blank + 5 content), got: {template:?}",
+        );
+        assert!(
+            template.starts_with('\n'),
+            "wide template must start with a blank row for breathing room: {template:?}",
         );
         // Vertical bar prefix on content lines.
         assert!(template.contains('\u{2502}'), "missing vertical bar │");
@@ -415,19 +474,26 @@ mod tests {
         assert!(template.contains("{smart_eta}"));
         // Top rule and bottom rule live on the BarTemplate struct, not in the
         // template; the closures pulse them per redraw.
-        assert!(wide.top_rule.contains("downloading"));
+        assert!(wide.top_rule.contains("downloading from iCloud"));
         assert!(wide.top_rule.starts_with('╭') && wide.top_rule.ends_with('╮'));
         assert!(wide.bottom_rule.starts_with('╰') && wide.bottom_rule.ends_with('╯'));
     }
 
     #[test]
-    fn friendly_medium_is_five_line_card_without_smart_eta() {
-        let medium = download_bar_template(Mode::Friendly, WidthTier::Medium, 70, 100);
+    fn friendly_medium_is_six_line_card_without_smart_eta() {
+        let medium =
+            download_bar_template(Mode::Friendly, WidthTier::Medium, 70, 100, Source::Icloud);
         let template = &medium.template;
+        // Same 1-blank + 5-content layout as wide; only the third row's
+        // smart-ETA suffix is dropped to keep the line short.
         assert_eq!(
             template.matches('\n').count(),
-            4,
-            "medium template should be five lines, got: {template:?}",
+            5,
+            "medium template should be six rows (1 blank + 5 content), got: {template:?}",
+        );
+        assert!(
+            template.starts_with('\n'),
+            "medium template must start with a blank row for breathing room: {template:?}",
         );
         assert!(template.contains("{top_rule}"));
         assert!(template.contains("{bottom_rule}"));
