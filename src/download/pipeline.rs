@@ -196,6 +196,15 @@ pub(super) struct StreamingResult {
     /// when downstream downloads partially failed). `false` when the
     /// producer aborted via shutdown, channel-close, or panic.
     pub(super) enumeration_complete: bool,
+    /// Photos downloaded in this pass (`MediaType::Photo` /
+    /// `LivePhotoImage`). Lifted into `SyncStats.photos_downloaded`.
+    pub(super) photos_downloaded: usize,
+    /// Videos downloaded in this pass (`MediaType::Video` /
+    /// `LivePhotoVideo`).
+    pub(super) videos_downloaded: usize,
+    /// Per-pass recap fold; merged with the cleanup pass's recap before
+    /// the friendly card renders.
+    pub(super) recap: super::recap::RunRecap,
 }
 
 /// Threshold of auth errors before aborting the download pass for re-authentication.
@@ -957,6 +966,13 @@ pub(super) struct PassResult {
     pub(super) bytes_downloaded: u64,
     pub(super) disk_bytes_written: u64,
     pub(super) rate_limit_observations: usize,
+    /// Photos / videos / recap observed during this pass, mirroring
+    /// `StreamingResult`. Folded into the cycle's `SyncStats` at the
+    /// caller. Defaults are zero / empty so the existing cleanup-pass
+    /// path behaves identically in non-friendly mode.
+    pub(super) photos_downloaded: usize,
+    pub(super) videos_downloaded: usize,
+    pub(super) recap: super::recap::RunRecap,
 }
 
 /// Return the subset of `paths` that do not exist on disk.
@@ -1224,6 +1240,9 @@ where
     let mut pending_state_writes: Vec<PendingStateWrite> = Vec::new();
     let mut bytes_downloaded_total: u64 = 0;
     let mut disk_bytes_total: u64 = 0;
+    let mut photos_downloaded = 0usize;
+    let mut videos_downloaded = 0usize;
+    let mut recap = super::recap::RunRecap::default();
     let library: Arc<str> = Arc::clone(&config.library);
 
     let (task_tx, task_rx) = mpsc::channel::<DownloadTask>(concurrency * 2);
@@ -1760,6 +1779,18 @@ where
             Ok((exif_ok, local_checksum, download_checksum, bytes_dl, disk_bytes)) => {
                 downloaded += 1;
                 bytes_downloaded_total += bytes_dl;
+                // Photos / videos fire in both modes (SyncStats serialises
+                // them into the JSON report); the recap fold is
+                // friendly-only so off-mode skips the per-success String
+                // allocation `to_recap_asset` does for the filename.
+                if task.media_type.is_photo_like() {
+                    photos_downloaded += 1;
+                } else if task.media_type.is_video_like() {
+                    videos_downloaded += 1;
+                }
+                if mode.is_friendly() {
+                    recap.observe(config.pass_label(), task.to_recap_asset());
+                }
                 // Feed the friendly bar's bandwidth sparkline / rate display.
                 // Atomic+Relaxed is fine: the bar reads it on each redraw,
                 // doesn't depend on it for correctness, and a missed update
@@ -1983,6 +2014,9 @@ where
         disk_bytes_written: disk_bytes_total,
         rate_limit_observations: rate_limit_counter.load(std::sync::atomic::Ordering::Relaxed),
         enumeration_complete: enumeration_complete_flag,
+        photos_downloaded,
+        videos_downloaded,
+        recap,
     })
 }
 
@@ -2019,6 +2053,9 @@ pub(super) async fn build_download_outcome(
             elapsed_secs: started.elapsed().as_secs_f64(),
             interrupted: true,
             rate_limited: streaming_result.rate_limit_observations,
+            photos_downloaded: streaming_result.photos_downloaded,
+            videos_downloaded: streaming_result.videos_downloaded,
+            recap: streaming_result.recap.clone(),
         };
         return Ok((
             DownloadOutcome::SessionExpired {
@@ -2091,6 +2128,9 @@ pub(super) async fn build_download_outcome(
             elapsed_secs: started.elapsed().as_secs_f64(),
             interrupted: shutdown_token.is_cancelled(),
             rate_limited: streaming_result.rate_limit_observations,
+            photos_downloaded: streaming_result.photos_downloaded,
+            videos_downloaded: streaming_result.videos_downloaded,
+            recap: streaming_result.recap.clone(),
         };
         log_sync_summary("\u{2500}\u{2500} Summary \u{2500}\u{2500}", &stats);
         if state_write_failures > 0
@@ -2151,6 +2191,8 @@ pub(super) async fn build_download_outcome(
     let total_auth_errors = auth_errors + phase2_auth_errors;
 
     if total_auth_errors >= AUTH_ERROR_THRESHOLD {
+        let mut merged_recap = streaming_result.recap.clone();
+        merged_recap.merge(pass_result.recap.clone());
         let stats = super::SyncStats {
             assets_seen: streaming_result.assets_seen,
             downloaded,
@@ -2166,6 +2208,9 @@ pub(super) async fn build_download_outcome(
             interrupted: true,
             rate_limited: streaming_result.rate_limit_observations
                 + pass_result.rate_limit_observations,
+            photos_downloaded: streaming_result.photos_downloaded + pass_result.photos_downloaded,
+            videos_downloaded: streaming_result.videos_downloaded + pass_result.videos_downloaded,
+            recap: merged_recap,
         };
         return Ok((
             DownloadOutcome::SessionExpired {
@@ -2191,6 +2236,8 @@ pub(super) async fn build_download_outcome(
         }
     }
 
+    let mut merged_recap = streaming_result.recap.clone();
+    merged_recap.merge(pass_result.recap.clone());
     let stats = super::SyncStats {
         assets_seen: streaming_result.assets_seen,
         downloaded: succeeded,
@@ -2205,6 +2252,9 @@ pub(super) async fn build_download_outcome(
         interrupted: shutdown_token.is_cancelled(),
         rate_limited: streaming_result.rate_limit_observations
             + pass_result.rate_limit_observations,
+        photos_downloaded: streaming_result.photos_downloaded + pass_result.photos_downloaded,
+        videos_downloaded: streaming_result.videos_downloaded + pass_result.videos_downloaded,
+        recap: merged_recap,
     };
     maybe_warn_rate_limit_pressure(&stats);
     log_sync_summary("\u{2500}\u{2500} Summary \u{2500}\u{2500}", &stats);
@@ -2280,6 +2330,13 @@ pub(super) async fn run_download_pass(
     let mut pending_state_writes: Vec<PendingStateWrite> = Vec::new();
     let mut bytes_downloaded_total: u64 = 0;
     let mut disk_bytes_total: u64 = 0;
+    let mut photos_downloaded = 0usize;
+    let mut videos_downloaded = 0usize;
+    let mut recap = super::recap::RunRecap::default();
+    // Cleanup pass doesn't carry an album label (it's a flat retry list);
+    // recap.observe gets the library name so a recovered asset still
+    // counts toward the per-album newest tracker rather than vanishing.
+    let pass_label = library.as_ref();
 
     // Stream results as each task completes so state writes and progress-bar
     // updates fire per-item. Collecting first would freeze the progress bar
@@ -2291,6 +2348,14 @@ pub(super) async fn run_download_pass(
                 bytes_downloaded_total += bytes_dl;
                 cleanup_bytes_counter.fetch_add(*bytes_dl, std::sync::atomic::Ordering::Relaxed);
                 disk_bytes_total += disk_bytes;
+                if task.media_type.is_photo_like() {
+                    photos_downloaded += 1;
+                } else if task.media_type.is_video_like() {
+                    videos_downloaded += 1;
+                }
+                if mode.is_friendly() {
+                    recap.observe(pass_label, task.to_recap_asset());
+                }
                 if !*exif_ok {
                     exif_failures += 1;
                     pb.suspend(|| {
@@ -2393,6 +2458,9 @@ pub(super) async fn run_download_pass(
         bytes_downloaded: bytes_downloaded_total,
         disk_bytes_written: disk_bytes_total,
         rate_limit_observations: rate_limit_counter.load(std::sync::atomic::Ordering::Relaxed),
+        photos_downloaded,
+        videos_downloaded,
+        recap,
     }
 }
 
@@ -3593,6 +3661,7 @@ mod tests {
                                 asset_id: "ASSET_A".into(),
                                 metadata: Arc::new(MetadataPayload::default()),
                                 version_size: VersionSizeKey::Original,
+                                media_type: crate::state::MediaType::Photo,
                             },
                             DownloadTask {
                                 url: "https://p01.icloud-content.com/b".into(),
@@ -3603,6 +3672,7 @@ mod tests {
                                 asset_id: "ASSET_B".into(),
                                 metadata: Arc::new(MetadataPayload::default()),
                                 version_size: VersionSizeKey::Original,
+                                media_type: crate::state::MediaType::Photo,
                             },
                         ];
 
@@ -3654,6 +3724,7 @@ mod tests {
                             asset_id: "ASSET_C".into(),
                             metadata: Arc::new(MetadataPayload::default()),
                             version_size: VersionSizeKey::Original,
+                            media_type: crate::state::MediaType::Photo,
                         }];
 
                         let client = Client::new();

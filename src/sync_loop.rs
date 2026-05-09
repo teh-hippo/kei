@@ -225,6 +225,11 @@ pub(crate) struct SyncArgs {
     /// Resolved friendly UX mode from lib.rs startup. Threaded into Config so
     /// the download pipeline picks the right bar template.
     pub personality_mode: crate::personality::Mode,
+    /// User-stated friendly preference (CLI > TOML; `None` means neither was
+    /// set, so the default-on-for-TTY policy is active). Threaded so the
+    /// resolved Config exposes the same intent the gate saw, useful for
+    /// downstream code that wants to know whether the user opted in.
+    pub friendly_request: Option<bool>,
 }
 
 /// Run the sync command: authenticate, enumerate photos, download, and
@@ -240,6 +245,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         config_path,
         redact_password,
         personality_mode,
+        friendly_request,
     } = args;
 
     let is_retry_failed = sync.retry_failed;
@@ -257,6 +263,11 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // it up via `config.personality_mode`. Config::build defaults to Off; the
     // CLI flag and gate logic live up in lib.rs.
     config.personality_mode = personality_mode;
+    // Same story for the user-stated preference: Config::build pulled the
+    // TOML value (if any), and lib.rs has already merged the CLI flag on
+    // top. Stamp the merged result so `to_toml` and any downstream consumer
+    // sees the canonical post-resolution intent.
+    config.friendly_request = friendly_request;
 
     // On first run (no config file), persist CLI-provided values so
     // subsequent runs don't need the same flags again. Only when the
@@ -858,12 +869,80 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 &shutdown_token,
             )
             .await?;
+
+            // One state-DB summary per cycle (friendly mode only). Powers
+            // the `Downloaded N new (X → Y)` phase line, the summary
+            // card's library totals, and the metrics gauges below; all
+            // three reuse the same fetch. Off mode skips it entirely so
+            // the v0.13 cycle path stays free of friendly-only DB calls.
+            let library_after_summary = if config.personality_mode.is_friendly() {
+                match state_db.as_deref() {
+                    Some(db) => match db.get_summary().await {
+                        Ok(s) => Some(s),
+                        Err(e) => {
+                            tracing::debug!(error = %e, "post-cycle summary unavailable; rendering card without library totals");
+                            None
+                        }
+                    },
+                    None => None,
+                }
+            } else {
+                None
+            };
+
+            // Friendly-mode phase ✓ lines: scrollback-stable narration that
+            // survives after the bar clears. The Downloaded line derives
+            // `before` by subtracting this cycle's bytes from the
+            // post-cycle library total — saves a second SQL aggregate per
+            // cycle and is exact unless a concurrent reconcile rewrote
+            // the table mid-cycle. Off mode is silent; log_sync_summary
+            // still fires its tracing events for journals.
+            let downloaded_u64 = u64::try_from(cycle_result.stats.downloaded).unwrap_or(u64::MAX);
+            if let Some(library_after) = library_after_summary.as_ref() {
+                let after = library_after.downloaded_bytes;
+                let before = after.saturating_sub(cycle_result.stats.bytes_downloaded);
+                crate::personality::narration::downloaded_phase_to_stderr(
+                    config.personality_mode,
+                    downloaded_u64,
+                    before,
+                    after,
+                );
+            }
+            crate::personality::narration::verified_phase_to_stderr(
+                config.personality_mode,
+                downloaded_u64,
+            );
+            if let Some(library_after) = library_after_summary.as_ref() {
+                let cycle_elapsed = cycle_started_at.elapsed();
+                let stats = &cycle_result.stats;
+                let card = crate::personality::summary::SummaryCard {
+                    photos_new: u64::try_from(stats.photos_downloaded).unwrap_or(u64::MAX),
+                    videos_new: u64::try_from(stats.videos_downloaded).unwrap_or(u64::MAX),
+                    skipped_total: u64::try_from(stats.skipped.total() - stats.skipped.duplicates)
+                        .unwrap_or(u64::MAX),
+                    skipped_already_present: u64::try_from(
+                        stats.skipped.by_state + stats.skipped.on_disk,
+                    )
+                    .unwrap_or(u64::MAX),
+                    failed: u64::try_from(stats.failed).unwrap_or(u64::MAX),
+                    elapsed: cycle_elapsed,
+                    bytes_downloaded: stats.bytes_downloaded,
+                    library_total_assets: library_after.total_assets,
+                    library_total_bytes: library_after.downloaded_bytes,
+                };
+                card.print_to_stderr(config.personality_mode);
+                crate::personality::summary::print_recap_to_stderr(
+                    config.personality_mode,
+                    &cycle_result.stats.recap,
+                );
+            }
+
             // Friendly-mode signoff line. Off-mode keeps relying on
             // log_sync_summary for journal output.
             crate::personality::narration::signoff_to_stderr(
                 config.personality_mode,
                 &crate::personality::narration::CycleSummary {
-                    downloaded: u64::try_from(cycle_result.stats.downloaded).unwrap_or(u64::MAX),
+                    downloaded: downloaded_u64,
                     failed: u64::try_from(cycle_result.failed_count).unwrap_or(u64::MAX),
                     elapsed: cycle_started_at.elapsed(),
                     watch_mode: is_watch_mode,
@@ -887,8 +966,12 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 }
                 handle.update(&cycle_result.stats, &health).await;
 
-                // Update DB-backed gauges from the state database.
-                if let Some(ref db) = state_db {
+                // Update DB-backed gauges from the state database. Reuse
+                // the post-cycle summary fetched for the friendly card
+                // when it's available, otherwise issue the call here.
+                if let Some(summary) = library_after_summary.as_ref() {
+                    handle.update_db_stats(summary, cycle_result.stats.assets_seen);
+                } else if let Some(ref db) = state_db {
                     match db.get_summary().await {
                         Ok(summary) => {
                             handle.update_db_stats(&summary, cycle_result.stats.assets_seen);
