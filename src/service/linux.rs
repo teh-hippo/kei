@@ -150,7 +150,8 @@ pub(crate) async fn install_user(args: &InstallArgs, config_path: &Path) -> Resu
 
     tracing::info!(
         "kei is now running as a per-user systemd service; \
-         check `systemctl --user status {SERVICE_IDENTIFIER}.service` to verify",
+         check `systemctl --user status {SERVICE_IDENTIFIER}.service` to verify. \
+         Run `kei uninstall` to remove this service.",
     );
     Ok(())
 }
@@ -160,7 +161,9 @@ pub(crate) async fn install_system(args: &InstallArgs, config_path: &Path) -> Re
     if !is_root() {
         bail!(
             "`kei install --system` must be run as root (EUID=0); \
-             rerun under sudo or use `kei install --user` for a per-user install"
+             rerun:  sudo kei install --system --config {}  \
+             Or use `kei install --user` for a per-user install.",
+            config_path.display()
         );
     }
     let user = sudo_user_or_bail()?;
@@ -188,7 +191,8 @@ pub(crate) async fn install_system(args: &InstallArgs, config_path: &Path) -> Re
 
     tracing::info!(
         "kei is now running as a system-wide systemd service; \
-         check `systemctl status {SERVICE_IDENTIFIER}.service` to verify",
+         check `systemctl status {SERVICE_IDENTIFIER}.service` to verify. \
+         Run `kei uninstall` as root to remove this service.",
     );
     Ok(())
 }
@@ -201,10 +205,9 @@ pub(crate) async fn uninstall(args: &UninstallArgs) -> Result<()> {
     let system_path = Some(system_unit_path()).filter(|p| p.exists());
 
     if user_path.is_none() && system_path.is_none() {
-        tracing::info!(
-            "no kei.service unit file found at the per-user or system path; \
-             nothing to uninstall"
-        );
+        tracing::info!("kei service was already removed. Nothing to do.");
+        // Don't bail — the service is already gone, which is the desired state.
+        // Still run purge if requested.
     }
 
     if let Some(path) = user_path.as_ref() {
