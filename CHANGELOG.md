@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.14.0] - 2026-05-12
 
 ### Added
 
@@ -28,11 +28,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Friendly-mode phase ✓ lines that survive scrollback.** Replaces the prior `Signed in as ...` / `Found N libraries to sync.` narration with `✓ Authenticated as you@example.com` and `✓ Listed N library/libraries`. After the cycle's downloads complete, two new phase lines fire: `✓ Downloaded N new files (412 GB → 412.3 GB)` (with the library size delta pulled from the state DB) and `✓ Verified N files (N of N matched)` (kei does atomic-rename-after-checksum so every counted download is implicitly verified; the line still prints because users want the explicit closure). All four lines no-op on no-op cycles. Off mode keeps today's wording byte-for-byte.
 - **Friendly-mode summary card replaces the plain `── Summary ──` block.** Same data in a more legible shape: a top rule, photos / videos split, skipped count with reason, failed, time, speed (bytes / elapsed), and library totals (asset count + on-disk bytes), then a bottom rule. Photos and videos counts are tracked separately on `SyncStats` (`photos_downloaded` / `videos_downloaded`); both Live Photo image and MOV variants count under their respective bucket. Off mode is unchanged: the existing `log_sync_summary` tracing events still fire so journals, JSON reports, and `kei status` consumers see byte-identical output.
 - **Friendly-mode "what's new" recap below the summary card.** Three highlight lines for cycles that downloaded anything: `Biggest grab` (largest file by bytes), `Oldest find` (earliest by EXIF capture date among newly-downloaded assets), and `Newest album` (album holding the most-recently-captured photo touched this cycle, since iCloud doesn't expose an album-creation timestamp). Suppressed entirely when 0 new. Each successful download contributes a fold into a per-cycle `RunRecap` tracker; the cleanup pass merges its observations so a recovered asset still counts. Off mode is silent.
+- **Setup wizard visual polish.** The `kei config setup` wizard now has dimmed section banners between steps, green-bold ✓ checkmarks on step completions, brief spinners during TOML generation and config write, and a styled TOML preview with dimmed comments and cyan section headers. Prompts use warmer, more conversational language throughout. No new dependencies. ([#373])
+- **Friendly-mode per-album done lines.** Multi-album syncs in `--friendly` mode now print a column-aligned `✓` line for each completed album pass (`✓ Family  1,204 / 1,204  2m 04s`). Single-album and off-mode runs skip this. ([#374])
+
+### Changed
+
+- **rpassword bumped to 7.5.2.** Supersedes stale dependabot PRs #353 and #354. No user-visible change. ([#357])
 
 ### Fixed
 
 - **Friendly-mode Ctrl+C now prints a stop line.** Friendly tracing filters to WARN+, so the existing `Received shutdown signal...` info lines were silently dropped, leaving `--friendly` users with no response on first Ctrl+C. The shutdown handler now also writes `Stopping. Finishing in-flight downloads. Press Ctrl+C again to exit immediately.` via narration. Off mode is unchanged.
 - **Friendly-mode no longer leaves a ghost top rule above the bar after Ctrl+C.** Indicatif fills the last bar row with spaces to the terminal's right edge, parking the cursor at column `term_width`; when the tty driver echoed `^C` there it overflowed to a new line, throwing the next `cursor_up` off by one and leaving the prior top rule as a stale frame above the live bar. Two coordinated fixes: narration now routes through `MultiProgress::println` (single atomic draw, no clear/write/redraw window where caller writes can desync indicatif's line tracking), and the friendly bar clears the `ECHOCTL` termios flag on stdin while it's active so the `^C` echo never lands (Unix only - Windows console doesn't echo `^C` and doesn't reproduce the bug). Restored on Drop and on both `process::exit` paths so a force-quit doesn't leave the user's shell with control-char echo silenced.
+- **100 MiB free-space floor before enumeration.** kei now requires at least 100 MiB of free space on the download filesystem before starting iCloud enumeration, preventing a cycle that enumerates thousands of assets then fails every download with "no space left". ([#372])
+- **State-write failures now produce a non-zero exit code.** `complete_sync_run` failure was silently swallowed, so a full disk at the "commit sync results" stage looked like a clean exit. Now bumps `state_write_failures` and propagates through the exit-code logic. ([#372])
+- **Help text and service messaging polish.** `--friendly`/`--no-friendly` show short help in `-h`; top-level `--help` footer groups commands logically; `kei install` prints the `kei uninstall` counterpart hint; double-uninstall says "already removed" instead of a path-not-found diagnostic; sleeping-until heartbeat adds "(local time)" disambiguation. ([#374])
 
 [#351]: https://github.com/rhoopr/kei/pull/351
 [#352]: https://github.com/rhoopr/kei/pull/352
@@ -40,6 +49,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [#356]: https://github.com/rhoopr/kei/pull/356
 [#358]: https://github.com/rhoopr/kei/pull/358
 [#359]: https://github.com/rhoopr/kei/pull/359
+[#357]: https://github.com/rhoopr/kei/pull/357
+[#362]: https://github.com/rhoopr/kei/pull/362
+[#363]: https://github.com/rhoopr/kei/pull/363
+[#364]: https://github.com/rhoopr/kei/pull/364
+[#365]: https://github.com/rhoopr/kei/pull/365
+[#366]: https://github.com/rhoopr/kei/pull/366
+[#367]: https://github.com/rhoopr/kei/pull/367
+[#370]: https://github.com/rhoopr/kei/pull/370
+[#371]: https://github.com/rhoopr/kei/pull/371
+[#372]: https://github.com/rhoopr/kei/pull/372
+[#373]: https://github.com/rhoopr/kei/pull/373
+[#374]: https://github.com/rhoopr/kei/pull/374
+
+## [Unreleased]
 
 ---
 
