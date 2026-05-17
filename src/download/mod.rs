@@ -101,7 +101,7 @@ pub struct SyncStats {
     /// Number of tasks that observed at least one HTTP 429 / 503 response
     /// during retry. A high ratio of rate_limited / assets_seen signals the
     /// sync is running against a back-pressured account; operators should
-    /// either raise --watch-with-interval or lower --threads-num.
+    /// either raise --watch-with-interval or lower --threads.
     pub rate_limited: usize,
     /// Photos downloaded this run (`MediaType::Photo` and
     /// `MediaType::LivePhotoImage`). Sums to `downloaded` together with
@@ -2765,7 +2765,6 @@ mod tests {
             friendly_request: None,
             keep_unicode_in_filenames: false,
             only_print_filenames: false,
-            no_incremental: false,
             notify_systemd: false,
             save_password: false,
         };
@@ -3214,10 +3213,9 @@ mod tests {
             username: Some("test@example.com".to_string()),
             domain: None,
             data_dir: Some(cookie_dir.to_string_lossy().into_owned()),
-            cookie_directory: None,
         };
         let mut sync = SyncArgs {
-            directory: Some(directory.to_string()),
+            download_dir: Some(directory.to_string()),
             ..SyncArgs::default()
         };
         overrides(&mut sync);
@@ -3273,11 +3271,11 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_config_hash_different_exclude_albums() {
+    fn test_compute_config_hash_different_inline_album_excludes() {
         let tmp = TempDir::new().unwrap();
         let a = build_config_with(tmp.path(), "/photos", |_| {});
         let b = build_config_with(tmp.path(), "/photos", |s| {
-            s.exclude_albums = vec!["Hidden".to_string()];
+            s.albums = vec!["!Hidden".to_string()];
         });
         assert_ne!(compute_config_hash(&a), compute_config_hash(&b));
     }
@@ -3733,8 +3731,11 @@ mod tests {
     fn golden_compute_config_hash_with_albums() {
         let tmp = TempDir::new().unwrap();
         let config = build_config_with(tmp.path(), "/photos", |s| {
-            s.albums = vec!["Favorites".to_string(), "Travel".to_string()];
-            s.exclude_albums = vec!["Hidden".to_string()];
+            s.albums = vec![
+                "Favorites".to_string(),
+                "Travel".to_string(),
+                "!Hidden".to_string(),
+            ];
         });
         let hash = compute_config_hash(&config);
         assert_eq!(

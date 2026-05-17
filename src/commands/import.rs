@@ -692,50 +692,20 @@ pub(crate) async fn run_import_existing(
 /// Build the [`Selection`] that `resolve_passes` consumes for import.
 ///
 /// `import-existing` has no `--album` / `--smart-folder` / `--unfiled` CLI
-/// flags of its own, so the selection comes from `[filters]` in TOML (with
-/// the same defaults as sync: `albums = "all"`, `smart_folders = "none"`,
-/// `unfiled = true`). The `LibrarySelector` was already resolved upstream
-/// and is threaded in directly so `Selection.libraries` matches what
-/// `resolve_libraries` walked.
-///
-/// Honours the same deprecated `[filters]` keys that `Config::build` does
-/// for `kei sync` -- singular `album`, and `exclude_albums` -- so a TOML
-/// that hasn't been migrated to the v0.13 array shape produces the same
-/// `Selection` for both commands. Without this, sync would scope to e.g.
-/// `Vacation` minus `Drafts` while import-existing silently fell back to
-/// the all-albums default.
+/// flags of its own, so the selection comes from current `[filters]` TOML:
+/// `albums`, `smart_folders`, and `unfiled`. The `LibrarySelector` was
+/// already resolved upstream and is threaded in directly so
+/// `Selection.libraries` matches what `resolve_libraries` walked.
 fn build_import_selection(
     toml_filters: Option<&config::TomlFilters>,
     libraries: &crate::selection::LibrarySelector,
 ) -> anyhow::Result<crate::selection::Selection> {
     use crate::selection::{parse_album_selector, parse_smart_folder_selector, Selection};
 
-    let toml_album_singular = toml_filters.and_then(|f| f.album.clone());
-    if toml_album_singular.is_some() {
-        config::warn_deprecated(
-            "`[filters].album` (singular string)",
-            "`[filters].albums = [\"name\"]` (array)",
-        );
-    }
-    let toml_exclude_albums = toml_filters.and_then(|f| f.exclude_albums.clone());
-    if toml_exclude_albums.as_ref().is_some_and(|v| !v.is_empty()) {
-        config::warn_deprecated(
-            "`[filters].exclude_albums`",
-            "`!name` entries inside `[filters].albums`",
-        );
-    }
-    // Array form wins; lift the singular only when the array is absent so
-    // a user who set both during migration doesn't lose the array shape.
-    let mut raw_albums: Vec<String> = toml_filters
+    let raw_albums: Vec<String> = toml_filters
         .and_then(|f| f.albums.as_ref())
         .cloned()
-        .or_else(|| toml_album_singular.map(|s| vec![s]))
         .unwrap_or_default();
-    if let Some(excludes) = toml_exclude_albums {
-        for name in excludes {
-            raw_albums.push(format!("!{name}"));
-        }
-    }
     let raw_smart_folders: Vec<String> = toml_filters
         .and_then(|f| f.smart_folders.as_ref())
         .cloned()
@@ -789,22 +759,7 @@ fn build_import_download_config(
 ) -> anyhow::Result<download::DownloadConfig> {
     let toml_dl = toml.and_then(|t| t.download.as_ref());
 
-    anyhow::ensure!(
-        !(args.download_dir.is_some() && args.directory.is_some()),
-        "both `--download-dir` and `--directory` are set; `--directory` is \
-         deprecated and will be removed in v0.20.0 -- pick one"
-    );
-    let directory_cli = if let Some(d) = args.download_dir.clone() {
-        Some(d)
-    } else if let Some(d) = args.directory.clone() {
-        tracing::warn!(
-            "`--directory` / `KEI_DIRECTORY` is deprecated and will be removed in v0.20.0, \
-             use `--download-dir` / `KEI_DOWNLOAD_DIR` instead"
-        );
-        Some(d)
-    } else {
-        None
-    };
+    let directory_cli = args.download_dir.clone();
     let directory_str = directory_cli
         .or_else(|| toml_dl.and_then(|d| d.directory.clone()))
         .unwrap_or_default();
@@ -842,12 +797,8 @@ fn build_import_download_config(
 
 #[cfg(test)]
 mod build_selection_tests {
-    //! Sync vs. import-existing parity for the v0.13 selector resolution. Both
-    //! commands must produce the same `Selection` from the same TOML, including
-    //! the deprecated singular `[filters].album` key and the deprecated
-    //! `[filters].exclude_albums` array. Without parity, a user with a TOML
-    //! that hasn't been migrated yet would see sync include an album that
-    //! import-existing silently skipped (or vice-versa for excludes).
+    //! Sync vs. import-existing parity for the current selector resolution.
+    //! Both commands must produce the same `Selection` from the same TOML.
     use super::build_import_selection;
     use crate::config::TomlFilters;
     use crate::selection::{AlbumSelector, LibrarySelector, Selection, SmartFolderSelector};
@@ -857,80 +808,7 @@ mod build_selection_tests {
         LibrarySelector::default()
     }
 
-    /// `[filters].album = "Foo"` (singular, deprecated) should resolve to the
-    /// same `AlbumSelector::Named { ["Foo"], excluded: {} }` that
-    /// `[filters].albums = ["Foo"]` produces. Pre-fix, import-existing read
-    /// only the array form so the singular silently fell through to the
-    /// "all albums" default.
-    #[test]
-    fn deprecated_album_singular_lifts_to_named_selector() {
-        let filters = TomlFilters {
-            album: Some("Vacation".to_string()),
-            ..TomlFilters::default()
-        };
-        let selection = build_import_selection(Some(&filters), &primary())
-            .expect("build_import_selection accepts deprecated singular `album`");
-        match selection.albums {
-            AlbumSelector::Named { included, excluded } => {
-                assert_eq!(
-                    included,
-                    BTreeSet::from(["Vacation".to_string()]),
-                    "singular `[filters].album` must lift into the named-include set"
-                );
-                assert!(
-                    excluded.is_empty(),
-                    "no excludes were configured; the lift must not invent any"
-                );
-            }
-            other => panic!("expected AlbumSelector::Named, got {other:?}"),
-        }
-    }
-
-    /// `[filters].exclude_albums = ["Drafts"]` (deprecated) should fold into
-    /// the active selector as a `!Drafts` entry. Pre-fix, the deprecated
-    /// excludes were silently dropped on the import-existing path.
-    #[test]
-    fn deprecated_exclude_albums_fold_into_inline_excludes() {
-        let filters = TomlFilters {
-            albums: Some(vec!["all".to_string()]),
-            exclude_albums: Some(vec!["Drafts".to_string(), "Hidden".to_string()]),
-            ..TomlFilters::default()
-        };
-        let selection = build_import_selection(Some(&filters), &primary())
-            .expect("build_import_selection accepts deprecated exclude_albums");
-        match selection.albums {
-            AlbumSelector::All { excluded } => {
-                assert_eq!(
-                    excluded,
-                    BTreeSet::from(["Drafts".to_string(), "Hidden".to_string()]),
-                    "exclude_albums entries must surface as inline `!name` excludes"
-                );
-            }
-            other => panic!("expected AlbumSelector::All, got {other:?}"),
-        }
-    }
-
-    /// Combined: deprecated singular `album` + deprecated `exclude_albums`
-    /// is the legacy v0.12 shape. Both must thread through together.
-    #[test]
-    fn deprecated_singular_plus_excludes_combine() {
-        let filters = TomlFilters {
-            album: Some("Vacation".to_string()),
-            exclude_albums: Some(vec!["Drafts".to_string()]),
-            ..TomlFilters::default()
-        };
-        let selection = build_import_selection(Some(&filters), &primary()).expect("ok");
-        match selection.albums {
-            AlbumSelector::Named { included, excluded } => {
-                assert_eq!(included, BTreeSet::from(["Vacation".to_string()]));
-                assert_eq!(excluded, BTreeSet::from(["Drafts".to_string()]));
-            }
-            other => panic!("expected AlbumSelector::Named, got {other:?}"),
-        }
-    }
-
-    /// New-shape input (array `albums`) keeps working unchanged. Sanity check
-    /// that the deprecation-handling rewrite didn't regress the v0.13 path.
+    /// Current-shape input uses the array `albums` selector.
     #[test]
     fn new_albums_array_still_works() {
         let filters = TomlFilters {
@@ -942,29 +820,6 @@ mod build_selection_tests {
             AlbumSelector::Named { included, excluded } => {
                 assert_eq!(included, BTreeSet::from(["Vacation".to_string()]));
                 assert_eq!(excluded, BTreeSet::from(["Family".to_string()]));
-            }
-            other => panic!("expected AlbumSelector::Named, got {other:?}"),
-        }
-    }
-
-    /// When both the array and the singular are set (mid-migration TOML), the
-    /// array wins. Mirrors `Config::build`'s precedence so sync and import
-    /// can't disagree on which key takes effect.
-    #[test]
-    fn albums_array_wins_over_singular_when_both_set() {
-        let filters = TomlFilters {
-            album: Some("OLD".to_string()),
-            albums: Some(vec!["NEW".to_string()]),
-            ..TomlFilters::default()
-        };
-        let selection = build_import_selection(Some(&filters), &primary()).expect("ok");
-        match selection.albums {
-            AlbumSelector::Named { included, .. } => {
-                assert_eq!(
-                    included,
-                    BTreeSet::from(["NEW".to_string()]),
-                    "array form must take precedence over the deprecated singular"
-                );
             }
             other => panic!("expected AlbumSelector::Named, got {other:?}"),
         }
@@ -2934,7 +2789,6 @@ mod build_config_tests {
             photos: None,
             watch: None,
             notifications: None,
-            metrics: None,
             server: None,
             report: None,
             ui: None,
@@ -3188,14 +3042,13 @@ mod build_config_tests {
             align_raw: Some(RawTreatmentPolicy::PreferOriginal),
             force_size: Some(true),
             keep_unicode_in_filenames: Some(true),
-            directory: Some("/photos".to_string()),
+            download_dir: Some("/photos".to_string()),
             ..Default::default()
         };
         let globals = GlobalArgs {
             username: Some("u@example.com".to_string()),
             domain: None,
             data_dir: None,
-            cookie_directory: None,
         };
         let sync_cfg = Config::build(
             &globals,
@@ -3243,14 +3096,13 @@ mod build_config_tests {
             .expect_err("import: system dir must reject");
 
         let sync = SyncArgs {
-            directory: Some("/etc".to_string()),
+            download_dir: Some("/etc".to_string()),
             ..Default::default()
         };
         let globals = GlobalArgs {
             username: Some("u@example.com".to_string()),
             domain: None,
             data_dir: None,
-            cookie_directory: None,
         };
         let sync_err = Config::build(&globals, &crate::cli::PasswordArgs::default(), sync, None)
             .expect_err("sync: system dir must reject");
@@ -3298,26 +3150,6 @@ mod build_config_tests {
         assert!(
             msg.contains("libraries PrimarySync, SharedSync-abc"),
             "must use plural `libraries` and list both, got: {msg}"
-        );
-    }
-
-    /// CG-10: setting both `--directory` (deprecated) and `--download-dir`
-    /// at once fails fast rather than letting one silently win. The
-    /// deprecation warning users rely on requires this guard to stay
-    /// strict.
-    #[test]
-    fn build_import_download_config_both_directory_flags_bails() {
-        let args = parse_import_args(&["--directory", "/old/photos"]);
-        // parse_import_args already set --download-dir=/photos, so both
-        // are present.
-        assert!(args.download_dir.is_some());
-        assert!(args.directory.is_some());
-        let err = build_import_download_config(&args, None)
-            .expect_err("both directory flags should bail");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("--directory") && (msg.contains("deprecated") || msg.contains("pick one")),
-            "error must name the deprecation conflict, got: {msg}"
         );
     }
 }

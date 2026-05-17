@@ -4,16 +4,10 @@
 //! (monitoring tools, Home Assistant, webhooks). In watch mode the file is
 //! overwritten every cycle — it's the current cycle's state, not a history log.
 //!
-//! # Schema v2 — pending v0.20.0
+//! # Schema v2
 //!
-//! Several `RunOptions` field names trail CLI renames during the v0.20.0
-//! deprecation window. When those flags are removed, bump `SyncReport.version`
-//! from `"1"` to `"2"` and apply these changes together (breaking the wire
-//! format once instead of drip-feeding churn):
-//!
-//! - `options.directory` → `options.download_dir` (matches `--download-dir`)
-//! - `options.threads_num` → `options.threads` (matches `--threads`)
-//! - `options.no_incremental` → removed (`--no-incremental` is gone)
+//! v2 renames run-option fields to match the v0.20 public CLI and removes
+//! deprecated incremental controls.
 
 use std::path::{Path, PathBuf};
 
@@ -89,7 +83,7 @@ const fn is_zero_usize(n: &usize) -> bool {
 #[derive(Debug, Serialize)]
 pub(crate) struct RunOptions {
     pub username: String,
-    pub directory: PathBuf,
+    pub download_dir: PathBuf,
     pub folder_structure: String,
     pub size: String,
     pub live_photo_mode: String,
@@ -105,8 +99,7 @@ pub(crate) struct RunOptions {
     pub set_exif_description: bool,
     pub embed_xmp: bool,
     pub xmp_sidecar: bool,
-    pub threads_num: u16,
-    pub no_incremental: bool,
+    pub threads: u16,
     pub dry_run: bool,
 }
 
@@ -115,7 +108,7 @@ impl RunOptions {
     pub(crate) fn from_config(config: &crate::config::Config) -> Self {
         Self {
             username: config.username.clone(),
-            directory: config.directory.clone(),
+            download_dir: config.directory.clone(),
             folder_structure: config.folder_structure.clone(),
             size: format!("{:?}", config.size).to_lowercase(),
             live_photo_mode: format!("{:?}", config.live_photo_mode).to_lowercase(),
@@ -149,8 +142,7 @@ impl RunOptions {
             xmp_sidecar: config.xmp_sidecar,
             #[cfg(not(feature = "xmp"))]
             xmp_sidecar: false,
-            threads_num: config.threads_num,
-            no_incremental: config.no_incremental,
+            threads: config.threads_num,
             dry_run: config.dry_run,
         }
     }
@@ -276,13 +268,13 @@ mod tests {
     #[test]
     fn report_serialization_roundtrip() {
         let report = SyncReport {
-            version: "1",
+            version: "2",
             kei_version: "0.7.12",
             timestamp: "2026-04-15T12:00:00Z".to_string(),
             status: "success".to_string(),
             options: RunOptions {
                 username: "user@example.com".to_string(),
-                directory: PathBuf::from("/photos"),
+                download_dir: PathBuf::from("/photos"),
                 folder_structure: "{:%Y/%m/%d}".to_string(),
                 size: "original".to_string(),
                 live_photo_mode: "original".to_string(),
@@ -298,8 +290,7 @@ mod tests {
                 set_exif_description: false,
                 embed_xmp: false,
                 xmp_sidecar: false,
-                threads_num: 4,
-                no_incremental: false,
+                threads: 4,
                 dry_run: false,
             },
             stats: SyncStats {
@@ -325,7 +316,7 @@ mod tests {
         let json = serde_json::to_string_pretty(&report).expect("serialize");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
 
-        assert_eq!(parsed["version"], "1");
+        assert_eq!(parsed["version"], "2");
         assert_eq!(parsed["status"], "success");
         assert_eq!(parsed["stats"]["downloaded"], 50);
         assert_eq!(parsed["stats"]["skipped"]["by_state"], 300);
@@ -336,18 +327,59 @@ mod tests {
     }
 
     #[test]
+    fn run_options_from_config_uses_schema_v2_option_names() {
+        let download_dir = tempfile::tempdir().expect("download dir");
+        let globals = crate::config::GlobalArgs {
+            username: Some("report@example.com".to_string()),
+            domain: None,
+            data_dir: None,
+        };
+        let sync = crate::cli::SyncArgs {
+            download_dir: Some(download_dir.path().display().to_string()),
+            threads: Some(6),
+            ..crate::cli::SyncArgs::default()
+        };
+        let config = crate::config::Config::build(
+            &globals,
+            &crate::cli::PasswordArgs::default(),
+            sync,
+            None,
+        )
+        .expect("build config");
+
+        let options = RunOptions::from_config(&config);
+        assert_eq!(options.download_dir, download_dir.path());
+        assert_eq!(options.threads, 6);
+
+        let json = serde_json::to_value(&options).expect("serialize options");
+        assert_eq!(
+            json["download_dir"],
+            download_dir.path().display().to_string()
+        );
+        assert_eq!(json["threads"], 6);
+        assert!(
+            json.get("directory").is_none(),
+            "schema v2 must not emit the legacy options.directory key"
+        );
+        assert!(
+            json.get("threads_num").is_none(),
+            "schema v2 must not emit the legacy options.threads_num key"
+        );
+    }
+
+    #[test]
     fn failed_assets_are_omitted_when_empty() {
         // serde(skip_serializing_if = "Vec::is_empty") on failed_assets
         // and is_zero_usize on failed_assets_truncated must keep clean-run
         // reports free of both fields.
         let report = SyncReport {
-            version: "1",
+            version: "2",
             kei_version: "test",
             timestamp: "2026-04-15T12:00:00Z".to_string(),
             status: "success".to_string(),
             options: RunOptions {
                 username: "u".to_string(),
-                directory: PathBuf::from("/x"),
+                download_dir: PathBuf::from("/x"),
                 folder_structure: String::new(),
                 size: String::new(),
                 live_photo_mode: String::new(),
@@ -363,8 +395,7 @@ mod tests {
                 set_exif_description: false,
                 embed_xmp: false,
                 xmp_sidecar: false,
-                threads_num: 1,
-                no_incremental: false,
+                threads: 1,
                 dry_run: false,
             },
             stats: SyncStats::default(),
@@ -390,13 +421,13 @@ mod tests {
             error_message: Some("HTTP 429".to_string()),
         };
         let report = SyncReport {
-            version: "1",
+            version: "2",
             kei_version: "test",
             timestamp: "2026-04-15T12:00:00Z".to_string(),
             status: "partial_failure".to_string(),
             options: RunOptions {
                 username: "u".to_string(),
-                directory: PathBuf::from("/x"),
+                download_dir: PathBuf::from("/x"),
                 folder_structure: String::new(),
                 size: String::new(),
                 live_photo_mode: String::new(),
@@ -412,8 +443,7 @@ mod tests {
                 set_exif_description: false,
                 embed_xmp: false,
                 xmp_sidecar: false,
-                threads_num: 1,
-                no_incremental: false,
+                threads: 1,
                 dry_run: false,
             },
             stats: SyncStats {
@@ -434,13 +464,13 @@ mod tests {
     #[test]
     fn failed_assets_truncated_emitted_when_nonzero() {
         let report = SyncReport {
-            version: "1",
+            version: "2",
             kei_version: "test",
             timestamp: "2026-04-15T12:00:00Z".to_string(),
             status: "partial_failure".to_string(),
             options: RunOptions {
                 username: "u".to_string(),
-                directory: PathBuf::from("/x"),
+                download_dir: PathBuf::from("/x"),
                 folder_structure: String::new(),
                 size: String::new(),
                 live_photo_mode: String::new(),
@@ -456,8 +486,7 @@ mod tests {
                 set_exif_description: false,
                 embed_xmp: false,
                 xmp_sidecar: false,
-                threads_num: 1,
-                no_incremental: false,
+                threads: 1,
                 dry_run: false,
             },
             stats: SyncStats::default(),
@@ -479,13 +508,13 @@ mod tests {
         let path = dir.path().join("report.json");
 
         let report = SyncReport {
-            version: "1",
+            version: "2",
             kei_version: "0.7.12",
             timestamp: "2026-04-15T12:00:00Z".to_string(),
             status: "success".to_string(),
             options: RunOptions {
                 username: "test@example.com".to_string(),
-                directory: PathBuf::from("/tmp/photos"),
+                download_dir: PathBuf::from("/tmp/photos"),
                 folder_structure: "{:%Y/%m/%d}".to_string(),
                 size: "original".to_string(),
                 live_photo_mode: "original".to_string(),
@@ -501,8 +530,7 @@ mod tests {
                 set_exif_description: false,
                 embed_xmp: false,
                 xmp_sidecar: false,
-                threads_num: 3,
-                no_incremental: false,
+                threads: 3,
                 dry_run: false,
             },
             stats: SyncStats::default(),
@@ -514,7 +542,7 @@ mod tests {
 
         let content = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).expect("valid JSON");
-        assert_eq!(parsed["version"], "1");
+        assert_eq!(parsed["version"], "2");
         assert_eq!(parsed["options"]["username"], "test@example.com");
     }
 }

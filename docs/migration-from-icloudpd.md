@@ -72,9 +72,8 @@ kei import-existing --username you@example.com --download-dir ~/Photos/iCloud \
   --folder-structure-albums "{album}/%Y/%m/%d"
 ```
 
-Putting `{album}` in `--folder-structure` still works for now, but kei prints a
-deprecation warning and auto-migrates it. Update the command or TOML before
-v0.20.
+On v0.20 and later, `{album}` is only accepted in
+`--folder-structure-albums`.
 
 ### Filename policy
 
@@ -147,17 +146,17 @@ if you want kei to store the password for future runs.
 |---|---|---|
 | `-u`, `--username` | Same | Also `ICLOUD_USERNAME`. |
 | `-p`, `--password` | Same | Works, but process lists can expose it. Prefer `kei password set`, `--password-file`, or `--password-command`. |
-| `-d`, `--directory` | `-d`, `--download-dir` | `--directory` still parses as a hidden deprecated alias through v0.20. |
+| `-d`, `--directory` | `-d`, `--download-dir` | `--directory` was removed in v0.20. |
 | `-a`, `--album` | Same | Repeatable. Default is `all`; use `--album '!Name'` for exclusions. |
-| `--exclude-album NAME` | `--album '!NAME'` | Deprecated alias through v0.20. |
-| `--list-albums` | `kei list albums` | The old flag is hidden and deprecated. |
-| `--list-libraries` | `kei list libraries` | The old flag is hidden and deprecated. |
-| `--cookie-directory` | `--data-dir` | New default is `~/.config/kei`. |
+| `--exclude-album NAME` | `--album '!NAME'` | Removed in v0.20. |
+| `--list-albums` | `kei list albums` | The old flag was removed in v0.20. |
+| `--list-libraries` | `kei list libraries` | The old flag was removed in v0.20. |
+| `--cookie-directory` | `--data-dir` | The old flag was removed in v0.20. New default is `~/.config/kei`. |
 | `--folder-structure "{:%Y/%m/%d}"` | `--folder-structure "%Y/%m/%d"` | Python wrapper syntax is still accepted. Album and smart-folder templates now have separate flags. |
 | `--size original` | Same | Values: `original`, `medium`, `thumb`, `adjusted`, `alternative`. kei accepts one size per run. |
-| `--threads-num` | `--threads` | Default is 10. With `--bandwidth-limit` and no explicit thread count, default drops to 1. |
+| `--threads-num` | `--threads` | The old flag was removed in v0.20. Default is 10. With `--bandwidth-limit` and no explicit thread count, default drops to 1. |
 | `--skip-videos`, `--skip-photos` | Same | Boolean flags also accept explicit false when overriding config. |
-| `--skip-live-photos` | `--live-photo-mode skip` | Deprecated alias through v0.20. |
+| `--skip-live-photos` | `--live-photo-mode skip` | The old flag was removed in v0.20. |
 | `--recent 100` | Same | Count form works for sync and import. |
 | `--recent 30d` | Same for sync | Import rejects the days form. |
 | `--set-exif-datetime` | Same | kei also has EXIF rating, GPS, and description flags. |
@@ -215,32 +214,17 @@ iCloud metadata that Python didn't handle the same way.
 | `kei reconcile` | Mark missing local files as failed so the next sync re-downloads them. |
 | `--reconcile-every-n-cycles` | Periodic read-only reconciliation warning pass during watch mode. |
 
-## Deprecated kei compatibility aliases
+## Removed kei compatibility aliases
 
-These still work in 0.14.x and are scheduled for removal in v0.20:
+v0.20 removed the remaining v0.13 compatibility aliases:
 
 | Deprecated | Use |
 |---|---|
-| `--directory`, `KEI_DIRECTORY` | `--download-dir`, `KEI_DOWNLOAD_DIR` |
-| `--cookie-directory`, `[auth].cookie_directory` | `--data-dir`, top-level `data_dir` |
 | `--exclude-album`, `KEI_EXCLUDE_ALBUM` | `--album '!NAME'` |
 | `{album}` inside `--folder-structure` | `--folder-structure-albums "{album}/..."` |
 | `[filters].album` | `[filters].albums = ["NAME"]` |
 | `[filters].exclude_albums` | `[filters].albums = ["!NAME"]` |
 | `[filters].library` | `[filters].libraries` |
-| `--skip-live-photos`, `[filters].skip_live_photos` | `--live-photo-mode skip`, `[photos].live_photo_mode = "skip"` |
-| `--threads-num`, `[download].threads_num` | `--threads`, `[download].threads` |
-| `--retry-delay`, `[download.retry].delay` | Let kei derive retry delay from `--max-retries`. |
-| `--no-incremental` | Run `kei reset sync-token` before sync. |
-| `KEI_METRICS_PORT`, `[metrics].port` | `KEI_HTTP_PORT`, `[server].port` |
-| `kei credential` | `kei password` |
-| `kei setup` | `kei config setup` |
-| `kei get-code` | `kei login get-code` |
-| `kei submit-code` | `kei login submit-code` |
-| `kei auth-only` or `--auth-only` | `kei login` |
-| `kei retry-failed` | `kei sync --retry-failed` |
-| `kei reset-state` | `kei reset state` |
-| `kei reset-sync-token` or `--reset-sync-token` | `kei reset sync-token` |
 
 ## Docker migration
 

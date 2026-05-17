@@ -31,7 +31,6 @@ fn clean_cmd() -> assert_cmd::Command {
         .env_remove("ICLOUD_PASSWORD")
         .env_remove("KEI_CONFIG")
         .env_remove("KEI_DATA_DIR")
-        .env_remove("KEI_DIRECTORY")
         .env_remove("KEI_DOWNLOAD_DIR")
         .env_remove("KEI_DOMAIN")
         .env_remove("KEI_LOG_LEVEL")
@@ -216,229 +215,7 @@ fn behavioral_helper_schema_matches_production() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Deprecation warnings: every legacy command prints to stderr
-// ═══════════════════════════════════════════════════════════════════════
-
-/// Assert a legacy invocation prints a deprecation warning naming the new command.
-fn assert_deprecated(args: &[&str], should_succeed: bool, hint: &str) {
-    let dir = tempfile::tempdir().unwrap();
-    let data_dir = dir.path().to_str().unwrap();
-    let with_data_dir: Vec<&str> = args
-        .iter()
-        .map(|a| if *a == "__DATA_DIR__" { data_dir } else { *a })
-        .collect();
-    let assert = clean_cmd().args(&with_data_dir).assert();
-    let assert = if should_succeed {
-        assert.success()
-    } else {
-        assert.failure()
-    };
-    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
-    assert!(
-        stderr.contains("deprecated") && stderr.contains(hint),
-        "args={args:?} hint={hint:?} stderr={stderr}"
-    );
-}
-
-#[test]
-fn deprecation_get_code() {
-    assert_deprecated(
-        &["get-code", "--username", "x@x.com", "--data-dir", "/tmp"],
-        false,
-        "login get-code",
-    );
-}
-
-#[test]
-fn deprecation_submit_code() {
-    assert_deprecated(
-        &[
-            "submit-code",
-            "123456",
-            "--username",
-            "x@x.com",
-            "--data-dir",
-            "/tmp",
-        ],
-        false,
-        "login submit-code",
-    );
-}
-
-#[test]
-fn deprecation_credential() {
-    // `credential` subcommand may exit success or failure depending on backend;
-    // only the deprecation warning matters here.
-    let out = clean_cmd()
-        .args([
-            "credential",
-            "backend",
-            "--username",
-            "x@x.com",
-            "--data-dir",
-            "/tmp",
-        ])
-        .assert()
-        .get_output()
-        .clone();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("deprecated") && stderr.contains("kei password"),
-        "stderr: {stderr}"
-    );
-}
-
-#[test]
-fn deprecation_retry_failed() {
-    assert_deprecated(
-        &[
-            "retry-failed",
-            "--username",
-            "x@x.com",
-            "--data-dir",
-            "/tmp",
-        ],
-        false,
-        "sync --retry-failed",
-    );
-}
-
-#[test]
-fn deprecation_reset_state() {
-    assert_deprecated(
-        &[
-            "reset-state",
-            "--yes",
-            "--username",
-            "x@x.com",
-            "--data-dir",
-            "__DATA_DIR__",
-        ],
-        true,
-        "reset state",
-    );
-}
-
-#[test]
-fn deprecation_reset_sync_token() {
-    assert_deprecated(
-        &[
-            "reset-sync-token",
-            "--username",
-            "x@x.com",
-            "--data-dir",
-            "__DATA_DIR__",
-        ],
-        true,
-        "reset sync-token",
-    );
-}
-
-#[test]
-fn deprecation_setup() {
-    // --help short-circuits before effective_command(), so no deprecation warning.
-    // Just confirm the subcommand still parses.
-    clean_cmd().args(["setup", "--help"]).assert().success();
-}
-
-#[test]
-fn deprecation_auth_only_flag() {
-    assert_deprecated(
-        &["--auth-only", "--username", "x@x.com", "--data-dir", "/tmp"],
-        false,
-        "kei login",
-    );
-}
-
-#[test]
-fn deprecation_list_albums_flag() {
-    assert_deprecated(
-        &[
-            "--list-albums",
-            "--username",
-            "x@x.com",
-            "--data-dir",
-            "/tmp",
-        ],
-        false,
-        "list albums",
-    );
-}
-
-#[test]
-fn deprecation_reset_sync_token_flag_on_sync() {
-    // Covers the `kei sync --reset-sync-token ...` path specifically,
-    // distinct from the legacy top-level `kei reset-sync-token` subcommand.
-    // The flag is hidden, still parses, still clears the token, but must
-    // now warn and name v0.20.0 as the removal target.
-    let dir = tempfile::tempdir().unwrap();
-    let data_dir = dir.path().to_str().unwrap();
-    let dl_dir = tempfile::tempdir().unwrap();
-    let assert = clean_cmd()
-        .args([
-            "sync",
-            "--reset-sync-token",
-            "--username",
-            "x@x.com",
-            "--download-dir",
-            dl_dir.path().to_str().unwrap(),
-            "--data-dir",
-            data_dir,
-            "--dry-run", // still goes through run_sync; fails at password resolution
-        ])
-        .assert()
-        .failure();
-    // Regardless of the password-resolution failure that follows, the
-    // --reset-sync-token warning fires earlier at flag-read time.
-    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
-    assert!(
-        stderr.contains("--reset-sync-token") && stderr.contains("kei reset sync-token"),
-        "expected reset-sync-token flag deprecation warning; stderr={stderr}"
-    );
-}
-
-#[test]
-fn deprecation_warning_names_v0_20_0_removal() {
-    // Guards the shared `deprecation_warning()` helper — every flag-rename
-    // warning in the codebase flows through it, so asserting one path
-    // carries v0.20.0 protects all of them from regressing back to a
-    // vague "a future release" wording.
-    let dir = tempfile::tempdir().unwrap();
-    let data_dir = dir.path().to_str().unwrap();
-    let assert = clean_cmd()
-        .args([
-            "--list-libraries",
-            "--username",
-            "x@x.com",
-            "--data-dir",
-            data_dir,
-        ])
-        .assert()
-        .failure();
-    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
-    assert!(
-        stderr.contains("v0.20.0"),
-        "deprecation warning must name v0.20.0 as removal target; stderr={stderr}"
-    );
-}
-
-#[test]
-fn deprecation_list_libraries_flag() {
-    assert_deprecated(
-        &[
-            "--list-libraries",
-            "--username",
-            "x@x.com",
-            "--data-dir",
-            "/tmp",
-        ],
-        false,
-        "list libraries",
-    );
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// New commands: NO deprecation warnings
+// Current commands: no deprecation warnings
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -659,7 +436,7 @@ username = "toml@example.com"
 
 [download]
 directory = "/toml/photos"
-threads_num = 4
+threads = 4
 "#,
     )
     .unwrap();
@@ -682,7 +459,7 @@ threads_num = 4
     assert!(stdout.contains("/toml/photos"), "stdout: {stdout}");
     assert!(
         stdout.contains("4"),
-        "threads_num should be 4, stdout: {stdout}"
+        "threads should be 4, stdout: {stdout}"
     );
 }
 
@@ -890,7 +667,7 @@ fn sync_requires_directory() {
         ])
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("--directory is required"));
+        .stderr(predicate::str::contains("--download-dir is required"));
 }
 
 #[test]
@@ -1002,24 +779,6 @@ fn reset_sync_token_no_db() {
         .stdout(predicate::str::contains("No state database found"));
 }
 
-// Legacy reset-state also works with no DB
-#[test]
-fn legacy_reset_state_no_db() {
-    let dir = tempfile::tempdir().unwrap();
-    clean_cmd()
-        .args([
-            "reset-state",
-            "--yes",
-            "--username",
-            "test@example.com",
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("No state database found"));
-}
-
 // ═══════════════════════════════════════════════════════════════════════
 // password backend: shows backend name without auth
 // ═══════════════════════════════════════════════════════════════════════
@@ -1089,42 +848,6 @@ fn password_backend_with_empty_data_dir_reports_none() {
     );
 }
 
-// Legacy credential backend produces same output as new
-#[test]
-fn legacy_credential_backend_same_as_new() {
-    let dir = tempfile::tempdir().unwrap();
-    let base = [
-        "--username",
-        "test@example.com",
-        "--data-dir",
-        dir.path().to_str().unwrap(),
-    ];
-
-    let old = clean_cmd()
-        .args(["credential", "backend"])
-        .args(base)
-        .output()
-        .unwrap();
-    let new = clean_cmd()
-        .args(["password", "backend"])
-        .args(base)
-        .output()
-        .unwrap();
-
-    assert_eq!(old.stdout, new.stdout, "same stdout");
-    // Old should have deprecation warning, new should not
-    let old_stderr = String::from_utf8_lossy(&old.stderr);
-    let new_stderr = String::from_utf8_lossy(&new.stderr);
-    assert!(
-        old_stderr.contains("deprecated"),
-        "old stderr: {old_stderr}"
-    );
-    assert!(
-        !new_stderr.contains("deprecated"),
-        "new stderr: {new_stderr}"
-    );
-}
-
 // ═══════════════════════════════════════════════════════════════════════
 // Env var behavior: KEI_* vars actually resolve
 // ═══════════════════════════════════════════════════════════════════════
@@ -1168,32 +891,6 @@ fn cli_flag_overrides_env_var() {
         .assert()
         .success()
         .stdout(predicate::str::contains("cli@icloud.com"));
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// --data-dir vs --cookie-directory behavior
-// ═══════════════════════════════════════════════════════════════════════
-
-#[test]
-fn cookie_directory_prints_deprecation() {
-    let dir = tempfile::tempdir().unwrap();
-    let out = clean_cmd()
-        .args([
-            "status",
-            "--username",
-            "x@x.com",
-            "--cookie-directory",
-            dir.path().to_str().unwrap(),
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("--cookie-directory") && stderr.contains("deprecated"),
-        "should warn about deprecated --cookie-directory, stderr: {stderr}"
-    );
 }
 
 #[test]
@@ -1285,81 +982,6 @@ fn first_run_auto_config_does_not_overwrite() {
         content, "# existing config\n",
         "auto-config must not overwrite existing file"
     );
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// Old -> new behavioral equivalence
-// ═══════════════════════════════════════════════════════════════════════
-
-#[test]
-fn legacy_and_new_credential_backend_same_output() {
-    let dir = tempfile::tempdir().unwrap();
-    let args_base = [
-        "--username",
-        "x@x.com",
-        "--data-dir",
-        dir.path().to_str().unwrap(),
-    ];
-
-    let old = clean_cmd()
-        .args(["credential", "backend"])
-        .args(args_base)
-        .output()
-        .unwrap();
-    let new = clean_cmd()
-        .args(["password", "backend"])
-        .args(args_base)
-        .output()
-        .unwrap();
-
-    assert_eq!(
-        old.stdout, new.stdout,
-        "credential backend and password backend should produce same stdout"
-    );
-}
-
-#[test]
-fn legacy_and_new_reset_state_same_behavior() {
-    // Both should print "No state database found" (path differs, so
-    // compare the prefix instead of exact bytes).
-    let dir1 = tempfile::tempdir().unwrap();
-    let dir2 = tempfile::tempdir().unwrap();
-
-    let old = clean_cmd()
-        .args([
-            "reset-state",
-            "--yes",
-            "--username",
-            "x@x.com",
-            "--data-dir",
-            dir1.path().to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    let new = clean_cmd()
-        .args([
-            "reset",
-            "state",
-            "--yes",
-            "--username",
-            "x@x.com",
-            "--data-dir",
-            dir2.path().to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-
-    let old_out = String::from_utf8_lossy(&old.stdout);
-    let new_out = String::from_utf8_lossy(&new.stdout);
-    assert!(
-        old_out.contains("No state database found"),
-        "old: {old_out}"
-    );
-    assert!(
-        new_out.contains("No state database found"),
-        "new: {new_out}"
-    );
-    assert_eq!(old.status, new.status, "exit codes should match");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1640,12 +1262,12 @@ fn config_watch_interval_below_60_in_toml() {
 }
 
 #[test]
-fn config_retry_delay_zero_in_toml() {
+fn config_retry_delay_toml_key_is_removed() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
     std::fs::write(
         &config_path,
-        "[auth]\nusername = \"x@x.com\"\n\n[download]\ndirectory = \"/photos\"\n\n[download.retry]\ndelay = 0\n",
+        "[auth]\nusername = \"x@x.com\"\n\n[download]\ndirectory = \"/photos\"\n\n[download.retry]\ndelay = 5\n",
     )
     .unwrap();
 
@@ -1659,16 +1281,16 @@ fn config_retry_delay_zero_in_toml() {
         ])
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("retry delay"));
+        .stderr(predicate::str::contains("unknown field `delay`"));
 }
 
 #[test]
-fn config_threads_num_zero_in_toml() {
+fn config_threads_num_toml_key_is_removed() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
     std::fs::write(
         &config_path,
-        "[auth]\nusername = \"x@x.com\"\n\n[download]\ndirectory = \"/photos\"\nthreads_num = 0\n",
+        "[auth]\nusername = \"x@x.com\"\n\n[download]\ndirectory = \"/photos\"\nthreads_num = 4\n",
     )
     .unwrap();
 
@@ -1682,7 +1304,7 @@ fn config_threads_num_zero_in_toml() {
         ])
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("threads_num"));
+        .stderr(predicate::str::contains("unknown field `threads_num`"));
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -2514,51 +2136,6 @@ fn reset_sync_token_with_yes_clears_under_non_tty() {
     );
 }
 
-#[test]
-fn legacy_reset_sync_token_alias_still_clears_without_yes() {
-    // The hidden compat command `kei reset-sync-token` (deprecated, no
-    // subcommand) historically auto-confirmed. Preserve that behavior so
-    // existing shell scripts and docker callers keep working until v0.20.
-    let dir = tempfile::tempdir().unwrap();
-    let username = "test@example.com";
-    let conn = create_state_db(dir.path(), username);
-    conn.execute(
-        "INSERT INTO metadata (key, value) VALUES ('sync_token:PrimarySync', 'tok-legacy')",
-        [],
-    )
-    .unwrap();
-    drop(conn);
-
-    let db_path = dir
-        .path()
-        .join(format!("{}.db", sanitize_username(username)));
-
-    clean_cmd()
-        .args([
-            "reset-sync-token",
-            "--username",
-            username,
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
-        .assert()
-        .success();
-
-    let conn = rusqlite::Connection::open(&db_path).unwrap();
-    let zone_token: Option<String> = conn
-        .query_row(
-            "SELECT value FROM metadata WHERE key = 'sync_token:PrimarySync'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .unwrap();
-    assert!(
-        zone_token.is_none(),
-        "legacy alias must still auto-confirm and clear the token"
-    );
-}
-
 // ═══════════════════════════════════════════════════════════════════════
 // Password source behavior
 // ═══════════════════════════════════════════════════════════════════════
@@ -2720,7 +2297,7 @@ fn exit_1_for_missing_directory_on_sync() {
         ])
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("--directory is required"));
+        .stderr(predicate::str::contains("--download-dir is required"));
 }
 
 #[test]
@@ -3125,7 +2702,7 @@ fn reset_sync_token_empty_metadata() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Config show outputs threads_num from CLI override
+// Config show outputs threads from TOML
 // ═══════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -3153,143 +2730,6 @@ fn config_show_reflects_threads_from_toml() {
         .clone();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("threads = 4"), "stdout: {stdout}");
-}
-
-#[test]
-fn config_show_legacy_threads_num_emits_deprecation() {
-    // The old `threads_num` TOML key still parses but must warn on load and
-    // round-trip into the new `threads` key on the way out.
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        "[auth]\nusername = \"x@x.com\"\n\n[download]\nthreads_num = 7\n",
-    )
-    .unwrap();
-
-    let assert = clean_cmd()
-        .args([
-            "config",
-            "show",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
-        .assert()
-        .success();
-    let output = assert.get_output().clone();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("`[download] threads_num`"), "{stderr}");
-    assert!(stderr.contains("v0.20.0"), "{stderr}");
-    assert!(stdout.contains("threads = 7"), "{stdout}");
-}
-
-#[test]
-fn config_show_reflects_report_json_from_toml() {
-    // [report] json = "..." is the canonical TOML home for --report-json.
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-    std::fs::write(
-        &config_path,
-        "[auth]\nusername = \"x@x.com\"\n\n[report]\njson = \"/tmp/kei-run.json\"\n",
-    )
-    .unwrap();
-
-    let out = clean_cmd()
-        .args([
-            "config",
-            "show",
-            "--config",
-            config_path.to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .clone();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("[report]"), "stdout: {stdout}");
-    assert!(
-        stdout.contains("json = \"/tmp/kei-run.json\""),
-        "stdout: {stdout}"
-    );
-}
-
-#[test]
-fn legacy_threads_num_cli_flag_warns() {
-    // The hidden `--threads-num` still parses for backward compat but must
-    // tell the user to migrate to `--threads` and name the v0.20.0 removal.
-    let dir = tempfile::tempdir().unwrap();
-    let dl_dir = tempfile::tempdir().unwrap();
-    clean_cmd()
-        .args([
-            "sync",
-            "--username",
-            "legacy-threads@example.com",
-            "--download-dir",
-            dl_dir.path().to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-            "--threads-num",
-            "3",
-            "--only-print-filenames",
-        ])
-        .assert()
-        .stderr(predicate::str::contains("--threads-num"))
-        .stderr(predicate::str::contains("--threads"))
-        .stderr(predicate::str::contains("v0.20.0"));
-}
-
-#[test]
-fn legacy_retry_delay_cli_flag_warns() {
-    // `--retry-delay` still accepts a value but must tell the user it's
-    // deprecated and point at the new smart-default behavior.
-    let dir = tempfile::tempdir().unwrap();
-    let dl_dir = tempfile::tempdir().unwrap();
-    clean_cmd()
-        .args([
-            "sync",
-            "--username",
-            "legacy-retry-delay@example.com",
-            "--download-dir",
-            dl_dir.path().to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-            "--retry-delay",
-            "10",
-            "--only-print-filenames",
-        ])
-        .assert()
-        .stderr(predicate::str::contains("--retry-delay"))
-        .stderr(predicate::str::contains("--max-retries"))
-        .stderr(predicate::str::contains("v0.20.0"));
-}
-
-#[test]
-fn both_threads_forms_fails_fast() {
-    let dir = tempfile::tempdir().unwrap();
-    let dl_dir = tempfile::tempdir().unwrap();
-    clean_cmd()
-        .args([
-            "sync",
-            "--username",
-            "double-threads@example.com",
-            "--download-dir",
-            dl_dir.path().to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-            "--threads",
-            "4",
-            "--threads-num",
-            "8",
-        ])
-        .assert()
-        .code(1)
-        .stderr(predicate::str::contains("both"))
-        .stderr(predicate::str::contains("pick one"));
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -3484,58 +2924,6 @@ fn dry_run_and_retry_failed_conflict() {
         ])
         .assert()
         .code(2);
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// --directory deprecation
-// ═══════════════════════════════════════════════════════════════════════
-
-#[test]
-fn legacy_directory_flag_emits_deprecation_warning() {
-    // `--directory` still works but must tell the user to switch to
-    // `--download-dir` and note the v0.20.0 removal target. We pair it with
-    // `--only-print-filenames` so the command exits before hitting auth.
-    let dir = tempfile::tempdir().unwrap();
-    let dl_dir = tempfile::tempdir().unwrap();
-
-    clean_cmd()
-        .args([
-            "sync",
-            "--username",
-            "legacy-dir@example.com",
-            "--directory",
-            dl_dir.path().to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-            "--only-print-filenames",
-        ])
-        .assert()
-        .stderr(predicate::str::contains("--directory"))
-        .stderr(predicate::str::contains("--download-dir"))
-        .stderr(predicate::str::contains("v0.20.0"));
-}
-
-#[test]
-fn both_directory_and_download_dir_fails_fast() {
-    let dir = tempfile::tempdir().unwrap();
-    let dl_dir = tempfile::tempdir().unwrap();
-
-    clean_cmd()
-        .args([
-            "sync",
-            "--username",
-            "double-dir@example.com",
-            "--directory",
-            dl_dir.path().to_str().unwrap(),
-            "--download-dir",
-            dl_dir.path().to_str().unwrap(),
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-        ])
-        .assert()
-        .code(1)
-        .stderr(predicate::str::contains("both"))
-        .stderr(predicate::str::contains("pick one"));
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -4202,6 +3590,30 @@ fn run_config_show(body: &str) -> (String, String) {
     )
 }
 
+fn run_config_show_error(body: &str) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!("[auth]\nusername = \"x@x.com\"\n\n[download]\ndirectory = \"/photos\"\n{body}"),
+    )
+    .unwrap();
+    let out = clean_cmd()
+        .args([
+            "config",
+            "show",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--data-dir",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
 /// Build a `kei sync` invocation pre-populated with username, fresh tempdir
 /// `--download-dir` / `--data-dir` pair, and `--only-print-filenames` so the
 /// run exits before auth. Returns the live `Command` so callers can append
@@ -4228,7 +3640,7 @@ fn sync_cmd_for_validation() -> assert_cmd::Command {
 }
 
 #[test]
-fn migration_legacy_album_in_cli_warns() {
+fn removed_legacy_album_in_cli_errors() {
     sync_cmd_for_validation()
         .args([
             "--folder-structure",
@@ -4236,63 +3648,45 @@ fn migration_legacy_album_in_cli_warns() {
             "--only-print-filenames",
         ])
         .assert()
+        .failure()
         .stderr(predicate::str::contains(
-            "`{album}` in `--folder-structure`",
+            "'{album}' is not valid in --folder-structure",
         ))
-        .stderr(predicate::str::contains("v0.20.0"))
         .stderr(predicate::str::contains("--folder-structure-albums"));
 }
 
 #[test]
-fn migration_legacy_album_in_toml_warns_and_lifts() {
-    let (stdout, stderr) = run_config_show("folder_structure = \"{album}/%B\"\n");
+fn removed_legacy_album_in_toml_errors() {
+    let stderr = run_config_show_error("folder_structure = \"{album}/%B\"\n");
     assert!(
-        stderr.contains("`{album}` in `--folder-structure`") && stderr.contains("v0.20.0"),
+        stderr.contains("'{album}' is not valid in --folder-structure")
+            && stderr.contains("--folder-structure-albums"),
         "stderr: {stderr}"
-    );
-    assert!(
-        stdout.contains("folder_structure_albums = \"{album}/%B\""),
-        "stdout: {stdout}"
-    );
-    assert!(
-        stdout.contains("folder_structure = \"%B\""),
-        "stdout: {stdout}"
     );
 }
 
-/// Locks in that all three input surfaces (CLI / TOML / env) flow through
-/// the same migration helper.
 #[test]
-fn migration_legacy_album_in_env_warns() {
+fn removed_legacy_album_in_env_errors() {
     sync_cmd_for_validation()
         .env("KEI_FOLDER_STRUCTURE", "{album}/%Y")
         .arg("--only-print-filenames")
         .assert()
+        .failure()
         .stderr(predicate::str::contains(
-            "`{album}` in `--folder-structure`",
+            "'{album}' is not valid in --folder-structure",
         ))
-        .stderr(predicate::str::contains("v0.20.0"));
+        .stderr(predicate::str::contains("--folder-structure-albums"));
 }
 
-/// User's albums template wins; the legacy `{album}` segment in the base
-/// template still gets stripped (so no leftover token reaches the renderer)
-/// and the warning still fires.
 #[test]
-fn migration_legacy_album_preserves_user_set_albums_template() {
-    let (stdout, stderr) = run_config_show(
+fn removed_legacy_album_errors_even_with_user_set_albums_template() {
+    let stderr = run_config_show_error(
         "folder_structure = \"{album}/%Y\"\nfolder_structure_albums = \"{album}/custom\"\n",
     );
     assert!(
-        stderr.contains("`{album}` in `--folder-structure`"),
+        stderr.contains("'{album}' is not valid in --folder-structure")
+            && stderr.contains("--folder-structure-albums"),
         "stderr: {stderr}"
-    );
-    assert!(
-        stdout.contains("folder_structure_albums = \"{album}/custom\""),
-        "stdout: {stdout}"
-    );
-    assert!(
-        stdout.contains("folder_structure = \"%Y\""),
-        "stdout: {stdout}"
     );
 }
 
@@ -4530,88 +3924,33 @@ fn config_show_emits_libraries_when_repeatable_named_zone() {
     );
 }
 
-// ── Deprecation warnings: legacy CLI / TOML selection keys ────────
-//
-// These pin the user-visible warning emission for every deprecated
-// selection surface. The `[migration_legacy_album_*]` block above
-// covers `{album}` in --folder-structure (gap 10 of the audit). The
-// tests below cover the remaining deprecation surfaces flagged by the
-// branch audit (gaps 9 and 11): `--exclude-album` CLI, `[filters].album`
-// singular TOML, `[filters].exclude_albums` TOML, and the parallel
-// `[filters].library` singular TOML key. A regression that drops any
-// of these warnings would silently break the v0.20 removal contract:
-// users running on the deprecated surface would never learn to migrate.
+// ── Removed v0.20 selection aliases ───────────────────────────────
 
 #[test]
-fn deprecation_exclude_album_cli_warns_and_names_v0_20_0() {
-    // `--exclude-album` is hidden from --help (cli.rs::sync_help_hides_deprecated_exclude_album_flag)
-    // but the user-visible deprecation warning was untested at the binary
-    // boundary. Pin the `eprintln!` that fires at config-build time, plus
-    // the accompanying "splits on commas" note that warns about the
-    // semantic gap between --exclude-album and --album.
+fn removed_exclude_album_cli_flag_errors() {
     sync_cmd_for_validation()
         .args(["--exclude-album", "Family", "--only-print-filenames"])
         .assert()
-        .stderr(predicate::str::contains("`--exclude-album`"))
-        .stderr(predicate::str::contains("deprecated"))
-        .stderr(predicate::str::contains("v0.20.0"))
-        .stderr(predicate::str::contains("--album '!NAME'"))
-        .stderr(predicate::str::contains("splits on commas"));
+        .failure()
+        .stderr(predicate::str::contains("--exclude-album"));
 }
 
 #[test]
-fn deprecation_toml_filters_album_singular_warns() {
-    // `[filters].album = "name"` (singular string) was the v0.12 spelling;
-    // v0.13 introduces `[filters].albums = ["name"]`. The deprecated key
-    // must emit a `warn_deprecated` message at config-load time before
-    // it gets lifted into the array form. Drives the warning through the
-    // real `kei config show` entry point so a regression that removes the
-    // emit-site (or moves it inside a branch never reached by config show)
-    // surfaces here.
-    let (_, stderr) = run_config_show("\n[filters]\nalbum = \"Vacation\"\n");
-    assert!(
-        stderr.contains("[filters].album") && stderr.contains("deprecated"),
-        "expected `[filters].album` deprecation warning; stderr:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("v0.20.0"),
-        "deprecation warning must name v0.20.0 as removal target; stderr:\n{stderr}"
-    );
-}
-
-#[test]
-fn deprecation_toml_filters_exclude_albums_warns() {
-    // `[filters].exclude_albums` mirrors `--exclude-album` in TOML; the
-    // v0.13 replacement is `!name` entries inside `[filters].albums`.
-    let (_, stderr) = run_config_show("\n[filters]\nexclude_albums = [\"Drafts\", \"Family\"]\n");
-    assert!(
-        stderr.contains("[filters].exclude_albums") && stderr.contains("deprecated"),
-        "expected `[filters].exclude_albums` deprecation warning; stderr:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("!name"),
-        "warning must point at the new `!name` shape; stderr:\n{stderr}"
-    );
-    assert!(stderr.contains("v0.20.0"), "stderr:\n{stderr}");
-}
-
-#[test]
-fn deprecation_toml_filters_library_singular_warns() {
-    // `[filters].library = "Foo"` (singular) was the v0.12 spelling; v0.13
-    // accepts `[filters].libraries = ["Foo"]`. The unit test
-    // `test_library_all_from_toml` (config.rs::tests) pins that the legacy
-    // value still loads, but the user-visible warning emission was not
-    // tested at the binary boundary -- a silent removal of the warning
-    // would let users keep running on the deprecated key past v0.20.
-    let (_, stderr) = run_config_show("\n[filters]\nlibrary = \"PrimarySync\"\n");
-    assert!(
-        stderr.contains("[filters].library") && stderr.contains("deprecated"),
-        "expected `[filters].library` deprecation warning; stderr:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("[filters].libraries"),
-        "warning must name the new array form; stderr:\n{stderr}"
-    );
+fn removed_toml_filter_aliases_error() {
+    for (field, body) in [
+        ("album", "\n[filters]\nalbum = \"Vacation\"\n"),
+        (
+            "exclude_albums",
+            "\n[filters]\nexclude_albums = [\"Drafts\", \"Family\"]\n",
+        ),
+        ("library", "\n[filters]\nlibrary = \"PrimarySync\"\n"),
+    ] {
+        let stderr = run_config_show_error(body);
+        assert!(
+            stderr.contains(&format!("unknown field `{field}`")),
+            "expected unknown-field error for {field}; stderr:\n{stderr}"
+        );
+    }
 }
 
 #[test]

@@ -1,11 +1,19 @@
 # Local Repo
 .scratch/
+.codex
+.codex/
+AGENTS.md
+CODEBASE.md
 
 # Pi coding agent
 .pi/
 
 # Rust
 /target
+
+# Python
+__pycache__/
+*.py[cod]
 
 # Claude
 .claude/
