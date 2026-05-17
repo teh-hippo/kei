@@ -81,7 +81,7 @@ opt-in (nightly + cargo-fuzz), excluded from `just gate`, and run via
    ```sh
    just dev login
    # or without just:
-   cargo run -- login --data-dir ~/.config/kei
+   KEI_DATA_DIR=~/.config/kei cargo run -- login
    ```
 
    This prompts for a 2FA code and writes session tokens. Redo only when
@@ -115,7 +115,7 @@ details are baked into test code.
 | `KEI_TEST_SCRATCH_DIR` | `/tmp/kei-tests-$USER` | Base dir for shell-suite scratch |
 | `KEI_IMPORT_FIXTURE_DIR` | `/tmp/claude/kei-import-fixture` | Where `import_existing_live.rs` caches its `--recent 100` sync fixture across runs |
 
-`just test live` applies `KEI_TEST_ALBUM=icloudpd-test` to match this
+`just test live` applies `KEI_TEST_ALBUM=kei-test` to match this
 repo's maintainer setup. Override in your environment to point at your
 own account. Cookie dir falls through to the harness default
 (`./.test-cookies`); set `ICLOUD_TEST_COOKIE_DIR` to override.

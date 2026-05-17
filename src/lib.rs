@@ -377,9 +377,7 @@ fn get_db_path(globals: &config::GlobalArgs, toml: Option<&TomlConfig>) -> anyho
     let (username, _, _, cookie_dir) =
         config::resolve_auth(globals, &cli::PasswordArgs::default(), toml);
     if username.is_empty() {
-        anyhow::bail!(
-            "--username is required (or set ICLOUD_USERNAME, or add username to config file)"
-        );
+        anyhow::bail!("username is required (set ICLOUD_USERNAME or [auth].username)");
     }
     Ok(cookie_dir.join(format!(
         "{}.db",
@@ -550,11 +548,9 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
             (expanded, false)
         }
     };
-    // When --config is explicitly set but the file doesn't exist, allow it
-    // if the parent directory exists (auto-config will create the file).
-    // Otherwise require the file to exist so typos in --config paths error.
     // When --config is explicit but the file doesn't exist and the parent
     // dir does exist, allow it (auto-config will create the file).
+    // Otherwise require the file to exist so typos in --config paths error.
     let can_auto_create =
         !config_path.exists() && config_path.parent().is_some_and(std::path::Path::is_dir);
     let config_required = config_explicitly_set && !can_auto_create;
@@ -583,7 +579,7 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     };
 
     // Resolve friendly mode. The gate has multiple short-circuits (service
-    // context, non-TTY, RUST_LOG, --report-json, ...) so the user-stated
+    // context, non-TTY, RUST_LOG, machine-output mode, ...) so the user-stated
     // preference is a request, not a guarantee.
     //
     // Resolution chain: CLI > TOML > default-on-for-TTY. The gate then
@@ -597,15 +593,20 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     // alternative (threading the resolved command through `run`) ripples
     // through every callee. Acceptable.
     let resolved_for_personality = cli.effective_command();
+    let toml_report_json = toml_config
+        .as_ref()
+        .and_then(|t| t.report.as_ref())
+        .and_then(|r| r.json.as_ref())
+        .is_some();
     let (cmd_no_progress_bar, cmd_only_print_filenames, cmd_report_json, cmd_service_run) =
         match &resolved_for_personality {
             cli::Command::Sync { sync, .. } => (
                 sync.no_progress_bar.unwrap_or(false),
                 sync.only_print_filenames,
-                sync.report_json.is_some(),
+                toml_report_json,
                 false,
             ),
-            cli::Command::Service { .. } => (false, false, false, true),
+            cli::Command::Service { .. } => (false, false, toml_report_json, true),
             _ => (false, false, false, false),
         };
     let personality_ctx = personality::Context::detect(
@@ -667,8 +668,9 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
         );
     }
 
-    // Build globals from CLI early (username, domain, data_dir).
-    let mut globals = config::GlobalArgs::from_cli(&cli);
+    // Build non-TOML globals early. In v0.20 these come from the narrow
+    // bootstrap env allow-list, not public global CLI flags.
+    let mut globals = config::GlobalArgs::from_bootstrap_env();
 
     // Dispatch based on command
     let mut command = cli.effective_command();

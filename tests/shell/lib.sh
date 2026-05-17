@@ -53,6 +53,49 @@ kei_album() {
     printf '%s' "${KEI_TEST_ALBUM:-kei-test}"
 }
 
+kei_toml_string() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    printf '"%s"' "$s"
+}
+
+kei_append_toml_fragment() {
+    local fragment="$1"
+    if [ -z "$fragment" ]; then
+        return
+    fi
+    printf '%s' "$fragment"
+    case "$fragment" in
+        *$'\n') ;;
+        *) echo ;;
+    esac
+}
+
+kei_write_sync_config() {
+    local data_dir="${1:?data dir required}"
+    local download_dir="${2:?download dir required}"
+    local download_extra="${KEI_SYNC_DOWNLOAD_TOML:-}"
+    local filters_extra="${KEI_SYNC_FILTERS_TOML:-}"
+    local photos_extra="${KEI_SYNC_PHOTOS_TOML:-}"
+    local config="$data_dir/.kei-shell-sync-$$.toml"
+    mkdir -p "$data_dir"
+    {
+        echo "[download]"
+        printf 'directory = %s\n' "$(kei_toml_string "$download_dir")"
+        kei_append_toml_fragment "$download_extra"
+        echo "[filters]"
+        printf 'albums = [%s]\n' "$(kei_toml_string "$(kei_album)")"
+        echo "unfiled = false"
+        kei_append_toml_fragment "$filters_extra"
+        if [ -n "$photos_extra" ]; then
+            echo "[photos]"
+            kei_append_toml_fragment "$photos_extra"
+        fi
+    } > "$config"
+    printf '%s' "$config"
+}
+
 kei_docker_image() {
     printf '%s' "${KEI_DOCKER_IMAGE:-kei:latest}"
 }
@@ -112,17 +155,15 @@ kei_preflight_session() {
     local bin cookies out
     bin="$(kei_release_bin)"
     cookies="$(kei_cookie_dir)"
-    out=$("$bin" login \
-        --username "$ICLOUD_USERNAME" \
-        --password "$ICLOUD_PASSWORD" \
-        --data-dir "$cookies" 2>&1)
+    out=$(KEI_DATA_DIR="$cookies" "$bin" login \
+        --password "$ICLOUD_PASSWORD" 2>&1)
     if echo "$out" | grep -q "Authentication completed\|Session OK\|already authenticated"; then
         kei_check "session valid" 0
         return 0
     fi
     echo "  ABORT: session invalid or rate-limited"
     echo "$out" | tail -3
-    echo "  Re-authenticate: cargo run --release -- login --data-dir $cookies"
+    echo "  Re-authenticate: KEI_DATA_DIR=$cookies cargo run --release -- login"
     exit 1
 }
 

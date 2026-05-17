@@ -40,25 +40,24 @@ cp "$COOKIES/".* "$DOCKER_CONFIG/" 2>/dev/null
 # Strip lock files so the container doesn't conflict with the host kei.
 rm -f "$DOCKER_CONFIG/"*.lock "$DOCKER_CONFIG/.lock"
 
-# Override the image's baked-in 24h watch default (Dockerfile sets
-# ENV KEI_WATCH_WITH_INTERVAL=86400). Empty value is parsed as unset
-# (see config.rs::parse_env_watch_interval). Applied to every one-shot
-# `docker run kei sync ...` below; the explicit watch-mode test (step
-# 10) sets --watch-with-interval directly.
-ONESHOT_ENV=(-e KEI_WATCH_WITH_INTERVAL=)
+sync_config="$(kei_write_sync_config "$DOCKER_CONFIG" "/photos")"
+cp "$sync_config" "$DOCKER_CONFIG/config.toml"
+{
+    cat "$sync_config"
+    echo ""
+    echo "[watch]"
+    echo "interval = 60"
+} > "$DOCKER_CONFIG/watch-config.toml"
 
 echo "--- 1. Docker sync ($ALBUM album) ---"
 docker run --rm \
-    "${ONESHOT_ENV[@]}" \
+    -e ICLOUD_USERNAME="$ICLOUD_USERNAME" \
+    -e KEI_DATA_DIR=/config \
     -v "$DOCKER_CONFIG:/config" \
     -v "$DOCKER_PHOTOS:/photos" \
     "$IMAGE" sync \
-        --username "$ICLOUD_USERNAME" \
+        --config /config/config.toml \
         --password "$ICLOUD_PASSWORD" \
-        --data-dir /config \
-        --download-dir /photos \
-        --album "$ALBUM" \
-        --unfiled false \
         --no-progress-bar \
         \
     2>&1
@@ -107,16 +106,13 @@ fi
 echo ""
 echo "--- 6. Idempotent re-sync (no new downloads) ---"
 docker run --rm \
-    "${ONESHOT_ENV[@]}" \
+    -e ICLOUD_USERNAME="$ICLOUD_USERNAME" \
+    -e KEI_DATA_DIR=/config \
     -v "$DOCKER_CONFIG:/config" \
     -v "$DOCKER_PHOTOS:/photos" \
     "$IMAGE" sync \
-        --username "$ICLOUD_USERNAME" \
+        --config /config/config.toml \
         --password "$ICLOUD_PASSWORD" \
-        --data-dir /config \
-        --download-dir /photos \
-        --album "$ALBUM" \
-        --unfiled false \
         --no-progress-bar \
         --log-level info \
     2>&1 | tee /dev/stderr | grep -qE "downloaded=0|No new photos"
@@ -126,16 +122,13 @@ echo ""
 echo "--- 7. Dry run ---"
 DRY_PHOTOS=$(mktemp -d "${TMPDIR:-/tmp}/kei-docker-dry-XXXXX")
 docker run --rm \
-    "${ONESHOT_ENV[@]}" \
+    -e ICLOUD_USERNAME="$ICLOUD_USERNAME" \
+    -e KEI_DATA_DIR=/config \
     -v "$DOCKER_CONFIG:/config" \
     -v "$DRY_PHOTOS:/photos" \
     "$IMAGE" sync \
-        --username "$ICLOUD_USERNAME" \
+        --config /config/config.toml \
         --password "$ICLOUD_PASSWORD" \
-        --data-dir /config \
-        --download-dir /photos \
-        --album "$ALBUM" \
-        --unfiled false \
         --no-progress-bar \
         --dry-run \
     2>&1
@@ -146,18 +139,20 @@ rm -rf "$DRY_PHOTOS"
 echo ""
 echo "--- 8. Password backend in container ---"
 BACKEND=$(docker run --rm \
+    -e ICLOUD_USERNAME="$ICLOUD_USERNAME" \
+    -e KEI_DATA_DIR=/config \
     -v "$DOCKER_CONFIG:/config" \
-    "$IMAGE" password --username "$ICLOUD_USERNAME" --data-dir /config backend 2>&1)
+    "$IMAGE" password backend 2>&1)
 echo "  Backend: $BACKEND"
 [ -n "$BACKEND" ]; kei_check "credential backend reports a value"
 
 echo ""
 echo "--- 9. List albums in container ---"
 docker run --rm \
+    -e ICLOUD_USERNAME="$ICLOUD_USERNAME" \
+    -e KEI_DATA_DIR=/config \
     -v "$DOCKER_CONFIG:/config" \
     "$IMAGE" list albums \
-        --username "$ICLOUD_USERNAME" \
-        --data-dir /config \
     2>&1 | grep -qF "$ALBUM"
 kei_check "list-albums shows $ALBUM album"
 
@@ -166,17 +161,14 @@ echo "--- 10. Watch mode cycles + graceful SIGTERM ---"
 WATCH_PHOTOS=$(mktemp -d "${TMPDIR:-/tmp}/kei-docker-watch-XXXXX")
 WATCH_NAME="kei-docker-watch-$$"
 docker run -d --name "$WATCH_NAME" \
+    -e ICLOUD_USERNAME="$ICLOUD_USERNAME" \
+    -e KEI_DATA_DIR=/config \
     -v "$DOCKER_CONFIG:/config" \
     -v "$WATCH_PHOTOS:/photos" \
     "$IMAGE" sync \
-        --username "$ICLOUD_USERNAME" \
+        --config /config/watch-config.toml \
         --password "$ICLOUD_PASSWORD" \
-        --data-dir /config \
-        --download-dir /photos \
-        --album "$ALBUM" \
-        --unfiled false \
         --no-progress-bar \
-        --watch-with-interval 60 \
         --log-level info >/dev/null
 
 sleep 130
@@ -217,17 +209,14 @@ printf '%s' "$ICLOUD_PASSWORD" > "$SECRETS_DIR/icloud_password"
 chmod 400 "$SECRETS_DIR/icloud_password"
 PWFILE_PHOTOS=$(mktemp -d "${TMPDIR:-/tmp}/kei-docker-pwfile-XXXXX")
 PWFILE_OUT=$(docker run --rm \
-    "${ONESHOT_ENV[@]}" \
+    -e ICLOUD_USERNAME="$ICLOUD_USERNAME" \
+    -e KEI_DATA_DIR=/config \
     -v "$DOCKER_CONFIG:/config" \
     -v "$PWFILE_PHOTOS:/photos" \
     -v "$SECRETS_DIR:/run/secrets:ro" \
     "$IMAGE" sync \
-        --username "$ICLOUD_USERNAME" \
+        --config /config/config.toml \
         --password-file /run/secrets/icloud_password \
-        --data-dir /config \
-        --download-dir /photos \
-        --album "$ALBUM" \
-        --unfiled false \
         --no-progress-bar \
         --dry-run \
     2>&1)
@@ -239,10 +228,10 @@ rm -rf "$SECRETS_DIR" "$PWFILE_PHOTOS"
 echo ""
 echo "--- 13. kei status --downloaded inside container ---"
 STATUS_OUT=$(docker run --rm \
+    -e ICLOUD_USERNAME="$ICLOUD_USERNAME" \
+    -e KEI_DATA_DIR=/config \
     -v "$DOCKER_CONFIG:/config" \
     "$IMAGE" status \
-        --username "$ICLOUD_USERNAME" \
-        --data-dir /config \
         --downloaded \
     2>&1)
 echo "$STATUS_OUT" | tail -5
@@ -259,7 +248,6 @@ TEST_PUID=4321
 TEST_PGID=4322
 puid_run() {
     docker run --rm \
-        "${ONESHOT_ENV[@]}" \
         -e PUID="$TEST_PUID" \
         -e PGID="$TEST_PGID" \
         -v "$PUID_CONFIG:/config" \
@@ -287,7 +275,6 @@ rm -rf "$PUID_CONFIG" "$PUID_PHOTOS"
 echo ""
 echo "--- 14b. No PUID/PGID = runs as root (backward compat) ---"
 ROOT_OUT=$(docker run --rm \
-    "${ONESHOT_ENV[@]}" \
     --entrypoint /usr/local/bin/entrypoint.sh \
     "$IMAGE" id -u 2>&1)
 [ "$ROOT_OUT" = "0" ]
@@ -296,7 +283,6 @@ kei_check "default (no PUID/PGID) still runs as root"
 echo ""
 echo "--- 14c. Non-numeric PUID is rejected ---"
 BAD_OUT=$(docker run --rm \
-    "${ONESHOT_ENV[@]}" \
     -e PUID="notanumber" \
     -e PGID="$TEST_PGID" \
     --entrypoint /usr/local/bin/entrypoint.sh \
@@ -307,7 +293,6 @@ kei_check "non-numeric PUID is rejected with clear error"
 echo ""
 echo "--- 14d. Setting only one of PUID/PGID is rejected ---"
 PARTIAL_OUT=$(docker run --rm \
-    "${ONESHOT_ENV[@]}" \
     -e PUID="$TEST_PUID" \
     --entrypoint /usr/local/bin/entrypoint.sh \
     "$IMAGE" id 2>&1 || true)
@@ -326,14 +311,13 @@ echo "--- 14e. kei subcommand routes through kei and runs as dropped user under 
 SUB_CONFIG=$(mktemp -d "${TMPDIR:-/tmp}/kei-docker-puid-sub-config-XXXXX")
 SUB_PHOTOS=$(mktemp -d "${TMPDIR:-/tmp}/kei-docker-puid-sub-photos-XXXXX")
 SUB_OUT=$(docker run --rm \
-    "${ONESHOT_ENV[@]}" \
+    -e ICLOUD_USERNAME="$ICLOUD_USERNAME" \
+    -e KEI_DATA_DIR=/config \
     -e PUID="$TEST_PUID" \
     -e PGID="$TEST_PGID" \
     -v "$SUB_CONFIG:/config" \
     -v "$SUB_PHOTOS:/photos" \
     "$IMAGE" status \
-        --username "$ICLOUD_USERNAME" \
-        --data-dir /config \
         --downloaded \
     2>&1)
 SUB_EC=$?
@@ -353,10 +337,10 @@ rm -rf "$SUB_CONFIG" "$SUB_PHOTOS"
 echo ""
 echo "--- 15. kei status --pending --failed --downloaded combined ---"
 COMBINED_OUT=$(docker run --rm \
+    -e ICLOUD_USERNAME="$ICLOUD_USERNAME" \
+    -e KEI_DATA_DIR=/config \
     -v "$DOCKER_CONFIG:/config" \
     "$IMAGE" status \
-        --username "$ICLOUD_USERNAME" \
-        --data-dir /config \
         --pending --failed --downloaded \
     2>&1)
 COMBINED_EC=$?

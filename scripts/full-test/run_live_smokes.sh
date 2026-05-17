@@ -8,7 +8,7 @@
 #
 # Optional env:
 #   KEI_TEST_DATA_DIR  cookie / db dir (default .test-cookies under repo)
-#   KEI_TEST_ALBUM     album name for sync dry-run (default icloudpd-test)
+#   KEI_TEST_ALBUM     album name for sync dry-run (default kei-test)
 #   KEI_TEST_DOWNLOAD_DIR  scratch dir for sync/import dry-run (default /tmp/codex/photos-test)
 #
 # Adding a new CLI subcommand: add a smoke line below. Don't add destructive
@@ -17,9 +17,12 @@
 set -euo pipefail
 
 repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+PROJECT_DIR="$repo_root"
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 time_phase="$script_dir/time_phase.sh"
 binary="$repo_root/target/release/kei"
+# shellcheck disable=SC1091
+source "$repo_root/tests/shell/lib.sh"
 
 if [[ ! -x "$binary" ]]; then
   echo "run_live_smokes: missing release binary at $binary (run Phase 1 first)" >&2
@@ -28,9 +31,10 @@ fi
 
 USR="${ICLOUD_USERNAME:-missing@example.invalid}"
 DD="${KEI_TEST_DATA_DIR:-$repo_root/.test-cookies}"
-ALBUM="${KEI_TEST_ALBUM:-icloudpd-test}"
 DOWNLOAD_DIR="${KEI_TEST_DOWNLOAD_DIR:-/tmp/codex/photos-test}"
 mkdir -p "$DOWNLOAD_DIR"
+
+sync_config="$(kei_write_sync_config "$DD" "$DOWNLOAD_DIR")"
 
 run() {
   local phase="$1"; shift
@@ -40,7 +44,7 @@ run() {
 # Wrappers for commands that need shell composition (rc check, etc.).
 verify_wrapper() {
   set +e
-  "$binary" verify --username "$USR" --data-dir "$DD"
+  env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" verify
   rc=$?
   set -e
   # rc=2 is clap parse error; everything else (including non-zero data
@@ -50,12 +54,12 @@ verify_wrapper() {
 export -f verify_wrapper
 export USR DD binary
 
-run live_status            "$binary" status                       --username "$USR" --data-dir "$DD"
-run live_libraries         "$binary" list libraries               --username "$USR" --data-dir "$DD"
-run live_albums            "$binary" list albums                  --username "$USR" --data-dir "$DD"
-run live_dryrun            "$binary" sync --dry-run --recent 5 -a "$ALBUM" --download-dir "$DOWNLOAD_DIR" --username "$USR" --data-dir "$DD"
-run live_config_show       "$binary" config show                  --username "$USR" --data-dir "$DD"
+run live_status            env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" status
+run live_libraries         env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" list libraries
+run live_albums            env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" list albums
+run live_dryrun            env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" sync --dry-run --recent 5 --config "$sync_config"
+run live_config_show       env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" config show
 run live_verify            bash -c verify_wrapper
-run live_reconcile_dryrun  "$binary" reconcile --dry-run          --username "$USR" --data-dir "$DD"
-run live_password_backend  "$binary" password backend             --username "$USR" --data-dir "$DD"
-run live_import_dryrun     "$binary" import-existing --dry-run --recent 5 --download-dir "$DOWNLOAD_DIR" --username "$USR" --data-dir "$DD"
+run live_reconcile_dryrun  env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" reconcile --dry-run
+run live_password_backend  env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" password backend
+run live_import_dryrun     env ICLOUD_USERNAME="$USR" KEI_DATA_DIR="$DD" "$binary" import-existing --dry-run --recent 5 --download-dir "$DOWNLOAD_DIR"

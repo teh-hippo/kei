@@ -163,15 +163,9 @@ fn ensure_session(username: &str, password: &str, cookie_dir: &Path) {
 
         eprintln!("Validating authentication session (login)...");
         let output = assert_cmd::cargo_bin_cmd!("kei")
-            .args([
-                "login",
-                "--username",
-                username,
-                "--password",
-                password,
-                "--data-dir",
-                cookie_dir.to_str().unwrap(),
-            ])
+            .env("ICLOUD_USERNAME", username)
+            .env("KEI_DATA_DIR", cookie_dir)
+            .args(["login", "--password", password])
             .timeout(std::time::Duration::from_secs(90))
             .output()
             .expect("failed to run login session validation");
@@ -188,7 +182,7 @@ fn ensure_session(username: &str, password: &str, cookie_dir: &Path) {
             }
             eprintln!(
                 "Login succeeded but session is not trusted (missing X-APPLE-WEBAUTH-TOKEN).\n\
-                 Complete 2FA first: kei login get-code --username {username} --data-dir {}\n\
+                 Complete 2FA first: ICLOUD_USERNAME={username} KEI_DATA_DIR={} kei login get-code\n\
                  Or set ICLOUD_TEST_COOKIE_DIR to a directory with a trusted session.",
                 cookie_dir.display()
             );
@@ -205,7 +199,7 @@ fn ensure_session(username: &str, password: &str, cookie_dir: &Path) {
         if stderr.contains("2FA") || stderr.contains("Two-factor") {
             eprintln!(
                 "\n*** ABORTING: 2FA required but not available in test mode ***\n\
-                 Complete 2FA first: kei login get-code --username {username} --data-dir {}\n\
+                 Complete 2FA first: ICLOUD_USERNAME={username} KEI_DATA_DIR={} kei login get-code\n\
                  Or set ICLOUD_TEST_COOKIE_DIR to a directory with a trusted session.",
                 cookie_dir.display()
             );
@@ -227,15 +221,9 @@ fn refresh_auth() {
 
     eprintln!("Running login to refresh session...");
     let output = assert_cmd::cargo_bin_cmd!("kei")
-        .args([
-            "login",
-            "--username",
-            username,
-            "--password",
-            password,
-            "--data-dir",
-            cookie_dir.to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", cookie_dir)
+        .args(["login", "--password", password])
         .timeout(std::time::Duration::from_secs(90))
         .output()
         .expect("failed to run login");
@@ -436,4 +424,34 @@ pub fn walkdir(dir: &Path) -> Vec<PathBuf> {
     }
     files.sort();
     files
+}
+
+/// Quote a string for the simple TOML snippets live tests write at runtime.
+#[allow(dead_code)]
+pub fn toml_string(s: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Write a per-test TOML config next to the test data directory.
+///
+/// Live tests run single-threaded, so a stable filename per process keeps the
+/// command lines short without racing another test in the same target.
+#[allow(dead_code)]
+pub fn write_toml_config(dir: &Path, name: &str, body: &str) -> PathBuf {
+    std::fs::create_dir_all(dir).expect("create config dir");
+    let path = dir.join(format!(".kei-{name}-{}.toml", std::process::id()));
+    std::fs::write(&path, body).expect("write test TOML config");
+    path
 }

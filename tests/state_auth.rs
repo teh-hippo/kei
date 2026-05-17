@@ -31,6 +31,19 @@ const TIMEOUT_CMD: u64 = 30;
 
 // ── Command builders ──────────────────────────────────────────────────
 
+fn sync_config(
+    data_dir: &Path,
+    dir: &Path,
+    download_extra: &str,
+    filters_extra: &str,
+) -> std::path::PathBuf {
+    let body = format!(
+        "[download]\ndirectory = {}\n{download_extra}[filters]\nalbums = [\"none\"]\n{filters_extra}",
+        common::toml_string(&dir.to_string_lossy())
+    );
+    common::write_toml_config(data_dir, "state-auth-sync", &body)
+}
+
 fn sync_cmd(
     username: &str,
     password: &str,
@@ -44,21 +57,18 @@ fn sync_cmd(
     // under `--recent N` and overrun Apple's rate limits across the
     // suite. The state-DB invariants tested here are pass-shape
     // independent.
+    let config_path = sync_config(cookie_dir, dir, "", "");
     let mut cmd = common::cmd();
+    cmd.env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", cookie_dir);
     cmd.args([
         "sync",
-        "--album",
-        "none",
         "--recent",
         &recent.to_string(),
-        "--username",
-        username,
         "--password",
         password,
-        "--data-dir",
-        cookie_dir.to_str().unwrap(),
-        "--download-dir",
-        dir.to_str().unwrap(),
+        "--config",
+        config_path.to_str().unwrap(),
         "--no-progress-bar",
     ]);
     cmd
@@ -66,38 +76,25 @@ fn sync_cmd(
 
 fn status_cmd(username: &str, cookie_dir: &Path) -> assert_cmd::Command {
     let mut cmd = common::cmd();
-    cmd.args([
-        "status",
-        "--username",
-        username,
-        "--data-dir",
-        cookie_dir.to_str().unwrap(),
-    ]);
+    cmd.env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", cookie_dir)
+        .arg("status");
     cmd
 }
 
 fn reset_state_cmd(username: &str, cookie_dir: &Path) -> assert_cmd::Command {
     let mut cmd = common::cmd();
-    cmd.args([
-        "reset",
-        "state",
-        "--username",
-        username,
-        "--data-dir",
-        cookie_dir.to_str().unwrap(),
-    ]);
+    cmd.env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", cookie_dir)
+        .args(["reset", "state"]);
     cmd
 }
 
 fn verify_cmd(username: &str, cookie_dir: &Path) -> assert_cmd::Command {
     let mut cmd = common::cmd();
-    cmd.args([
-        "verify",
-        "--username",
-        username,
-        "--data-dir",
-        cookie_dir.to_str().unwrap(),
-    ]);
+    cmd.env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", cookie_dir)
+        .arg("verify");
     cmd
 }
 
@@ -108,14 +105,12 @@ fn import_cmd(
     dir: &Path,
 ) -> assert_cmd::Command {
     let mut cmd = common::cmd();
+    cmd.env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", cookie_dir);
     cmd.args([
         "import-existing",
-        "--username",
-        username,
         "--password",
         password,
-        "--data-dir",
-        cookie_dir.to_str().unwrap(),
         "--download-dir",
         dir.to_str().unwrap(),
     ]);
@@ -131,20 +126,17 @@ fn retry_failed_cmd(
     cookie_dir: &Path,
     dir: &Path,
 ) -> assert_cmd::Command {
+    let config_path = sync_config(cookie_dir, dir, "", "");
     let mut cmd = common::cmd();
+    cmd.env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", cookie_dir);
     cmd.args([
         "sync",
-        "--album",
-        "none",
         "--retry-failed",
-        "--username",
-        username,
         "--password",
         password,
-        "--data-dir",
-        cookie_dir.to_str().unwrap(),
-        "--download-dir",
-        dir.to_str().unwrap(),
+        "--config",
+        config_path.to_str().unwrap(),
         "--no-progress-bar",
         "--log-level",
         "info",
@@ -386,8 +378,20 @@ fn verify_checksums_detects_corruption() {
             .timeout(std::time::Duration::from_secs(TIMEOUT_CMD))
             .assert();
 
-        sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 1)
-            .args(["--skip-videos"])
+        let config_path = sync_config(&cookie_dir, download_dir.path(), "", "skip_videos = true\n");
+        common::cmd()
+            .env("ICLOUD_USERNAME", &username)
+            .env("KEI_DATA_DIR", &cookie_dir)
+            .args([
+                "sync",
+                "--recent",
+                "1",
+                "--password",
+                &password,
+                "--config",
+                config_path.to_str().unwrap(),
+                "--no-progress-bar",
+            ])
             .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
             .assert()
             .success();
@@ -418,14 +422,12 @@ fn import_existing_with_nonexistent_directory_fails() {
 
     common::with_auth_retry(|| {
         common::cmd()
+            .env("ICLOUD_USERNAME", &username)
+            .env("KEI_DATA_DIR", &cookie_dir)
             .args([
                 "import-existing",
-                "--username",
-                &username,
                 "--password",
                 &password,
-                "--data-dir",
-                cookie_dir.to_str().unwrap(),
                 "--download-dir",
                 "/nonexistent/path/that/does/not/exist",
             ])
@@ -503,8 +505,25 @@ fn import_existing_custom_folder_structure() {
     common::with_auth_retry(|| {
         let download_dir = tempfile::tempdir().expect("failed to create download dir");
 
-        sync_cmd(&username, &password, &cookie_dir, download_dir.path(), 1)
-            .args(["--folder-structure", "%Y"])
+        let config_path = sync_config(
+            &cookie_dir,
+            download_dir.path(),
+            "folder_structure = \"%Y\"\n",
+            "",
+        );
+        common::cmd()
+            .env("ICLOUD_USERNAME", &username)
+            .env("KEI_DATA_DIR", &cookie_dir)
+            .args([
+                "sync",
+                "--recent",
+                "1",
+                "--password",
+                &password,
+                "--config",
+                config_path.to_str().unwrap(),
+                "--no-progress-bar",
+            ])
             .timeout(std::time::Duration::from_secs(TIMEOUT_SYNC))
             .assert()
             .success();
@@ -666,15 +685,9 @@ fn reset_sync_token_forces_full_enumeration() {
         // (and in CI), since the next sync re-enumerates every asset and we
         // ship a confirmation prompt by default.
         common::cmd()
-            .args([
-                "reset",
-                "sync-token",
-                "--yes",
-                "--username",
-                &username,
-                "--data-dir",
-                cookie_dir.to_str().unwrap(),
-            ])
+            .env("ICLOUD_USERNAME", &username)
+            .env("KEI_DATA_DIR", &cookie_dir)
+            .args(["reset", "sync-token", "--yes"])
             .timeout(Duration::from_secs(10))
             .assert()
             .success()
@@ -705,14 +718,9 @@ fn config_show_after_sync() {
     let (username, _password, cookie_dir) = common::require_preauth();
     // config show doesn't need auth, just needs username resolution
     common::cmd()
-        .args([
-            "config",
-            "show",
-            "--username",
-            &username,
-            "--data-dir",
-            cookie_dir.to_str().unwrap(),
-        ])
+        .env("ICLOUD_USERNAME", &username)
+        .env("KEI_DATA_DIR", &cookie_dir)
+        .args(["config", "show"])
         .timeout(Duration::from_secs(10))
         .assert()
         .success()
@@ -730,15 +738,9 @@ fn login_with_existing_session() {
     let (username, password, cookie_dir) = common::require_preauth();
     common::with_auth_retry(|| {
         common::cmd()
-            .args([
-                "login",
-                "--username",
-                &username,
-                "--password",
-                &password,
-                "--data-dir",
-                cookie_dir.to_str().unwrap(),
-            ])
+            .env("ICLOUD_USERNAME", &username)
+            .env("KEI_DATA_DIR", &cookie_dir)
+            .args(["login", "--password", &password])
             .timeout(Duration::from_secs(60))
             .assert()
             .success();
