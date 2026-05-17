@@ -786,10 +786,12 @@ fn build_import_download_config(
         },
         toml,
     );
+    let media = config::resolve_media_selection(toml.and_then(|t| t.filters.as_ref()), None, None)?;
 
     Ok(download::DownloadConfig::for_path_derivation_only(
         directory,
         path_fields,
+        media,
         args.dry_run,
         args.no_progress_bar,
     ))
@@ -1117,8 +1119,7 @@ mod wiremock_tests {
             folder_structure_smart_folders: Arc::from("{smart-folder}"),
             library: Arc::from(crate::icloud::photos::PRIMARY_ZONE_NAME),
             size: AssetVersionSize::Original,
-            skip_videos: false,
-            skip_photos: false,
+            media: crate::config::MediaSelection::all(),
             skip_created_before: None,
             skip_created_after: None,
             #[cfg(feature = "xmp")]
@@ -1829,15 +1830,15 @@ mod wiremock_tests {
         assert_eq!(stats.matched, 1);
     }
 
-    // ── Tests: skip_videos / skip_photos ──────────────────────────────
+    // ── Tests: media filters ──────────────────────────────────────────
 
-    /// `skip_videos` filtering happens via `is_asset_filtered`, which
+    /// Media filtering happens via `is_asset_filtered`, which
     /// `import_assets` now invokes upstream of `expected_paths_for`. The
     /// previous incarnation of this test asserted `matched == 0` without
     /// staging a file, so it would have passed even if the gate were
     /// missing entirely (no file → no match for an unrelated reason). Stage
     /// the file the matcher would land on AND verify `is_asset_filtered`
-    /// classifies it as a video-skip; if the gate disappears, `matched`
+    /// classifies it as a media skip; if the gate disappears, `matched`
     /// becomes 1 and `unmatched` stays 0, failing this test loudly.
     #[tokio::test]
     async fn skip_videos_excludes_movie_assets() {
@@ -1846,7 +1847,7 @@ mod wiremock_tests {
         let dl = tmp.path().join("photos");
         std::fs::create_dir_all(&dl).unwrap();
         let mut config = base_config(&dl);
-        config.skip_videos = true;
+        config.media.videos = false;
 
         let asset = WiremockAsset::new("VID1", "MOV_0001.MOV", "com.apple.quicktime-movie").orig(
             5000,
@@ -1855,30 +1856,30 @@ mod wiremock_tests {
         );
 
         // Stage the file at the path expected_paths_for *would* emit if the
-        // gate were missing. Without skip_videos honored, this would match.
-        let probe_config = base_config(&dl); // skip_videos defaults to false
+        // gate were missing. With all media enabled, this would match.
+        let probe_config = base_config(&dl);
         let expected_if_unfiltered = expected_paths_for(&asset.to_photo_asset(), &probe_config);
         assert_eq!(
             expected_if_unfiltered.len(),
             1,
-            "probe: video should have one expected path when skip_videos=false",
+            "probe: video should have one expected path when media is unrestricted",
         );
         stage_file(
             &expected_if_unfiltered[0].path,
             expected_if_unfiltered[0].size,
         );
 
-        // is_asset_filtered must classify a movie under skip_videos as filtered.
+        // is_asset_filtered must classify a movie excluded by media as filtered.
         assert!(
             crate::download::filter::is_asset_filtered(&asset.to_photo_asset(), &config).is_some(),
-            "skip_videos must filter movie assets via is_asset_filtered",
+            "media filter must drop movie assets via is_asset_filtered",
         );
 
         let db = open_db(&tmp).await;
         let stats = run_import(&server, &[asset], db.as_ref(), &config, false).await;
 
         assert_eq!(stats.total, 1, "asset still enumerated");
-        assert_eq!(stats.matched, 0, "skip_videos must drop the movie");
+        assert_eq!(stats.matched, 0, "media filter must drop the movie");
         assert_eq!(
             stats.unmatched, 0,
             "filter happens before path derivation; unmatched stays 0",
@@ -2002,8 +2003,8 @@ mod wiremock_tests {
     }
 
     /// Verifies `import_assets` actually invokes `is_asset_filtered`. We
-    /// can't easily flip skip_videos through `build_import_download_config`
-    /// (it hardcodes false), but `exclude_asset_ids` is honored by
+    /// can't easily flip media selection through `build_import_download_config`,
+    /// but `exclude_asset_ids` is honored by
     /// `is_asset_filtered` and we can set it directly on the test
     /// `DownloadConfig`. If `import_assets` ever stops calling the gate,
     /// this test fails with `matched=1` instead of `matched=0`.
@@ -2053,7 +2054,7 @@ mod wiremock_tests {
     // `is_asset_filtered_blocks_excluded_asset_id` already pin the gate
     // for two filter sources. The branch's commit "honor is_asset_filtered"
     // (05356d2) ties the import path to ALL filter sources, not just two.
-    // These pin skip_photos / date / filename-exclude so a future change
+    // These pin media / date / filename-exclude so a future change
     // that loses one of them surfaces here.
     //
     // Each test stages the file the matcher would land on without the
@@ -2072,13 +2073,13 @@ mod wiremock_tests {
         let dl = tmp.path().join("photos");
         std::fs::create_dir_all(&dl).unwrap();
         let mut config = base_config(&dl);
-        config.skip_photos = true;
+        config.media.photos = false;
         stage_expected(&asset.to_photo_asset(), &base_config(&dl));
 
         let db = open_db(&tmp).await;
         let stats = run_import(&server, &[asset], db.as_ref(), &config, false).await;
         assert_eq!(stats.total, 1);
-        assert_eq!(stats.matched, 0, "skip_photos must drop the still");
+        assert_eq!(stats.matched, 0, "media filter must drop the still");
         assert_eq!(stats.unmatched, 0, "filter fires before resolve_match_path");
         assert_eq!(stats.filtered, 1);
         assert!(all_downloaded(db.as_ref()).await.is_empty());
@@ -2762,7 +2763,7 @@ mod build_config_tests {
     //! parse path that production uses.
     use super::build_import_download_config;
     use crate::cli::{Cli, Command};
-    use crate::config::{Config, GlobalArgs, TomlConfig, TomlPhotos};
+    use crate::config::{Config, GlobalArgs, MediaKind, TomlConfig, TomlFilters, TomlPhotos};
     use crate::types::{
         AssetVersionSize, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy,
         LivePhotoSize, RawTreatmentPolicy, VersionSize,
@@ -2798,6 +2799,12 @@ mod build_config_tests {
     fn toml_with_photos(p: TomlPhotos) -> TomlConfig {
         let mut t = empty_toml();
         t.photos = Some(p);
+        t
+    }
+
+    fn toml_with_filters(f: TomlFilters) -> TomlConfig {
+        let mut t = empty_toml();
+        t.filters = Some(f);
         t
     }
 
@@ -2944,6 +2951,21 @@ mod build_config_tests {
         assert_eq!(cfg.align_raw, RawTreatmentPolicy::PreferOriginal);
         assert!(cfg.force_size);
         assert!(cfg.keep_unicode_in_filenames);
+    }
+
+    #[test]
+    fn build_import_download_config_uses_toml_media_filter() {
+        let args = parse_import_args(&[]);
+        let toml = toml_with_filters(TomlFilters {
+            media: Some(vec![MediaKind::Photos, MediaKind::LivePhotos]),
+            ..TomlFilters::default()
+        });
+
+        let cfg = build_import_download_config(&args, Some(&toml)).unwrap();
+
+        assert!(cfg.media.photos);
+        assert!(!cfg.media.videos);
+        assert!(cfg.media.live_photos);
     }
 
     /// CG-1: documented defaults when neither CLI nor TOML set the field.
