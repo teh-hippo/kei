@@ -14,15 +14,21 @@ path = "src/main.rs"
 [features]
 # XMP metadata embedding + sidecar writing. Default-on; build with
 # `--no-default-features` on platforms where Adobe's vendored C++ XMP
-# Toolkit does not compile (notably FreeBSD — see #256). Disabling drops
-# the `--embed-xmp`, `--xmp-sidecar`, and `--set-exif-*` CLI flags and the
-# code paths behind them; HEIC container edits go with it because the
-# XMP packet serializer lives in xmp_toolkit.
+# Toolkit does not compile (notably FreeBSD — see #256). Disabling drops XMP
+# embedding, sidecars, and HEIC container edits; native JPEG/TIFF EXIF writes
+# remain available through little_exif.
 default = ["xmp"]
 xmp = ["dep:xmp_toolkit"]
 # Re-exports parser entry points for cargo-fuzz harnesses (`fuzz/`).
 # Off by default; production builds never see the `kei::__fuzz` module.
 __fuzz_internals = []
+
+[package.metadata.cargo-udeps.ignore]
+# Used only by no-default-features builds (`#[cfg(not(feature = "xmp"))]`).
+# The unused-deps CI job runs the default feature set, so cargo-udeps cannot
+# see the native EXIF path even though `cargo test --no-default-features`
+# exercises it.
+normal = ["little_exif"]
 
 [dependencies]
 # CLI
@@ -92,6 +98,10 @@ console = "0.16"
 # working C++ toolchain for the vendored sources can opt out. See #256.
 xmp_toolkit = { version = "1", optional = true }
 
+# Native EXIF writing used by `set_exif_*` settings, including builds that
+# disable the default `xmp` feature.
+little_exif = "0.6"
+
 # ISO-BMFF (MP4 / HEIF / HEIC) atom parsing + encoding. HEIC's XMP packet
 # lives in a `mime`-type item inside the `meta` box; mp4-atom gives us the
 # box primitives to surgically insert it without decoding image data.
@@ -103,8 +113,7 @@ xmp_toolkit = { version = "1", optional = true }
 #           metadata embed on HDR HEICs (kei #269, #276)
 #   - #157  bound `Vec::with_capacity` in `parse_vorbis_comment` / `Avcc`,
 #           fixes the fuzz-found OOM (upstream #154)
-#   - #161  drops the unmaintained `paste` dep in favor of `pastey`,
-#           clearing RUSTSEC-2024-0436 (kei #310)
+#   - #161  drops mp4-atom's unmaintained `paste` dep in favor of `pastey`
 # Switch back to a crates.io version once a release containing these ships.
 mp4-atom = { git = "https://github.com/kixelated/mp4-atom", rev = "3366b08671a6d6d7292532b922d1973f6718d5a1" }
 
