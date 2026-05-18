@@ -29,17 +29,25 @@
 > kei is pre-release software under active development, and minor versions may contain breaking changes. We follow a deprecate-then-remove practice, but always check CHANGELOG when updating.
 
 > [!IMPORTANT]
-> v0.20 makes TOML the primary config surface. Put persistent settings in `config.toml`; keep CLI flags for one-off actions and env vars for secrets/runtime glue. Full migration guide: [docs/v0.20-migration.md](docs/v0.20-migration.md). Full config dictionary: [example.config.toml](example.config.toml).
+> **v0.20 is coming soon and it is a breaking config release.** The `:main` Docker tag is the release candidate for v0.20. The official v0.20 release is planned for May 22, 2026. The old "everything can be a CLI flag or `KEI_*` env var" model is being replaced by a smaller source model:
 >
-> | TOML key | Default |
+> - TOML is for settings you want to keep.
+> - CLI flags are for one run or one action.
+> - Env vars are for secrets, config path/bootstrap, process-manager glue, and tests.
+>
+> If you run kei from Docker, systemd, launchd, cron, or a long shell alias, move durable sync settings into `config.toml` before upgrading. The migration guide has the old spelling -> new TOML key map: [docs/v0.20-migration.md](docs/v0.20-migration.md). The full config dictionary is in [example.config.toml](example.config.toml).
+>
+> Common moves:
+>
+> | Old durable setting | New v0.20 setting |
 > |---|---|
-> | `[filters].albums` | `["all"]` |
-> | `[filters].smart_folders` | `["none"]` |
-> | `[filters].libraries` | `["primary"]` |
-> | `[filters].unfiled` | `true` |
-> | `[download].folder_structure` | `%Y/%m/%d` |
-> | `[download].folder_structure_albums` | `{album}` |
-> | `[download].folder_structure_smart_folders` | `{smart-folder}` |
+> | `--download-dir`, `KEI_DOWNLOAD_DIR` | `[download].directory` |
+> | `--album`, `--smart-folder`, `--library`, `--unfiled` | `[filters].albums`, `.smart_folders`, `.libraries`, `.unfiled` |
+> | `--skip-videos`, `--skip-photos` | `[filters].media` |
+> | `--size`, `--live-photo-size`, `--force-size` | `[photos].resolution`, `.live_resolution`, `.force_resolution` |
+> | `--watch-with-interval` | `[watch].interval` |
+> | `--report-json`, `--notification-script` | `[report].json`, `[notifications].script` |
+> | `--http-bind`, `--http-port` | `[server].bind`, `[server].port` |
 
 
 ---
@@ -50,7 +58,7 @@
 brew install rhoopr/kei/kei             # Homebrew
 
 docker pull ghcr.io/rhoopr/kei:latest   # Docker
-# :latest follows tagged releases. Use :main to track main HEAD for unreleased builds.
+# :latest follows tagged releases. :main is the v0.20 release candidate until the planned May 22, 2026 release.
 ```
 
 Pre-built binaries for macOS, Linux, and Windows are on the [Releases page](https://github.com/rhoopr/kei/releases). For Docker Compose, building from source, FreeBSD, and other install paths, see the [Install wiki page](https://github.com/rhoopr/kei/wiki/Install).
@@ -133,8 +141,8 @@ Operations:
 Everything lives on the [wiki](https://github.com/rhoopr/kei/wiki): full CLI reference, filtering and folder templates, watch mode, Docker Compose, credentials, troubleshooting, and more.
 
 - [Commands](https://github.com/rhoopr/kei/wiki/Home#commands) - `sync`, `install`, `uninstall`, `service`, `login`, `list`, `password`, `config`, `reset`, `status`, `verify`, `reconcile`, `import-existing`
-- [Configuration](https://github.com/rhoopr/kei/wiki/Configuration) - TOML file, env vars, precedence
-- [Docker](https://github.com/rhoopr/kei/wiki/Docker) - Compose files and headless 2FA
+- [Configuration](https://github.com/rhoopr/kei/wiki/Configuration) - TOML config model and source precedence
+- [Docker](https://github.com/rhoopr/kei/wiki/Docker) - Compose with mounted `config.toml` and headless 2FA
 - [Synology](https://github.com/rhoopr/kei/wiki/Synology) - Container Manager setup, PUID/PGID, Synology Photos integration
 - [Credentials](https://github.com/rhoopr/kei/wiki/Credentials) - keyring, encrypted file, password files and commands
 - [v0.20 Migration Guide](docs/v0.20-migration.md)
