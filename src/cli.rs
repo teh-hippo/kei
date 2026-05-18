@@ -236,6 +236,37 @@ pub struct SyncArgs {
     pub(crate) config_overrides: crate::config::SyncConfigOverrides,
 }
 
+/// Runtime-friendly output toggles.
+///
+/// These are deliberately not global options. They only affect bare `kei`
+/// (the sync alias) and `kei sync`; non-sync subcommands either do no long
+/// running terminal rendering or force friendly mode off.
+#[derive(Parser, Debug, Clone, Default)]
+pub struct FriendlyArgs {
+    /// Use friendly progress UI (default on interactive terminals)
+    #[arg(
+        long,
+        overrides_with = "no_friendly",
+        long_help = "Use friendly progress UI (verb-cycling spinners, curated phase narration, summary card, sign-off). \
+                     Default: on for plain TTYs, off in service/container/journal contexts and whenever a \
+                     machine-output mode (`--only-print-filenames` or TOML report JSON) or an explicit \
+                     `--log-level` / `RUST_LOG` is in play. `--friendly` overrides the TOML `[ui] friendly` \
+                     setting and the auto-detected default; environmental hard-off contexts still win."
+    )]
+    pub friendly: bool,
+
+    /// Disable friendly progress UI
+    #[arg(
+        long,
+        overrides_with = "friendly",
+        long_help = "Force friendly progress messages off (preserves v0.13 scrollback byte-for-byte). \
+                     Overrides `--friendly`, the TOML `[ui] friendly` setting, and the auto-detected default. \
+                     Use this when piping kei output to a log aggregator on an interactive TTY where \
+                     auto-detection would otherwise enable friendly mode."
+    )]
+    pub no_friendly: bool,
+}
+
 /// Arguments for the status command.
 #[derive(Parser, Debug, Clone)]
 pub struct StatusArgs {
@@ -421,9 +452,11 @@ pub struct UninstallArgs {
 
 /// Arguments for `kei service run`.
 ///
-/// Identical to `kei sync` arguments; carried as its own struct so the
-/// surrounding [`ServiceAction`] enum does not balloon by ~600 bytes
-/// (the size of `SyncArgs`) on the unrelated `Status` variant.
+/// Shares the reduced runtime [`SyncArgs`] with `kei sync`, but omits
+/// friendly-mode toggles because service mode forces friendly output off.
+/// Carried as its own struct so the surrounding [`ServiceAction`] enum
+/// does not balloon by ~600 bytes (the size of `SyncArgs`) on the
+/// unrelated `Status` variant.
 #[derive(Args, Debug, Clone)]
 pub struct ServiceRunArgs {
     #[command(flatten)]
@@ -439,7 +472,7 @@ pub enum ServiceAction {
     /// Run the service worker (invoked by launchd / systemd / Windows SCM,
     /// or directly for testing). Equivalent to `kei sync` with service-mode
     /// defaults: when no other source provides a watch interval, defaults
-    /// to 86400 seconds so the daemon polls once per day.
+    /// to once per day (24 hours / 86,400 seconds).
     Run(Box<ServiceRunArgs>),
 
     /// Show whether kei is registered as a service on this host and when
@@ -457,6 +490,9 @@ pub enum ServiceAction {
 pub enum Command {
     /// Download photos from iCloud (the default: running `kei` with no command does this)
     Sync {
+        #[command(flatten)]
+        friendly: FriendlyArgs,
+
         #[command(flatten)]
         password: PasswordArgs,
 
@@ -574,30 +610,8 @@ pub struct Cli {
     #[arg(long, short = 'v', global = true)]
     pub verbose: bool,
 
-    /// Use friendly progress UI (default on interactive terminals)
-    #[arg(
-        long,
-        global = true,
-        overrides_with = "no_friendly",
-        long_help = "Use friendly progress UI (verb-cycling spinners, curated phase narration, summary card, sign-off). \
-                     Default: on for plain TTYs, off in service/container/journal contexts and whenever a \
-                     machine-output mode (`--only-print-filenames` or TOML report JSON) or an explicit \
-                     `--log-level` / `RUST_LOG` is in play. `--friendly` overrides the TOML `[ui] friendly` \
-                     setting and the auto-detected default; environmental hard-off contexts still win."
-    )]
-    pub friendly: bool,
-
-    /// Disable friendly progress UI
-    #[arg(
-        long,
-        global = true,
-        overrides_with = "friendly",
-        long_help = "Force friendly progress messages off (preserves v0.13 scrollback byte-for-byte). \
-                     Overrides `--friendly`, the TOML `[ui] friendly` setting, and the auto-detected default. \
-                     Use this when piping kei output to a log aggregator on an interactive TTY where \
-                     auto-detection would otherwise enable friendly mode."
-    )]
-    pub no_friendly: bool,
+    #[command(flatten)]
+    pub friendly: FriendlyArgs,
 
     /// Path to TOML config file
     #[arg(
@@ -642,6 +656,29 @@ impl SyncArgs {
     }
 }
 
+impl FriendlyArgs {
+    /// User-stated friendly-mode preference, distilled from the
+    /// `--friendly` / `--no-friendly` pair. `Some(true)` and `Some(false)` are
+    /// explicit user requests; `None` means neither flag was set.
+    #[must_use]
+    pub fn request(&self) -> Option<bool> {
+        if self.no_friendly {
+            Some(false)
+        } else if self.friendly {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
+    fn merge_from(&mut self, fallback: &Self) {
+        if self.request().is_none() {
+            self.friendly = fallback.friendly;
+            self.no_friendly = fallback.no_friendly;
+        }
+    }
+}
+
 impl PasswordArgs {
     /// Merge top-level (fallback) password args into self.
     fn merge_from(&mut self, fallback: &Self) {
@@ -669,12 +706,12 @@ impl Cli {
     /// post-parse state has at most one of `friendly` / `no_friendly` set.
     #[must_use]
     pub fn friendly_request(&self) -> Option<bool> {
-        if self.no_friendly {
-            Some(false)
-        } else if self.friendly {
-            Some(true)
-        } else {
-            None
+        match &self.command {
+            None => self.friendly.request(),
+            Some(Command::Sync { friendly, .. }) => {
+                friendly.request().or_else(|| self.friendly.request())
+            }
+            _ => None,
         }
     }
 
@@ -686,10 +723,11 @@ impl Cli {
     pub fn effective_command(&self) -> Command {
         if let Some(cmd) = &self.command {
             let mut cmd = cmd.clone();
-            cmd.merge_top_level_args(&self.password, &self.sync);
+            cmd.merge_top_level_args(&self.friendly, &self.password, &self.sync);
             cmd
         } else {
             Command::Sync {
+                friendly: self.friendly.clone(),
                 password: self.password.clone(),
                 sync: self.sync.clone(),
             }
@@ -717,32 +755,51 @@ impl Cli {
         let Some(cmd) = &self.command else {
             return Ok(());
         };
-        // Sync carries sync args directly; top-level merge into it is intended.
-        // `service run` also carries SyncArgs and merges top-level flags.
-        if matches!(
-            cmd,
-            Command::Sync { .. }
-                | Command::Service {
-                    action: ServiceAction::Run(..),
+        match cmd {
+            // Sync carries sync args directly; top-level merge into it is intended.
+            Command::Sync { .. } => Ok(()),
+            // `service run` also carries SyncArgs and merges top-level runtime
+            // flags, but friendly-mode flags are sync-only because service mode
+            // forces friendly output off.
+            Command::Service {
+                action: ServiceAction::Run(_),
+            } => {
+                let invalid: Vec<&'static str> = explicit_sync_flags
+                    .iter()
+                    .copied()
+                    .filter(|flag| matches!(*flag, "--friendly" | "--no-friendly"))
+                    .collect();
+                if invalid.is_empty() {
+                    Ok(())
+                } else {
+                    Err(service_run_friendly_flags_error(&invalid))
                 }
-        ) {
-            return Ok(());
+            }
+            _ if explicit_sync_flags.is_empty() => Ok(()),
+            _ => Err(sync_only_flags_error(
+                subcommand_display_name(cmd),
+                explicit_sync_flags,
+            )),
         }
-        if explicit_sync_flags.is_empty() {
-            return Ok(());
-        }
-        let cmd_name = subcommand_display_name(cmd);
-        let flag_list = explicit_sync_flags.join(", ");
-        Err(format!(
-            "the following sync-only flag{plural} cannot be combined with `kei {cmd_name}`: {flag_list}\n\
-             bare-kei (no subcommand) is shorthand for `kei sync`; sync-only flags are only valid there or under `kei sync`",
-            plural = if explicit_sync_flags.len() == 1 {
-                ""
-            } else {
-                "s"
-            },
-        ))
     }
+}
+
+fn sync_only_flags_error(cmd_name: &str, flags: &[&'static str]) -> String {
+    let flag_list = flags.join(", ");
+    format!(
+        "the following sync-only flag{plural} cannot be combined with `kei {cmd_name}`: {flag_list}\n\
+         bare-kei (no subcommand) is shorthand for `kei sync`; sync-only flags are only valid there or under `kei sync`",
+        plural = if flags.len() == 1 { "" } else { "s" },
+    )
+}
+
+fn service_run_friendly_flags_error(flags: &[&'static str]) -> String {
+    let flag_list = flags.join(", ");
+    format!(
+        "friendly-mode flag{plural} cannot be combined with `kei service run`: {flag_list}\n\
+         service mode always disables friendly output",
+        plural = if flags.len() == 1 { "" } else { "s" },
+    )
 }
 
 /// Human-readable subcommand name for error messages.
@@ -788,6 +845,12 @@ fn explicit_top_level_sync_flags(matches: &clap::ArgMatches) -> Vec<&'static str
     let mut out = Vec::new();
     if matches.value_source("recent") == Some(ValueSource::CommandLine) {
         out.push("--recent");
+    }
+    if matches.value_source("friendly") == Some(ValueSource::CommandLine) {
+        out.push("--friendly");
+    }
+    if matches.value_source("no_friendly") == Some(ValueSource::CommandLine) {
+        out.push("--no-friendly");
     }
     if matches.value_source("dry_run") == Some(ValueSource::CommandLine) {
         out.push("--dry-run");
@@ -839,10 +902,16 @@ where
 impl Command {
     /// Merge top-level CLI password/sync args as fallbacks into the
     /// subcommand's own args.
-    fn merge_top_level_args(&mut self, top_password: &PasswordArgs, top_sync: &SyncArgs) {
+    fn merge_top_level_args(
+        &mut self,
+        top_friendly: &FriendlyArgs,
+        top_password: &PasswordArgs,
+        top_sync: &SyncArgs,
+    ) {
         // Merge sync args for commands that carry them
         match self {
-            Self::Sync { sync, .. } => {
+            Self::Sync { friendly, sync, .. } => {
+                friendly.merge_from(top_friendly);
                 sync.merge_from(top_sync);
             }
             Self::Service {
@@ -2274,7 +2343,7 @@ mod tests {
     // ── Validator must NOT fire on legitimate uses ─────────────────
     #[test]
     fn validate_allows_bare_kei_with_sync_flags() {
-        parse_and_validate(&["kei", "--recent", "100"])
+        parse_and_validate(&["kei", "--friendly", "--recent", "100"])
             .expect("bare-kei with kept per-run sync flag must validate");
     }
     #[test]
@@ -2282,6 +2351,7 @@ mod tests {
         parse_and_validate(&[
             "kei",
             "sync",
+            "--friendly",
             "--recent",
             "100",
             "--skip-created-before",
@@ -2291,7 +2361,7 @@ mod tests {
     }
     #[test]
     fn validate_allows_top_level_sync_flag_then_sync_subcommand() {
-        parse_and_validate(&["kei", "--recent", "100", "sync"])
+        parse_and_validate(&["kei", "--friendly", "--recent", "100", "sync"])
             .expect("top-level kept sync flag with sync subcommand must validate");
     }
     #[test]
@@ -2317,6 +2387,17 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_friendly_with_service_run() {
+        let err = parse_and_validate(&["kei", "--friendly", "service", "run"])
+            .expect_err("service run forces friendly mode off");
+        assert!(err.contains("--friendly"), "got: {err}");
+        assert!(
+            err.contains("service mode always disables friendly output"),
+            "got: {err}",
+        );
+    }
+
+    #[test]
     fn validate_rejects_service_status_with_sync_flags() {
         let err = parse_and_validate(&["kei", "--download-dir", "/photos", "service", "status"])
             .expect_err("validation must reject sync flags with service status");
@@ -2338,6 +2419,8 @@ mod tests {
             ("keep_unicode", &["--keep-unicode-in-filenames=true"]),
             ("notify_systemd", &["--notify-systemd=true"]),
             ("dry_run", &["--dry-run"]),
+            ("friendly", &["--friendly"]),
+            ("no_friendly", &["--no-friendly"]),
             ("only_print_filenames", &["--only-print-filenames"]),
             ("save_password", &["--save-password"]),
             ("retry_failed", &["--retry-failed"]),
@@ -2422,19 +2505,19 @@ mod tests {
 
     #[test]
     fn friendly_request_some_true_with_friendly() {
-        let cli = parse(&["kei", "--friendly", "status"]);
+        let cli = parse(&["kei", "--friendly"]);
         assert_eq!(cli.friendly_request(), Some(true));
     }
 
     #[test]
     fn friendly_request_some_false_with_no_friendly() {
-        let cli = parse(&["kei", "--no-friendly", "status"]);
+        let cli = parse(&["kei", "--no-friendly", "sync"]);
         assert_eq!(cli.friendly_request(), Some(false));
     }
 
     #[test]
     fn friendly_request_last_wins_no_friendly_after_friendly() {
-        let cli = parse(&["kei", "--friendly", "--no-friendly", "status"]);
+        let cli = parse(&["kei", "sync", "--friendly", "--no-friendly"]);
         assert_eq!(
             cli.friendly_request(),
             Some(false),
@@ -2444,7 +2527,7 @@ mod tests {
 
     #[test]
     fn friendly_request_last_wins_friendly_after_no_friendly() {
-        let cli = parse(&["kei", "--no-friendly", "--friendly", "status"]);
+        let cli = parse(&["kei", "--no-friendly", "--friendly"]);
         assert_eq!(
             cli.friendly_request(),
             Some(true),
