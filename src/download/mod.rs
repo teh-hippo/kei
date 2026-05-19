@@ -90,6 +90,10 @@ impl DownloadRunMode {
     pub(crate) fn only_print_filenames(self) -> bool {
         matches!(self, Self::PrintFilenames)
     }
+
+    pub(crate) fn downloads_files(self) -> bool {
+        matches!(self, Self::Download)
+    }
 }
 
 /// Presentation knobs for the download pipeline.
@@ -155,6 +159,8 @@ pub struct SyncResult {
     pub sync_token: Option<String>,
     /// Accumulated statistics from this sync run.
     pub stats: SyncStats,
+    /// Whether this result came from a full records/query enumeration.
+    pub(crate) full_enumeration_ran: bool,
 }
 
 /// Accumulated statistics from a sync run, used for JSON reports and notifications.
@@ -1919,6 +1925,7 @@ async fn download_photos_full_with_token(
         outcome,
         sync_token,
         stats,
+        full_enumeration_ran: true,
     })
 }
 
@@ -2046,6 +2053,7 @@ async fn download_photos_incremental(
             outcome: DownloadOutcome::Success,
             sync_token,
             stats,
+            full_enumeration_ran: false,
         });
     }
 
@@ -2186,6 +2194,7 @@ async fn download_photos_incremental(
             outcome: DownloadOutcome::Success,
             sync_token,
             stats,
+            full_enumeration_ran: false,
         });
     }
 
@@ -2207,6 +2216,7 @@ async fn download_photos_incremental(
             outcome: DownloadOutcome::Success,
             sync_token: None,
             stats,
+            full_enumeration_ran: false,
         });
     }
 
@@ -2271,6 +2281,7 @@ async fn download_photos_incremental(
             },
             sync_token,
             stats,
+            full_enumeration_ran: false,
         });
     }
 
@@ -2287,6 +2298,7 @@ async fn download_photos_incremental(
         outcome,
         sync_token,
         stats,
+        full_enumeration_ran: false,
     })
 }
 
@@ -2458,6 +2470,7 @@ mod tests {
             outcome: DownloadOutcome::PartialFailure { failed_count: 3 },
             sync_token: Some("tok".to_string()),
             stats: SyncStats::default(),
+            full_enumeration_ran: false,
         };
         match result.outcome {
             DownloadOutcome::PartialFailure { failed_count } => {
@@ -2475,6 +2488,7 @@ mod tests {
             },
             sync_token: None,
             stats: SyncStats::default(),
+            full_enumeration_ran: false,
         };
         match result.outcome {
             DownloadOutcome::SessionExpired { auth_error_count } => {
