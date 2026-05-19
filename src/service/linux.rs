@@ -14,10 +14,9 @@
 //!   is the one who's expected to run with privilege.
 //!
 //! Unit-file rendering is split out as a pure function so tests can
-//! assert key shape without spawning systemd. The systemd command
-//! pipeline (`daemon-reload`, `enable`, `disable`) is exercised by the
-//! per-platform smoke matrix, since faithful local mocking of
-//! `systemctl --user` requires an active user session.
+//! assert key shape without spawning systemd. CI covers dry-run rendering
+//! and unit syntax; real `daemon-reload` / `enable` / `disable` handoff
+//! still needs an active user session.
 
 #![allow(
     clippy::print_stdout,
@@ -124,25 +123,23 @@ fn system_unit_path() -> PathBuf {
 /// default on Linux).
 pub(crate) async fn install_user(args: &InstallArgs, config_path: &Path) -> Result<()> {
     let exe = current_executable()?;
+    let contents = render_user_unit(&exe, config_path);
+    if args.dry_run {
+        print!("{contents}");
+        tracing::info!("dry run: rendered per-user systemd unit; no files written");
+        return Ok(());
+    }
+
     let unit_path =
         user_unit_path().ok_or_else(|| anyhow!("could not resolve XDG_CONFIG_HOME or $HOME"))?;
-    let contents = render_user_unit(&exe, config_path);
     write_unit(&unit_path, &contents)?;
     tracing::info!(
         service = SERVICE_IDENTIFIER,
         path = %unit_path.display(),
         executable = %exe.display(),
         config = %config_path.display(),
-        dry_run = args.dry_run,
         "wrote per-user systemd unit",
     );
-
-    if args.dry_run {
-        tracing::info!(
-            "dry run: skipped systemctl daemon-reload / enable / loginctl enable-linger"
-        );
-        return Ok(());
-    }
 
     daemon_reload_user().await?;
     enable_now_user().await?;
@@ -158,6 +155,18 @@ pub(crate) async fn install_user(args: &InstallArgs, config_path: &Path) -> Resu
 
 /// Top-level entry for `kei install --system`.
 pub(crate) async fn install_system(args: &InstallArgs, config_path: &Path) -> Result<()> {
+    if args.dry_run {
+        let user = system_preview_user()?;
+        let exe = current_executable()?;
+        let contents = render_system_unit(&exe, config_path, &user);
+        print!("{contents}");
+        tracing::info!(
+            run_as_user = user,
+            "dry run: rendered system-wide systemd unit; no files written"
+        );
+        return Ok(());
+    }
+
     if !is_root() {
         bail!(
             "`kei install --system` must be run as root (EUID=0); \
@@ -177,14 +186,8 @@ pub(crate) async fn install_system(args: &InstallArgs, config_path: &Path) -> Re
         executable = %exe.display(),
         config = %config_path.display(),
         run_as_user = user,
-        dry_run = args.dry_run,
         "wrote system-wide systemd unit",
     );
-
-    if args.dry_run {
-        tracing::info!("dry run: skipped systemctl daemon-reload / enable");
-        return Ok(());
-    }
 
     daemon_reload_system().await?;
     enable_now_system().await?;
@@ -413,14 +416,44 @@ fn is_root() -> bool {
     effective_uid() == 0
 }
 
-fn sudo_user_or_bail() -> Result<String> {
-    match std::env::var("SUDO_USER") {
-        Ok(u) if !u.is_empty() && u != "root" => Ok(u),
-        _ => bail!(
-            "$SUDO_USER not set; rerun via `sudo kei install --system` so the service \
-             can be configured to run as your account rather than root"
-        ),
+fn non_root_env_user(key: &str) -> Option<String> {
+    match std::env::var(key) {
+        Ok(user) if !user.is_empty() && user != "root" => Some(user),
+        _ => None,
     }
+}
+
+fn sudo_user_or_bail() -> Result<String> {
+    if let Some(user) = non_root_env_user("SUDO_USER") {
+        return Ok(user);
+    }
+    bail!(
+        "$SUDO_USER not set; rerun via `sudo kei install --system` so the service \
+         can be configured to run as your account rather than root"
+    )
+}
+
+fn system_preview_user() -> Result<String> {
+    if let Some(user) = non_root_env_user("SUDO_USER") {
+        return Ok(user);
+    }
+
+    if is_root() {
+        bail!(
+            "$SUDO_USER not set; rerun via `sudo kei install --system --dry-run` so the service \
+             can be previewed for your account rather than root"
+        );
+    }
+
+    for key in ["USER", "LOGNAME"] {
+        if let Some(user) = non_root_env_user(key) {
+            return Ok(user);
+        }
+    }
+    bail!(
+        "could not determine which user the system unit would run as; \
+         set SUDO_USER or USER before running `kei install --system --dry-run`"
+    )
 }
 
 async fn daemon_reload_user() -> Result<()> {
