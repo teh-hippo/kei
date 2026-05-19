@@ -10,10 +10,11 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use super::endpoints::Endpoints;
+use super::responses::AppleServiceError;
 use super::session::Session;
 use super::twofa::{check_rscd_from_headers, rscd_service_error};
 use super::AUTH_RETRY_CONFIG;
-use crate::auth::error::AuthError;
+use crate::auth::error::{is_terminal_apple_auth_code, AuthError};
 use crate::retry::parse_retry_after_header;
 
 /// Buffered HTTP response for SRP authentication steps.
@@ -45,6 +46,51 @@ impl SrpResponse {
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).into_owned()
     }
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SrpServiceErrorBody {
+    #[serde(default, alias = "has_error")]
+    has_error: bool,
+    #[serde(default, alias = "service_errors")]
+    service_errors: Vec<AppleServiceError>,
+}
+
+fn srp_service_error_message<'a>(err: &'a AppleServiceError, fallback: &'static str) -> &'a str {
+    let raw_message = err.message.trim();
+    if raw_message.is_empty() {
+        err.title.as_deref().unwrap_or(fallback)
+    } else {
+        raw_message
+    }
+}
+
+fn apple_auth_error_from_body(response: &SrpResponse) -> Option<AuthError> {
+    let body: SrpServiceErrorBody = response.json().ok()?;
+    if let Some(err) = body
+        .service_errors
+        .iter()
+        .find(|err| is_terminal_apple_auth_code(&err.code))
+    {
+        return Some(AuthError::terminal_apple_auth(
+            &err.code,
+            srp_service_error_message(err, "Apple reported a terminal authentication error"),
+        ));
+    }
+    if let Some(err) = body.service_errors.first() {
+        return Some(AuthError::service_error(
+            &err.code,
+            srp_service_error_message(err, "Apple reported an error"),
+        ));
+    }
+    if body.has_error {
+        return Some(AuthError::ServiceError {
+            code: "unknown".to_string(),
+            message: "Apple reported an error but provided no details".to_string(),
+        });
+    }
+    None
 }
 
 /// Abstracts the HTTP transport used by SRP authentication.
@@ -490,6 +536,10 @@ pub async fn authenticate_srp(
         return Err(rscd_service_error(rscd, &response.text()).into());
     }
 
+    if let Some(err) = apple_auth_error_from_body(&response) {
+        return Err(err.into());
+    }
+
     if response.status == 409 {
         // The 409 body carries the 2FA challenge metadata. When the account
         // has FIDO/WebAuthn security keys registered, Apple includes an
@@ -692,6 +742,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::error::{APPLE_ACCOUNT_LOCKED_CODE, APPLE_INVALID_CREDENTIALS_CODE};
 
     #[test]
     fn test_derive_apple_password_s2k() {
@@ -855,6 +906,14 @@ mod tests {
         let mut t = stub(responses);
         let ep = Endpoints::for_domain("com").unwrap();
         authenticate_srp(&mut t, &ep, "u@test.com", "p", "c", "com").await
+    }
+
+    async fn run_srp_complete_error(status: u16, body: &[u8]) -> AuthError {
+        run_srp(vec![valid_init_response(), response(status, body.to_vec())])
+            .await
+            .unwrap_err()
+            .downcast::<AuthError>()
+            .expect("typed AuthError")
     }
 
     /// 401 at /signin/init is not a bad-password signal — Apple hasn't yet
@@ -1135,6 +1194,89 @@ mod tests {
             matches!(auth_err, AuthError::ApiError { code: 403, .. }),
             "403 on complete must be ApiError, not FailedLogin, got: {auth_err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn srp_complete_403_service_error_20209_is_terminal_apple_auth() {
+        let body = br#"{
+            "hasError": true,
+            "serviceErrors": [
+                {
+                    "code": "-20209",
+                    "message": "This Apple Account has been locked for security reasons."
+                }
+            ]
+        }"#;
+        match run_srp_complete_error(403, body).await {
+            AuthError::TerminalAppleAuth { code, message } => {
+                assert_eq!(code, APPLE_ACCOUNT_LOCKED_CODE);
+                assert!(message.contains("locked for security reasons"));
+            }
+            other => panic!("expected TerminalAppleAuth, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn srp_complete_200_service_error_20209_is_terminal_apple_auth() {
+        let body = br#"{
+            "service_errors": [
+                {"code": "-20209", "message": "", "title": "Account locked"}
+            ]
+        }"#;
+        match run_srp_complete_error(200, body).await {
+            AuthError::TerminalAppleAuth { code, message } => {
+                assert_eq!(code, APPLE_ACCOUNT_LOCKED_CODE);
+                assert_eq!(message, "Account locked");
+            }
+            other => panic!("expected TerminalAppleAuth, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn srp_complete_401_service_error_20101_is_terminal_apple_auth() {
+        let body = br#"{
+            "serviceErrors": [
+                {
+                    "code": "-20101",
+                    "message": "Enter the email or phone number and password for your Apple Account."
+                }
+            ]
+        }"#;
+        match run_srp_complete_error(401, body).await {
+            AuthError::TerminalAppleAuth { code, message } => {
+                assert_eq!(code, APPLE_INVALID_CREDENTIALS_CODE);
+                assert!(message.contains("email or phone number and password"));
+            }
+            other => panic!("expected TerminalAppleAuth, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn srp_complete_200_non_terminal_service_error_is_service_error() {
+        let body = br#"{
+            "serviceErrors": [
+                {"code": "AUTH-401", "message": "Authentication required"}
+            ]
+        }"#;
+        match run_srp_complete_error(200, body).await {
+            AuthError::ServiceError { code, message } => {
+                assert_eq!(code, "AUTH-401");
+                assert!(message.contains("Authentication required"));
+            }
+            other => panic!("expected ServiceError, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn srp_complete_200_bare_has_error_is_service_error() {
+        let body = br#"{"hasError": true}"#;
+        match run_srp_complete_error(200, body).await {
+            AuthError::ServiceError { code, message } => {
+                assert_eq!(code, "unknown");
+                assert!(message.contains("Apple reported an error"));
+            }
+            other => panic!("expected ServiceError, got: {other:?}"),
+        }
     }
 
     /// 429 at /signin/complete must be reported as rate-limited, not as a
