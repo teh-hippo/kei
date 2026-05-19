@@ -2045,6 +2045,7 @@ async fn download_photos_incremental(
     if downloadable_assets.is_empty() {
         let stats = SyncStats {
             elapsed_secs: started.elapsed().as_secs_f64(),
+            interrupted: shutdown_token.is_cancelled(),
             ..SyncStats::default()
         };
         tracing::info!("No new photos to download from incremental sync");
@@ -2186,6 +2187,7 @@ async fn download_photos_incremental(
         let stats = SyncStats {
             skipped: skip_breakdown,
             elapsed_secs: started.elapsed().as_secs_f64(),
+            interrupted: shutdown_token.is_cancelled(),
             ..SyncStats::default()
         };
         tracing::info!("All incremental assets already downloaded or filtered");
@@ -2234,7 +2236,7 @@ async fn download_photos_incremental(
         concurrency: config.concurrent_downloads,
         reporting: controls.reporting,
         temp_suffix: Arc::clone(&config.temp_suffix),
-        shutdown_token,
+        shutdown_token: shutdown_token.clone(),
         state_db: config.state_db.clone(),
         rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         bandwidth_limiter: config.bandwidth_limiter.clone(),
@@ -2263,7 +2265,8 @@ async fn download_photos_incremental(
         state_write_failures: pass_result.state_write_failures,
         enumeration_errors: 0,
         elapsed_secs: started.elapsed().as_secs_f64(),
-        interrupted: pass_result.auth_errors >= AUTH_ERROR_THRESHOLD,
+        interrupted: shutdown_token.is_cancelled()
+            || pass_result.auth_errors >= AUTH_ERROR_THRESHOLD,
         rate_limited: pass_result.rate_limit_observations,
         photos_downloaded: pass_result.photos_downloaded,
         videos_downloaded: pass_result.videos_downloaded,
