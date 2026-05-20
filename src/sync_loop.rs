@@ -124,6 +124,12 @@ fn should_retry_session_init(err: &anyhow::Error, already_retried: bool) -> bool
     !already_retried && is_session_error(err)
 }
 
+fn take_pending_auth<T>(pending_auth: &mut Option<T>) -> anyhow::Result<T> {
+    pending_auth
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("internal auth retry state missing before attempt"))
+}
+
 /// Given the user's library selector, the count of iCloud shared libraries
 /// on the account, and whether the notice has already fired, return the
 /// warning message to emit, or `None` if no notice is warranted.
@@ -505,13 +511,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     let mut pending_auth = Some(auth_result);
     let mut retried_after_session_error = false;
     let (shared_session, mut photos_service, libraries) = loop {
-        #[allow(
-            clippy::expect_used,
-            reason = "pending_auth is re-populated at the end of every retry branch before looping"
-        )]
-        let this_auth = pending_auth
-            .take()
-            .expect("auth_result present at start of attempt");
+        let this_auth = take_pending_auth(&mut pending_auth)?;
         let init_result =
             init_photos_service(this_auth, api_retry_config, config.ui.personality_mode).await;
         let (ss, mut ps) = match init_result {
@@ -1364,22 +1364,33 @@ async fn check_changes_database(
         return WatchPrecheck::SkipAll;
     }
     for lib_state in library_states {
-        let has_token = db
-            .get_metadata(&lib_state.sync_token_key)
-            .await
-            .ok()
-            .flatten()
-            .is_some_and(|t| !t.is_empty());
+        let has_token = match db.get_metadata(&lib_state.sync_token_key).await {
+            Ok(token) => token.is_some_and(|t| !t.is_empty()),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    zone = %lib_state.zone_name,
+                    metadata_key = %lib_state.sync_token_key,
+                    "Failed to read zone sync token; proceeding with sync"
+                );
+                return WatchPrecheck::proceed_all();
+            }
+        };
         if !has_token {
             return WatchPrecheck::proceed_all();
         }
     }
-    let db_token = db
-        .get_metadata(DB_SYNC_TOKEN_KEY)
-        .await
-        .ok()
-        .flatten()
-        .filter(|t| !t.is_empty());
+    let db_token = match db.get_metadata(DB_SYNC_TOKEN_KEY).await {
+        Ok(token) => token.filter(|t| !t.is_empty()),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                metadata_key = DB_SYNC_TOKEN_KEY,
+                "Failed to read changes/database sync token; proceeding with sync"
+            );
+            return WatchPrecheck::proceed_all();
+        }
+    };
     match photos_service.changes_database(db_token.as_deref()).await {
         Ok(db_resp) => {
             let selected_zones: rustc_hash::FxHashSet<&str> = library_states
@@ -1402,10 +1413,13 @@ async fn check_changes_database(
             }
 
             if changed_selected_zones.is_empty() {
-                store_db_sync_token(db, &db_resp.sync_token).await;
                 if db_resp.more_coming {
-                    return WatchPrecheck::proceed_all();
+                    return WatchPrecheck::Proceed {
+                        changed_zones: None,
+                        db_sync_token_after_success: Some(db_resp.sync_token),
+                    };
                 }
+                store_db_sync_token(db, &db_resp.sync_token).await;
                 tracing::info!(
                     "No selected library changes detected (changes/database), skipping cycle"
                 );
@@ -2535,6 +2549,27 @@ mod tests {
         assert!(should_retry_session_init(&err, false));
     }
 
+    #[test]
+    fn take_pending_auth_returns_value_once() {
+        let mut pending = Some("auth");
+
+        assert_eq!(take_pending_auth(&mut pending).unwrap(), "auth");
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn take_pending_auth_empty_state_returns_error() {
+        let mut pending: Option<&str> = None;
+
+        let err = take_pending_auth(&mut pending).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("internal auth retry state missing before attempt"),
+            "unexpected error: {err}"
+        );
+    }
+
     // ── determine_sync_mode ──────────────────────────────────────────
     //
     // Sync-mode decision is the gatekeeper for the kei "user data is sacred"
@@ -2564,6 +2599,7 @@ mod tests {
     struct FailingMetadataSetDb {
         inner: Arc<dyn state::StateDb>,
         failure: MetadataSetFailure,
+        get_failure: Option<MetadataSetFailure>,
         delete_prefix_failure: Option<&'static str>,
         message: &'static str,
         cancel_on_upsert: Option<CancellationToken>,
@@ -2573,6 +2609,7 @@ mod tests {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("FailingMetadataSetDb")
                 .field("failure", &self.failure)
+                .field("get_failure", &self.get_failure)
                 .field("delete_prefix_failure", &self.delete_prefix_failure)
                 .field("message", &self.message)
                 .finish_non_exhaustive()
@@ -2588,10 +2625,24 @@ mod tests {
             Self {
                 inner,
                 failure,
+                get_failure: None,
                 delete_prefix_failure: None,
                 message,
                 cancel_on_upsert: None,
             }
+        }
+
+        fn without_set_failure(inner: Arc<dyn state::StateDb>, message: &'static str) -> Self {
+            Self::new(
+                inner,
+                MetadataSetFailure::Exact("__unused_metadata_key__"),
+                message,
+            )
+        }
+
+        fn with_get_failure(mut self, failure: MetadataSetFailure) -> Self {
+            self.get_failure = Some(failure);
+            self
         }
 
         fn with_delete_prefix_failure(mut self, prefix: &'static str) -> Self {
@@ -2794,7 +2845,11 @@ mod tests {
             &self,
             key: &str,
         ) -> Result<Option<String>, state::error::StateError> {
-            self.inner.get_metadata(key).await
+            if self.get_failure.is_some_and(|failure| failure.matches(key)) {
+                Err(state::error::StateError::LockPoisoned(self.message.into()))
+            } else {
+                self.inner.get_metadata(key).await
+            }
         }
 
         async fn set_metadata(
@@ -3337,7 +3392,7 @@ mod tests {
     /// `more_coming=true` with empty zones must NOT skip the cycle.
     /// Production logic: `if zones.is_empty() && !more_coming { skip }`.
     /// A regression that flipped the conjunction would silently skip every
-    /// page-bearing wakeup — silent loss of pending changes.
+    /// page-bearing wakeup -- silent loss of pending changes.
     #[tokio::test]
     async fn check_changes_database_more_coming_does_not_skip() {
         use serde_json::json;
@@ -3369,19 +3424,18 @@ mod tests {
                 precheck,
                 WatchPrecheck::Proceed {
                     changed_zones: None,
-                    db_sync_token_after_success: None
-                }
+                    db_sync_token_after_success: Some(ref token)
+                } if token == "db-tok-2"
             ),
             "more_coming=true must not skip the cycle (more pages pending)"
         );
-        // db_sync_token should have been persisted so the next cycle
-        // continues paging from where we left off.
-        let stored = db
-            .get_metadata(DB_SYNC_TOKEN_KEY)
-            .await
-            .expect("read db_sync_token")
-            .expect("token persisted");
-        assert_eq!(stored, "db-tok-2");
+        assert!(
+            db.get_metadata(DB_SYNC_TOKEN_KEY)
+                .await
+                .expect("read db_sync_token")
+                .is_none(),
+            "more_coming=true must defer db_sync_token advancement until the sync cycle succeeds"
+        );
     }
 
     /// Empty zones + `more_coming=false` must return `skip=true`.
@@ -3563,6 +3617,66 @@ mod tests {
                 }
             ),
             "no stored token must continue without a changes/database call"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_changes_database_zone_token_read_failure_proceeds_without_precheck() {
+        let session = crate::test_helpers::MockPhotosSession::new();
+        let mut svc = crate::icloud::photos::PhotosService::for_testing(
+            Box::new(session),
+            std::collections::HashMap::new(),
+        );
+        let inner = make_state_db();
+        inner
+            .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
+            .await
+            .expect("seed token");
+        let db: Arc<dyn state::StateDb> = Arc::new(
+            FailingMetadataSetDb::without_set_failure(inner, "simulated zone-token read failure")
+                .with_get_failure(MetadataSetFailure::Exact("sync_token:PrimarySync")),
+        );
+
+        let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
+        let precheck =
+            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc).await;
+
+        assert_eq!(
+            precheck,
+            WatchPrecheck::proceed_all(),
+            "metadata read failure should fall back to the safe full cycle path"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_changes_database_db_token_read_failure_proceeds_without_precheck() {
+        let session = crate::test_helpers::MockPhotosSession::new();
+        let mut svc = crate::icloud::photos::PhotosService::for_testing(
+            Box::new(session),
+            std::collections::HashMap::new(),
+        );
+        let inner = make_state_db();
+        inner
+            .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
+            .await
+            .expect("seed zone token");
+        inner
+            .set_metadata(DB_SYNC_TOKEN_KEY, "db-tok-prev")
+            .await
+            .expect("seed db token");
+        let db: Arc<dyn state::StateDb> = Arc::new(
+            FailingMetadataSetDb::without_set_failure(inner, "simulated db-token read failure")
+                .with_get_failure(MetadataSetFailure::Exact(DB_SYNC_TOKEN_KEY)),
+        );
+
+        let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
+        let precheck =
+            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc).await;
+
+        assert_eq!(
+            precheck,
+            WatchPrecheck::proceed_all(),
+            "db token read failure should fall back to the safe full cycle path"
         );
     }
 
@@ -4156,9 +4270,8 @@ mod tests {
             .await
             .expect("seed zone token");
         let db: Arc<dyn state::StateDb> = Arc::new(
-            FailingMetadataSetDb::new(
+            FailingMetadataSetDb::without_set_failure(
                 Arc::clone(&inner),
-                MetadataSetFailure::Exact("__unused_metadata_key__"),
                 "simulated token purge failure",
             )
             .with_delete_prefix_failure(SYNC_TOKEN_PREFIX),
@@ -4235,12 +4348,8 @@ mod tests {
             .expect("seed zone token");
         let shutdown_token = CancellationToken::new();
         let db: Arc<dyn state::StateDb> = Arc::new(
-            FailingMetadataSetDb::new(
-                Arc::clone(&inner),
-                MetadataSetFailure::Exact("__unused_metadata_key__"),
-                "unused",
-            )
-            .with_cancel_on_upsert(shutdown_token.clone()),
+            FailingMetadataSetDb::without_set_failure(Arc::clone(&inner), "unused")
+                .with_cancel_on_upsert(shutdown_token.clone()),
         );
         let download_dir = tempfile::tempdir().expect("download tempdir");
         let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
@@ -4686,9 +4795,8 @@ mod tests {
             .await
             .expect("seed zone token");
         let db: Arc<dyn state::StateDb> = Arc::new(
-            FailingMetadataSetDb::new(
+            FailingMetadataSetDb::without_set_failure(
                 Arc::clone(&inner),
-                MetadataSetFailure::Exact("__unused_metadata_key__"),
                 "simulated token purge failure",
             )
             .with_delete_prefix_failure(SYNC_TOKEN_PREFIX),
