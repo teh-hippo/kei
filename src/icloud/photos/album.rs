@@ -914,7 +914,7 @@ impl PhotoAlbum {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::MockPhotosSession;
+    use crate::test_helpers::{mock_photo_query_page, MockPhotosFlow, MockPhotosSession};
     use serde_json::json;
 
     fn make_album(
@@ -1097,60 +1097,15 @@ mod tests {
         )
     }
 
-    /// Build a canned QueryResponse with one paired CPLMaster+CPLAsset
-    /// record and an optional syncToken.
-    fn canned_page(record_name: &str, sync_token: Option<&str>) -> Value {
-        let mut resp = json!({
-            "records": [
-                {
-                    "recordName": record_name,
-                    "recordType": "CPLMaster",
-                    "fields": {
-                        "filenameEnc": {"value": "dGVzdC5qcGc=", "type": "STRING"},
-                        "resOriginalRes": {
-                            "value": {
-                                "downloadURL": "https://p01.icloud-content.com/photo.jpg",
-                                "size": 1024,
-                                "fileChecksum": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
-                            }
-                        },
-                        "resOriginalWidth": {"value": 100, "type": "INT64"},
-                        "resOriginalHeight": {"value": 100, "type": "INT64"},
-                        "resOriginalFileType": {"value": "public.jpeg"},
-                        "itemType": {"value": "public.jpeg"},
-                        "adjustmentRenderType": {"value": 0, "type": "INT64"}
-                    },
-                    "recordChangeTag": "ct1"
-                },
-                {
-                    "recordName": format!("asset-{record_name}"),
-                    "recordType": "CPLAsset",
-                    "fields": {
-                        "masterRef": {
-                            "value": {"recordName": record_name, "zoneID": {"zoneName": "PrimarySync"}},
-                            "type": "REFERENCE"
-                        },
-                        "assetDate": {"value": 1700000000000i64, "type": "TIMESTAMP"},
-                        "addedDate": {"value": 1700000000000i64, "type": "TIMESTAMP"}
-                    },
-                    "recordChangeTag": "ct2"
-                }
-            ]
-        });
-        if let Some(token) = sync_token {
-            resp["syncToken"] = json!(token);
-        }
-        resp
-    }
-
     #[tokio::test]
     async fn test_photo_stream_with_token_returns_sync_token() {
         use tokio_stream::StreamExt;
 
-        let mock = MockPhotosSession::new()
-            .ok(canned_page("master-1", Some("st-zone-abc")))
+        let mock = MockPhotosFlow::new()
+            .query_photo_page("master-1", Some("st-zone-abc"))
             // Second call returns empty records to stop the fetcher
-            .ok(json!({"records": [], "syncToken": "st-zone-abc"}));
+            .empty_query_page(Some("st-zone-abc"))
+            .build();
         let album = make_album_with_session(100, Box::new(mock));
 
         let (stream, token_rx) = album.photo_stream_with_token(None, None, 1);
@@ -1172,9 +1127,10 @@ mod tests {
         use tokio_stream::StreamExt;
 
         // Responses without syncToken field
-        let mock = MockPhotosSession::new()
-            .ok(canned_page("master-1", None))
-            .ok(json!({"records": []}));
+        let mock = MockPhotosFlow::new()
+            .query_photo_page("master-1", None)
+            .empty_query_page(None)
+            .build();
         let album = make_album_with_session(100, Box::new(mock));
 
         let (stream, token_rx) = album.photo_stream_with_token(None, None, 1);
@@ -1195,10 +1151,11 @@ mod tests {
         // Two pages with different syncTokens — last one should be captured.
         // page_size=1 so each page yields 1 master record and the fetcher
         // advances offset by 1.
-        let mock = MockPhotosSession::new()
-            .ok(canned_page("master-1", Some("st-first")))
-            .ok(canned_page("master-2", Some("st-second")))
-            .ok(json!({"records": []}));
+        let mock = MockPhotosFlow::new()
+            .query_photo_page("master-1", Some("st-first"))
+            .query_photo_page("master-2", Some("st-second"))
+            .empty_query_page(None)
+            .build();
         let album = make_album_with_session(1, Box::new(mock));
 
         let (stream, token_rx) = album.photo_stream_with_token(None, None, 1);
@@ -1225,6 +1182,115 @@ mod tests {
             count += 1;
         }
         count
+    }
+
+    #[tokio::test]
+    async fn offline_replay_full_pass_fixture() {
+        let mock = MockPhotosFlow::new()
+            .query_photo_page("master-replay-full", Some("token-full"))
+            .empty_query_page(Some("token-full"))
+            .build();
+        let album = make_album_with_session(100, Box::new(mock));
+
+        let (stream, token_rx) = album.photo_stream_with_token(None, None, 1);
+
+        assert_eq!(drain_photo_stream_count(stream).await, 1);
+        assert_eq!(
+            token_rx.await.expect("sync token sender").as_deref(),
+            Some("token-full")
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_replay_paginated_full_pass_fixture() {
+        let mock = MockPhotosFlow::new()
+            .query_photo_page("master-replay-page-1", Some("token-page-1"))
+            .query_photo_page("master-replay-page-2", Some("token-page-2"))
+            .empty_query_page(Some("token-page-2"))
+            .build();
+        let album = make_album_with_session(1, Box::new(mock));
+
+        let (stream, token_rx) = album.photo_stream_with_token(None, None, 1);
+
+        assert_eq!(drain_photo_stream_count(stream).await, 2);
+        assert_eq!(
+            token_rx.await.expect("sync token sender").as_deref(),
+            Some("token-page-2")
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_replay_empty_page_probe_fixture() {
+        let mock = MockPhotosFlow::new()
+            .query_photo_page("master-before-gap", None)
+            .empty_query_page(None)
+            .query_photo_page("master-after-gap", None)
+            .build();
+        let album = make_album_with_session(1, Box::new(mock));
+
+        let (stream, _handles) = album.photo_stream_inner(None, None, 1, None);
+
+        assert_eq!(
+            drain_photo_stream_count(stream).await,
+            2,
+            "single empty records/query page must be treated as a gap, not EOF"
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_replay_incremental_changes_fixture() {
+        use tokio_stream::StreamExt;
+
+        let mock = MockPhotosFlow::new()
+            .changes_photo_page("master-replay-change", "token-incremental", false)
+            .build();
+        let album = make_album_with_session(100, Box::new(mock));
+
+        let (stream, token_rx) = album.changes_stream("token-before");
+        tokio::pin!(stream);
+        let mut events = Vec::new();
+        while let Some(result) = stream.next().await {
+            events.push(result.expect("change event"));
+        }
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(&*events[0].record_name, "master-replay-change");
+        assert!(events[0].asset.is_some());
+        assert_eq!(
+            token_rx.await.expect("sync token sender"),
+            "token-incremental"
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_replay_retryable_error_page_fixture() {
+        use tokio_stream::StreamExt;
+
+        let mock = MockPhotosFlow::new()
+            .changes_zone_error("RETRY_LATER", "temporary backend issue", "")
+            .build();
+        let album = make_album_with_session(100, Box::new(mock));
+
+        let (stream, token_rx) = album.changes_stream("token-before");
+        tokio::pin!(stream);
+        let mut errors = Vec::new();
+        while let Some(result) = stream.next().await {
+            if let Err(error) = result {
+                errors.push(error);
+            }
+        }
+
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].to_string().contains("RETRY_LATER"),
+            "retryable fixture should surface the CloudKit retry code: {}",
+            errors[0]
+        );
+        assert_eq!(
+            token_rx.await.expect("sync token sender"),
+            "token-before",
+            "retryable error must preserve the last-good token"
+        );
     }
 
     #[derive(Clone, Debug)]
@@ -1254,7 +1320,7 @@ mod tests {
 
             Ok(self.tokens_by_offset.get(&offset).map_or_else(
                 || json!({"records": []}),
-                |token| canned_page(&format!("master-{offset}"), Some(token)),
+                |token| mock_photo_query_page(&format!("master-{offset}"), Some(token)),
             ))
         }
 
@@ -1338,7 +1404,7 @@ mod tests {
         // --recent 0 should produce 0 items. The mock has a valid page
         // available, but limit=0 means the fetcher should never send it.
         let mock = MockPhotosSession::new()
-            .ok(canned_page("master-1", None))
+            .ok(mock_photo_query_page("master-1", None))
             .ok(json!({"records": []}));
         let album = make_album_with_session(100, Box::new(mock));
 
@@ -1354,8 +1420,8 @@ mod tests {
         use tokio_stream::StreamExt;
 
         let mock = MockPhotosSession::new()
-            .ok(canned_page("master-1", None))
-            .ok(canned_page("master-2", None))
+            .ok(mock_photo_query_page("master-1", None))
+            .ok(mock_photo_query_page("master-2", None))
             .ok(json!({"records": []}));
         let album = make_album_with_session(1, Box::new(mock));
 
@@ -1396,7 +1462,7 @@ mod tests {
         });
 
         // Page 2: Valid paired CPLMaster + CPLAsset.
-        let page2 = canned_page("master-ok", None);
+        let page2 = mock_photo_query_page("master-ok", None);
 
         // Page 3: Empty → terminates.
         let mock = MockPhotosSession::new()
@@ -1428,11 +1494,11 @@ mod tests {
         use tokio_stream::StreamExt;
 
         let mock = MockPhotosSession::new()
-            .ok(canned_page("master-1", None))
+            .ok(mock_photo_query_page("master-1", None))
             // Page 2 is empty (simulated gap); must not terminate.
             .ok(json!({"records": []}))
             // Page 3 contains records past the gap.
-            .ok(canned_page("master-2", None));
+            .ok(mock_photo_query_page("master-2", None));
         // MockPhotosSession then returns the default {"records": []} on
         // every subsequent call; the fetcher requires MAX_EMPTY_PAGE_PROBES
         // consecutive empties to commit to EOF.
@@ -1463,14 +1529,14 @@ mod tests {
         use tokio_stream::StreamExt;
 
         let mock = MockPhotosSession::new()
-            .ok(canned_page("master-1", None))
+            .ok(mock_photo_query_page("master-1", None))
             // 4 consecutive empty pages (within tolerance).
             .ok(json!({"records": []}))
             .ok(json!({"records": []}))
             .ok(json!({"records": []}))
             .ok(json!({"records": []}))
             // Records reappear past the empty run.
-            .ok(canned_page("master-2", None));
+            .ok(mock_photo_query_page("master-2", None));
         let album = make_album_with_session(1, Box::new(mock));
 
         let (stream, _handles) = album.photo_stream_inner(None, None, 1, None);
@@ -1501,14 +1567,14 @@ mod tests {
         // page with a record would be unreachable; the test asserts it is
         // never observed.
         let mock = MockPhotosSession::new()
-            .ok(canned_page("master-1", None))
+            .ok(mock_photo_query_page("master-1", None))
             .ok(json!({"records": []}))
             .ok(json!({"records": []}))
             .ok(json!({"records": []}))
             .ok(json!({"records": []}))
             .ok(json!({"records": []}))
             // Should never be requested — terminator should fire first.
-            .ok(canned_page("master-unreachable", None));
+            .ok(mock_photo_query_page("master-unreachable", None));
         let album = make_album_with_session(1, Box::new(mock));
 
         let (stream, _handles) = album.photo_stream_inner(None, None, 1, None);
@@ -1590,7 +1656,9 @@ mod tests {
             changes_master("master-1"),
             changes_asset("asset-1", "master-1"),
         ];
-        let mock = MockPhotosSession::new().ok(canned_changes_page(&records, "token-final", false));
+        let mock = MockPhotosFlow::new()
+            .changes_zone_page(records, "token-final", false)
+            .build();
         let album = make_album_with_session(100, Box::new(mock));
 
         let (stream, token_rx) = album.changes_stream("token-initial");
@@ -1622,9 +1690,10 @@ mod tests {
             changes_master("master-2"),
             changes_asset("asset-2", "master-2"),
         ];
-        let mock = MockPhotosSession::new()
-            .ok(canned_changes_page(&page1_records, "token-page1", true))
-            .ok(canned_changes_page(&page2_records, "token-page2", false));
+        let mock = MockPhotosFlow::new()
+            .changes_zone_page(page1_records, "token-page1", true)
+            .changes_zone_page(page2_records, "token-page2", false)
+            .build();
         let album = make_album_with_session(100, Box::new(mock));
 
         let (stream, token_rx) = album.changes_stream("token-initial");
@@ -1653,9 +1722,10 @@ mod tests {
             changes_master("master-1"),
             changes_asset("asset-1", "master-1"),
         ];
-        let mock = MockPhotosSession::new()
-            .ok(canned_changes_page(&[], "token-empty", true))
-            .ok(canned_changes_page(&page2_records, "token-final", false));
+        let mock = MockPhotosFlow::new()
+            .changes_zone_page(Vec::new(), "token-empty", true)
+            .changes_zone_page(page2_records, "token-final", false)
+            .build();
         let album = make_album_with_session(100, Box::new(mock));
 
         let (stream, token_rx) = album.changes_stream("token-initial");
@@ -1677,15 +1747,9 @@ mod tests {
     async fn test_changes_stream_zone_error() {
         use tokio_stream::StreamExt;
 
-        let mock = MockPhotosSession::new().ok(json!({
-            "zones": [{
-                "zoneID": {"zoneName": "PrimarySync"},
-                "syncToken": "",
-                "moreComing": false,
-                "serverErrorCode": "BAD_REQUEST",
-                "reason": "Unknown sync continuation type"
-            }]
-        }));
+        let mock = MockPhotosFlow::new()
+            .changes_zone_error("BAD_REQUEST", "Unknown sync continuation type", "")
+            .build();
         let album = make_album_with_session(100, Box::new(mock));
 
         let (stream, token_rx) = album.changes_stream("bad-token");
@@ -1718,15 +1782,9 @@ mod tests {
         // on the very first page must not lose the caller's initial sync_token.
         use tokio_stream::StreamExt;
 
-        let mock = MockPhotosSession::new().ok(json!({
-            "zones": [{
-                "zoneID": {"zoneName": "PrimarySync", "ownerRecordName": "_defaultOwner"},
-                "syncToken": "",
-                "moreComing": false,
-                "serverErrorCode": "RETRY_LATER",
-                "reason": "temporary backend issue"
-            }]
-        }));
+        let mock = MockPhotosFlow::new()
+            .changes_zone_error("RETRY_LATER", "temporary backend issue", "")
+            .build();
         let album = make_album_with_session(100, Box::new(mock));
 
         let (stream, token_rx) = album.changes_stream("token-T0");
