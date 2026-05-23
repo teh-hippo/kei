@@ -1375,7 +1375,6 @@ struct PerPassStreamingResult {
 }
 
 struct CollectedUnfiledStream {
-    count: u64,
     token_rx: tokio::sync::oneshot::Receiver<Option<String>>,
     items: Vec<anyhow::Result<PhotoAsset>>,
 }
@@ -1402,7 +1401,6 @@ fn deferred_unfiled_index(passes: &[crate::commands::AlbumPass]) -> Option<usize
 
 async fn collect_unfiled_stream(
     pass: &crate::commands::AlbumPass,
-    count: u64,
     stream_total_count: Option<u64>,
     config: &DownloadConfig,
     controls: DownloadControls,
@@ -1430,11 +1428,7 @@ async fn collect_unfiled_stream(
         }
         items.push(item);
     }
-    CollectedUnfiledStream {
-        count,
-        token_rx,
-        items,
-    }
+    CollectedUnfiledStream { token_rx, items }
 }
 
 async fn run_full_pass_stream<S>(
@@ -1979,6 +1973,11 @@ struct PassCountPlan {
     len_errors: usize,
 }
 
+fn capped_exact_total(counts: &[u64], recent: Option<u32>) -> u64 {
+    let total = counts.iter().sum::<u64>();
+    total.min(recent.map(u64::from).unwrap_or(u64::MAX))
+}
+
 fn should_skip_pass_count_fetch(config: &DownloadConfig, controls: DownloadControls) -> bool {
     config.recent.is_some()
         && (controls.run_mode.is_dry_run() || controls.run_mode.only_print_filenames())
@@ -2015,10 +2014,7 @@ async fn build_pass_count_plan(
     let pass_count_results = crate::icloud::photos::PhotoAlbum::len_many(&pass_albums).await;
     let (display_counts, len_errors) = fold_pass_count_results(pass_count_results, passes);
     let stream_total_counts = display_counts.iter().copied().map(Some).collect();
-    let mut exact_total: u64 = display_counts.iter().sum();
-    if let Some(recent) = config.recent {
-        exact_total = exact_total.min(u64::from(recent));
-    }
+    let exact_total = capped_exact_total(&display_counts, config.recent);
 
     PassCountPlan {
         display_counts,
@@ -2029,21 +2025,14 @@ async fn build_pass_count_plan(
 }
 
 /// Classification of how the producer-observed asset count compared with the
-/// pre-enumeration API total. Drives the two-tier pagination-undercount gate.
+/// pre-enumeration API total.
 ///
-/// - `Match`: producer saw at least as many assets as `total` reported. Token
-///   advances silently.
-/// - `WithinTolerance`: producer saw fewer than `total` but the gap is below
-///   the 5% suppression threshold. Token advances; a `warn!` fires so a slow
-///   drift is visible before it grows past 5%.
-/// - `Suppress`: gap is at or above 5% of `total`. Token is suppressed so the
-///   next cycle re-enumerates. Without this gate, missed change events would
-///   sit behind an advanced token forever (silent data loss).
+/// Any shortfall is token-unsafe. The shortfall count is kept so logs can
+/// report how many assets were missed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PaginationShortfall {
     Match,
-    WithinTolerance { shortfall: u64 },
-    Suppress,
+    Shortfall { shortfall: u64 },
 }
 
 /// Pure classifier for the pagination-undercount gate. `total` is the
@@ -2054,13 +2043,8 @@ fn classify_pagination_shortfall(total: u64, seen: u64) -> PaginationShortfall {
     if seen >= total {
         return PaginationShortfall::Match;
     }
-    let suppress_threshold = total * 95 / 100; // 5% tolerance
-    if seen < suppress_threshold {
-        PaginationShortfall::Suppress
-    } else {
-        PaginationShortfall::WithinTolerance {
-            shortfall: total - seen,
-        }
+    PaginationShortfall::Shortfall {
+        shortfall: total - seen,
     }
 }
 
@@ -2122,7 +2106,8 @@ async fn download_photos_full_with_token(
     let pass_count_plan = build_pass_count_plan(passes, config, controls).await;
     let pass_counts = pass_count_plan.display_counts;
     let pass_stream_counts = pass_count_plan.stream_total_counts;
-    let exact_total = pass_count_plan.exact_total;
+    let mut pagination_counts = pass_counts.clone();
+    let mut exact_total = pass_count_plan.exact_total;
     let len_errors = pass_count_plan.len_errors;
     let display_total = pass_counts
         .iter()
@@ -2264,11 +2249,10 @@ async fn download_photos_full_with_token(
 
         let unfiled_collection = async {
             match deferred_unfiled {
-                Some(index) => match (passes.get(index), pass_counts.get(index).copied()) {
-                    (Some(pass), Some(count)) => Some(
+                Some(index) => match passes.get(index) {
+                    Some(pass) => Some(
                         collect_unfiled_stream(
                             pass,
-                            count,
                             pass_stream_counts.get(index).copied().flatten(),
                             config,
                             controls,
@@ -2322,14 +2306,24 @@ async fn download_photos_full_with_token(
                         .map_or(true, |asset| !excluded_ids.contains(asset.id()))
                 });
                 if let Some(pass_config) = pass_configs.get(index).cloned() {
+                    let filtered_items = filtered.collect::<Vec<_>>();
+                    let filtered_count = filtered_items
+                        .iter()
+                        .filter(|item| item.is_ok())
+                        .count()
+                        .try_into()
+                        .unwrap_or(u64::MAX);
+                    if let Some(slot) = pagination_counts.get_mut(index) {
+                        *slot = filtered_count;
+                    }
                     let pass_result = run_full_pass_stream(
                         download_client.clone(),
-                        stream::iter(filtered),
+                        stream::iter(filtered_items),
                         collected.token_rx,
                         pass_config,
                         FullPassStreamOptions {
                             controls,
-                            count: collected.count,
+                            count: filtered_count,
                             kind: crate::commands::PassKind::Unfiled,
                             shutdown_token: shutdown_token.clone(),
                             download_ctx: shared_download_ctx.clone(),
@@ -2416,6 +2410,9 @@ async fn download_photos_full_with_token(
     if len_errors > 0 {
         streaming_result.enumeration_complete = false;
     }
+    if exact_total.is_some() {
+        exact_total = Some(capped_exact_total(&pagination_counts, config.recent));
+    }
 
     // Check if enumeration saw significantly fewer assets than the API reported.
     // This catches silent pagination truncation, dropped pages, or API hiccups
@@ -2428,20 +2425,11 @@ async fn download_photos_full_with_token(
             let decision = classify_pagination_shortfall(total, streaming_result.assets_seen);
             match decision {
                 PaginationShortfall::Match => false,
-                PaginationShortfall::WithinTolerance { shortfall } => {
+                PaginationShortfall::Shortfall { shortfall } => {
                     tracing::warn!(
                         expected = total,
                         seen = streaming_result.assets_seen,
                         shortfall,
-                        "Enumeration saw slightly fewer assets than expected; within \
-                         5% tolerance so sync token will still advance"
-                    );
-                    false
-                }
-                PaginationShortfall::Suppress => {
-                    tracing::warn!(
-                        expected = total,
-                        seen = streaming_result.assets_seen,
                         "Enumeration saw fewer assets than expected — blocking sync token \
                          advancement to force full re-enumeration on next run"
                     );
@@ -2454,6 +2442,9 @@ async fn download_photos_full_with_token(
     } else {
         false
     };
+    if pagination_undercount {
+        streaming_result.enumeration_errors += 1;
+    }
 
     // Collect the sync token from every album's token receiver and require
     // agreement before advancing. In practice, all passes for a zone should
@@ -2461,7 +2452,10 @@ async fn download_photos_full_with_token(
     // observe one coherent snapshot.
     // Don't advance the token for read-only operations, or when pagination
     // was incomplete (would permanently skip missed assets).
-    let sync_token = if !controls.run_mode.only_print_filenames() && !pagination_undercount {
+    let sync_token = if !controls.run_mode.only_print_filenames()
+        && !pagination_undercount
+        && streaming_result.enumeration_errors == 0
+    {
         let mut tokens = Vec::new();
         for rx in token_receivers {
             if let Ok(Some(token)) = rx.await {
@@ -2675,6 +2669,7 @@ async fn download_photos_incremental(
     let mut tasks: Vec<DownloadTask> = Vec::new();
     let mut task_planner = planner::TaskPlanner::new();
     let mut skip_breakdown = SkipBreakdown::default();
+    let mut enumeration_errors = 0usize;
     let pass_configs = build_pass_configs_resolving_deferred_excludes(passes, config).await?;
 
     for (asset, pass_index) in &downloadable_assets {
@@ -2688,6 +2683,16 @@ async fn download_photos_incremental(
         let plan = task_planner.plan_asset(asset, effective_config).await;
         if let Some(reason) = plan.filter_reason {
             skip_breakdown.record_filter_reason(reason);
+            continue;
+        }
+        if let Some(resource) = &plan.malformed_resource {
+            enumeration_errors += 1;
+            tracing::error!(
+                asset_id = %asset.id(),
+                field = %resource.field,
+                reason = %resource.reason,
+                "Malformed CloudKit resource prevented incremental download planning"
+            );
             continue;
         }
 
@@ -2741,15 +2746,23 @@ async fn download_photos_incremental(
     if tasks.is_empty() {
         let stats = SyncStats {
             skipped: skip_breakdown,
+            enumeration_errors,
             elapsed_secs: started.elapsed().as_secs_f64(),
             interrupted: shutdown_token.is_cancelled(),
             ..SyncStats::default()
         };
         tracing::info!("All incremental assets already downloaded or filtered");
         tracing::info!(elapsed = %format_duration(started.elapsed()), "  completed");
+        let outcome = if enumeration_errors > 0 {
+            DownloadOutcome::PartialFailure {
+                failed_count: enumeration_errors,
+            }
+        } else {
+            DownloadOutcome::Success
+        };
         return Ok(SyncResult {
-            outcome: DownloadOutcome::Success,
-            sync_token,
+            outcome,
+            sync_token: (enumeration_errors == 0).then_some(sync_token).flatten(),
             stats,
             full_enumeration_ran: false,
         });
@@ -2765,12 +2778,19 @@ async fn download_photos_incremental(
         }
         let stats = SyncStats {
             skipped: skip_breakdown,
+            enumeration_errors,
             elapsed_secs: started.elapsed().as_secs_f64(),
             ..SyncStats::default()
         };
         // Don't advance the sync token — this is a read-only operation.
         return Ok(SyncResult {
-            outcome: DownloadOutcome::Success,
+            outcome: if enumeration_errors > 0 {
+                DownloadOutcome::PartialFailure {
+                    failed_count: enumeration_errors,
+                }
+            } else {
+                DownloadOutcome::Success
+            },
             sync_token: None,
             stats,
             full_enumeration_ran: false,
@@ -2818,7 +2838,7 @@ async fn download_photos_incremental(
         disk_bytes_written: pass_result.disk_bytes_written,
         exif_failures: pass_result.exif_failures,
         state_write_failures: pass_result.state_write_failures,
-        enumeration_errors: 0,
+        enumeration_errors,
         elapsed_secs: started.elapsed().as_secs_f64(),
         interrupted: shutdown_token.is_cancelled()
             || pass_result.auth_errors >= AUTH_ERROR_THRESHOLD
@@ -2844,18 +2864,24 @@ async fn download_photos_incremental(
         });
     }
 
-    let outcome =
-        if failed > 0 || pass_result.exif_failures > 0 || pass_result.state_write_failures > 0 {
-            DownloadOutcome::PartialFailure {
-                failed_count: failed + pass_result.exif_failures + pass_result.state_write_failures,
-            }
-        } else {
-            DownloadOutcome::Success
-        };
+    let outcome = if failed > 0
+        || pass_result.exif_failures > 0
+        || pass_result.state_write_failures > 0
+        || enumeration_errors > 0
+    {
+        DownloadOutcome::PartialFailure {
+            failed_count: failed
+                + pass_result.exif_failures
+                + pass_result.state_write_failures
+                + enumeration_errors,
+        }
+    } else {
+        DownloadOutcome::Success
+    };
 
     Ok(SyncResult {
         outcome,
-        sync_token,
+        sync_token: (enumeration_errors == 0).then_some(sync_token).flatten(),
         stats,
         full_enumeration_ran: false,
     })
@@ -3128,6 +3154,47 @@ mod tests {
         )
     }
 
+    fn mock_photo_records_with_filename(record_name: &str, filename: &str) -> Vec<Value> {
+        vec![
+            json!({
+                "recordName": record_name,
+                "recordType": "CPLMaster",
+                "fields": {
+                    "filenameEnc": {"value": filename, "type": "STRING"},
+                    "resOriginalRes": {
+                        "value": {
+                            "downloadURL": "https://p01.icloud-content.com/photo.jpg",
+                            "size": 1024,
+                            "fileChecksum": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+                        }
+                    },
+                    "resOriginalWidth": {"value": 100, "type": "INT64"},
+                    "resOriginalHeight": {"value": 100, "type": "INT64"},
+                    "resOriginalFileType": {"value": "public.jpeg"},
+                    "itemType": {"value": "public.jpeg"},
+                    "adjustmentRenderType": {"value": 0, "type": "INT64"}
+                },
+                "recordChangeTag": "ct1"
+            }),
+            json!({
+                "recordName": format!("asset-{record_name}"),
+                "recordType": "CPLAsset",
+                "fields": {
+                    "masterRef": {
+                        "value": {
+                            "recordName": record_name,
+                            "zoneID": {"zoneName": "PrimarySync"}
+                        },
+                        "type": "REFERENCE"
+                    },
+                    "assetDate": {"value": 1700000000000i64, "type": "TIMESTAMP"},
+                    "addedDate": {"value": 1700000000000i64, "type": "TIMESTAMP"}
+                },
+                "recordChangeTag": "ct2"
+            }),
+        ]
+    }
+
     #[tokio::test]
     async fn full_sync_per_pass_streams_overlap_when_paths_are_pass_specific() {
         let session = ConcurrentRecordsSession::new(Duration::from_millis(100));
@@ -3216,6 +3283,73 @@ mod tests {
         assert!(
             matches!(result.outcome, DownloadOutcome::Success),
             "filtered duplicate should not make the run partial"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_sync_deferred_unfiled_write_mode_exclusion_does_not_count_as_shortfall() {
+        let records = mock_photo_records_with_filename("MASTER_1", "test.jpg");
+        let album_session = MockPhotosFlow::new()
+            .album_count(1)
+            .query_page(records.clone(), Some("zone-token"))
+            .build();
+        let unfiled_session = MockPhotosFlow::new()
+            .album_count(1)
+            .query_page(records.clone(), Some("zone-token"))
+            .build();
+        let passes = vec![
+            AlbumPass {
+                kind: PassKind::Album,
+                album: mock_album("Vacation", album_session),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+            AlbumPass {
+                kind: PassKind::Unfiled,
+                album: mock_album("", unfiled_session),
+                exclude_ids: Arc::new(FxHashSet::default()),
+            },
+        ];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 2;
+
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        let album_config = config.with_pass(&passes[0]);
+        let expected_path = filter::expected_paths_for(&asset, &album_config)
+            .into_iter()
+            .next()
+            .expect("mock asset should have an expected path");
+        tokio::fs::create_dir_all(expected_path.path.parent().expect("path has parent"))
+            .await
+            .expect("create parent dir");
+        tokio::fs::write(&expected_path.path, vec![0u8; 1024])
+            .await
+            .expect("seed existing file");
+
+        let result = download_photos_full_with_token(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("write-mode full sync should succeed");
+
+        assert_eq!(
+            result.stats.enumeration_errors, 0,
+            "deferred unfiled exclusions are intentional and must not be counted as pagination undercount"
+        );
+        assert_eq!(
+            result.sync_token.as_deref(),
+            Some("zone-token"),
+            "clean write-mode enumeration should still advance the agreed sync token"
+        );
+        assert!(
+            matches!(result.outcome, DownloadOutcome::Success),
+            "filtered duplicate should not make the write-mode run partial"
         );
     }
 
@@ -5307,57 +5441,44 @@ mod tests {
         assert_eq!(decision, PaginationShortfall::Match);
     }
 
-    /// A 1% undercount (within 5% tolerance) classifies as
-    /// `WithinTolerance` so the caller emits a `warn!` but still advances the
-    /// sync token. This is the visible-but-non-blocking layer that closes the
-    /// pre-existing 4%-silent-drop gap (the prior gate fired only at >=5%).
+    /// A 1% undercount is token-unsafe. Small mismatches still keep the
+    /// shortfall count for log/report context, but the token must not advance.
     #[test]
-    fn classify_pagination_shortfall_one_percent_below_warns_but_advances() {
+    fn classify_pagination_shortfall_one_percent_below_blocks_token() {
         // 1000 expected, 990 seen → 1% shortfall, within 5% tolerance.
         let decision = classify_pagination_shortfall(1000, 990);
         assert_eq!(
             decision,
-            PaginationShortfall::WithinTolerance { shortfall: 10 },
-            "1% undercount must classify as WithinTolerance so the caller emits \
-             a warn but does NOT suppress the sync token"
+            PaginationShortfall::Shortfall { shortfall: 10 },
+            "1% undercount must block sync-token advancement"
         );
     }
 
-    /// A 4% undercount (still within 5% tolerance) classifies as
-    /// `WithinTolerance`. Pre-fix this slipped through silently with no log;
-    /// post-fix the `warn!` makes the drift visible before it grows past 5%.
+    /// A 4% undercount is also token-unsafe. There is no tolerance for
+    /// write-capable syncs because a short page can hide never-downloaded
+    /// records behind an advanced token.
     #[test]
-    fn classify_pagination_shortfall_four_percent_below_still_advances() {
+    fn classify_pagination_shortfall_four_percent_below_blocks_token() {
         // 1000 expected, 960 seen → 4% shortfall.
         let decision = classify_pagination_shortfall(1000, 960);
-        assert_eq!(
-            decision,
-            PaginationShortfall::WithinTolerance { shortfall: 40 }
-        );
+        assert_eq!(decision, PaginationShortfall::Shortfall { shortfall: 40 });
     }
 
-    /// A 6% undercount crosses the 5% threshold and must `Suppress` so
-    /// the sync token is held back, forcing full re-enumeration on the next
-    /// run rather than skipping the missing change events forever.
+    /// A 6% undercount is token-unsafe for the same reason as a small
+    /// undercount.
     #[test]
-    fn classify_pagination_shortfall_six_percent_below_suppresses_token() {
-        // 1000 expected, 940 seen → 6% shortfall, above the 5% suppression
-        // threshold. `total * 95 / 100 = 950`, and 940 < 950 → Suppress.
+    fn classify_pagination_shortfall_six_percent_below_blocks_token() {
+        // 1000 expected, 940 seen → 6% shortfall.
         let decision = classify_pagination_shortfall(1000, 940);
-        assert_eq!(decision, PaginationShortfall::Suppress);
+        assert_eq!(decision, PaginationShortfall::Shortfall { shortfall: 60 });
     }
 
-    /// Boundary case at exactly 5% shortfall. `total * 95 / 100 = 950`,
-    /// and seen == 950 is NOT below the threshold, so it stays in
-    /// `WithinTolerance` (the gate is strict less-than). Pinning this so a
-    /// future tweak to the threshold math doesn't flip the boundary silently.
+    /// Boundary case at exactly 5% shortfall. The old tolerance boundary is
+    /// still token-unsafe under fail-closed enumeration.
     #[test]
-    fn classify_pagination_shortfall_at_threshold_is_within_tolerance() {
+    fn classify_pagination_shortfall_at_old_threshold_blocks_token() {
         let decision = classify_pagination_shortfall(1000, 950);
-        assert_eq!(
-            decision,
-            PaginationShortfall::WithinTolerance { shortfall: 50 }
-        );
+        assert_eq!(decision, PaginationShortfall::Shortfall { shortfall: 50 });
     }
 
     /// The orphan-part walk must remove .part files older
