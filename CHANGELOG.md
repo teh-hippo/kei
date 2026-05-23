@@ -9,19 +9,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **v0.20 migration guide and example config.** Added `docs/v0.20-migration.md` and `example.config.toml` to show every supported TOML key, default, and allowed value. README, Docker Compose, and migration docs now describe the v0.20 source model: TOML for persistent settings, CLI flags for one-run actions, and env vars for secrets or runtime glue. ([#411])
+- **Keyring-first setup wizard.** `kei config setup` now stores accepted passwords through the same credential path as `kei password set`, keeps `.env` as an explicit fallback, and shows which credential backend was used. Generated TOML stays password-free. ([#410])
+- **Strict import adoption.** `import-existing --strict` and `[import].strict = true` verify a small iCloud prefix before adopting same-name, same-size local files. Strict refusals are counted in the import summary. ([#408])
+
 ### Changed
 
-- **v0.20 TOML-first migration docs.** Added `docs/v0.20-migration.md` and `example.config.toml`, a complete TOML config dictionary with defaults and allowed values. README, Docker Compose, and migration docs now describe the v0.20 source model: TOML for persistent settings, CLI flags for one-run actions, and env vars for secrets/runtime glue. Docker examples now use mounted `/config/config.toml` for durable settings while keeping `KEI_DATA_DIR=/config` as container runtime glue for sessions, state, and stored credentials.
-- **README scope refreshed.** The README now leads with the current iCloud sync, media, operations, service, Docker, and planned-backend scope, then moves the longer capability list into a `Features` section. The command links now include `reconcile`.
-- **v0.20 deprecation cleanup.** Removed the remaining v0.13 compatibility aliases: `--exclude-album` / `KEI_EXCLUDE_ALBUM`, `{album}` in the base `--folder-structure`, implicit `--album all` promotion from that token, `[filters].album`, `[filters].exclude_albums`, and `[filters].library`. Use `--album '!NAME'`, `--folder-structure-albums`, and the `[filters].albums` / `[filters].libraries` arrays.
-- **`import-existing` is TOML-first.** Import now reads persistent path, photo, and media matching settings from the same TOML config as sync. The old import-only durable flags and env mirrors are gone; keep `--library`, `--recent`, `--dry-run`, `--force-empty`, `--no-progress-bar`, and new `--strict` for one-off import behavior. `[import].strict = true` or `--strict` verifies a small iCloud prefix before adopting a same-name, same-size local file, and the summary reports strict refusals. ([#314])
-- **Operator visibility for suspicious successful syncs.** Deferred state-write retries now log at info level with retry metadata, and a completed full sync that enumerates zero assets warns without changing the exit code. `sync --retry-failed` no-op runs stay quiet. ([#279], [#280])
-- **Terminal Apple auth failures get their own exit path.** Apple `/signin/complete` responses with `serviceErrors[].code = "-20209"` or `"-20101"` now surface as terminal auth errors with account recovery or stored-password update steps, and kei exits 4 instead of the generic auth exit. ([#333])
+- **TOML is now the durable config surface.** Persistent sync, path, photo, media, retry, metadata, UI, and import settings resolve from `config.toml`. CLI flags are for one-run behavior, and env vars remain for secrets and runtime/container glue. Docker now starts `kei service run --config /config/config.toml`, keeps state under `/config`, and takes the download location from `[download].directory`. ([#403], [#405], [#406], [#408], [#409], [#411])
+- **Config names were tightened for v0.20.** Durable media filtering moved to `[filters].media`; selector literals can escape sentinels with `=`; photo resolution settings split into `resolution`, `live_resolution`, `edited`, `alternative`, `raw_policy`, and `force_resolution`; retry settings moved to `[download.retry].per_transfer` and `[download.retry].per_asset`; progress moved to `[ui].progress_bar`; metadata settings moved to `[metadata]`. ([#405], [#406], [#409])
+- **JPEG/TIFF EXIF writes no longer require the `xmp` feature.** Native EXIF updates now work in default builds. XMP sidecars and HEIC metadata writes still require the `xmp` feature. ([#409])
+- **Watch and full-sync runs make fewer Apple and SQLite calls.** Idle watch cycles can skip album refresh when `/changes/database` reports no selected-library changes. Multi-pass full syncs preload download state once, batch same-library album counts, bound known-count streams, and run independent album streams concurrently. ([#416], [#464], [#465], [#466], [#467], [#468])
+- **Download scheduling now keeps iCloud URLs fresher.** Full download enumeration stays close to the worker pool so signed URLs spend less time waiting before transfer. Cleanup retries target the exact failed asset/version/path entries instead of retrying the whole library. ([#473])
+- **Service behavior is safer to preview and easier to operate.** `kei install --dry-run` on Linux and macOS prints the service artifact without writing unit/plist files or log directories. Linux system install previews work without root. `kei status` gives clearer background-sync guidance, Docker and generated Linux systemd units set `MALLOC_ARENA_MAX=2`, and Linux uninstall restores the pre-install linger state when kei recorded it. ([#413], [#417], [#451], [#471], [#472])
 
-[#279]: https://github.com/rhoopr/kei/issues/279
-[#280]: https://github.com/rhoopr/kei/issues/280
-[#314]: https://github.com/rhoopr/kei/issues/314
-[#333]: https://github.com/rhoopr/kei/issues/333
+### Removed
+
+- **Old v0.13-v0.19 compatibility names were removed.** v0.20 rejects the deprecated durable flags, env mirrors, TOML keys, and hidden command aliases from the warning window. Removed names include `--directory` / `KEI_DIRECTORY`, `--threads-num`, `--cookie-directory`, `[auth].cookie_directory`, `[download].threads_num`, `[metrics].port`, `--exclude-album` / `KEI_EXCLUDE_ALBUM`, `{album}` in the base folder template, implicit `--album all` from that token, `[filters].album`, `[filters].exclude_albums`, `[filters].library`, and the legacy `kei setup` / `kei retry-failed` / `kei reset-state` aliases. Use the v0.20 TOML keys and current subcommands instead. ([#402], [#403], [#405], [#406], [#409])
+- **Import-only durable flags and env mirrors were removed.** `import-existing` now reads durable matching settings from TOML, like sync. `--library`, `--recent`, `--dry-run`, `--force-empty`, `--no-progress-bar`, and `--strict` remain one-off import controls. ([#408])
+
+### Fixed
+
+- **Existing media files are no longer replaced by duplicate `.part` promotion.** If another writer already created the final path, kei removes only its redundant `.part` file and leaves the existing file untouched. ([#407])
+- **Interrupted downloads remain resumable.** Shutdown during a response body now leaves the `.part` file in place, skips downloaded/failed state updates for interrupted in-flight assets, and resumes with byte-range validation on the next run. ([#421])
+- **Expired iCloud CDN URLs no longer poison sync tokens.** HTTP 410 is treated as an expired signed URL. The current URL batch aborts with an interrupted partial result so tokens don't advance past work that must be re-enumerated. ([#473])
+- **Cross-zone album members are downloaded from their source library.** Album relations that point outside the selected owner zone now fetch the referenced member from its source CloudKit zone. Stale or orphaned relation records warn instead of failing the album. ([#474])
+- **Sync-token and state-write failures are safer.** Config-hash purge failures force a full enumeration without persisting the unsafe hash; `complete_sync_run` failures count as state-write failures even on zero-download runs; full-enumeration fetchers and pass streams must agree on the token before it advances; repeated deferred state-write failures stop more downloads from streaming. ([#444], [#445], [#446], [#447], [#454])
+- **Suspicious successful syncs are louder.** Deferred state-write retries log at info level with retry metadata, and a completed full sync that enumerates zero assets warns without changing the exit code. `sync --retry-failed` no-op runs stay quiet. ([#419])
+- **Terminal Apple auth failures get their own exit path.** Apple `/signin/complete` responses with `serviceErrors[].code = "-20209"` or `"-20101"` now surface as terminal auth errors with account recovery or stored-password update steps, and kei exits 4 instead of the generic auth exit. ([#420])
+- **Session files survive permission-denied reads.** kei no longer deletes session files when reading them fails with `PermissionDenied`, and the log includes a `PUID`/`PGID` hint for Docker users. ([#400])
+- **Unicode-stripped filenames no longer collapse to extension-only paths.** When stripping Unicode leaves an empty stem, sync and import fall back to fingerprint filenames for primary files, extras, size variants, and live-photo MOV paths. ([#462])
+- **Malformed HEIF `iloc` data no longer panics in the pinned parser.** `mp4-atom` is pinned to the crates.io `0.11.0` release with the HEIF fixes kei depends on. ([#412], [#461], [#470])
+- **Narrow CloudKit and Windows service panic paths now return errors.** CloudKit enumeration/cache failures and Windows SCM mutex failures now surface as errors instead of panics. ([#448])
+
+### Security
+
+- **GitHub Actions workflows were hardened.** Workflow `uses:` references are pinned to full commit SHAs, CI rejects mutable action refs and risky Docker publishing settings, Docker publishing is split from arbitrary-ref manual builds, coverage-comment artifacts are size-limited and sanitized before privileged posting, and release workflows default to read-only permissions. ([#399])
+
+[#399]: https://github.com/rhoopr/kei/pull/399
+[#400]: https://github.com/rhoopr/kei/pull/400
+[#402]: https://github.com/rhoopr/kei/pull/402
+[#403]: https://github.com/rhoopr/kei/pull/403
+[#405]: https://github.com/rhoopr/kei/pull/405
+[#406]: https://github.com/rhoopr/kei/pull/406
+[#407]: https://github.com/rhoopr/kei/pull/407
+[#408]: https://github.com/rhoopr/kei/pull/408
+[#409]: https://github.com/rhoopr/kei/pull/409
+[#410]: https://github.com/rhoopr/kei/pull/410
+[#411]: https://github.com/rhoopr/kei/pull/411
+[#412]: https://github.com/rhoopr/kei/pull/412
+[#413]: https://github.com/rhoopr/kei/pull/413
+[#416]: https://github.com/rhoopr/kei/pull/416
+[#417]: https://github.com/rhoopr/kei/pull/417
+[#419]: https://github.com/rhoopr/kei/pull/419
+[#420]: https://github.com/rhoopr/kei/pull/420
+[#421]: https://github.com/rhoopr/kei/pull/421
+[#444]: https://github.com/rhoopr/kei/pull/444
+[#445]: https://github.com/rhoopr/kei/pull/445
+[#446]: https://github.com/rhoopr/kei/pull/446
+[#447]: https://github.com/rhoopr/kei/pull/447
+[#448]: https://github.com/rhoopr/kei/pull/448
+[#451]: https://github.com/rhoopr/kei/pull/451
+[#454]: https://github.com/rhoopr/kei/pull/454
+[#461]: https://github.com/rhoopr/kei/pull/461
+[#462]: https://github.com/rhoopr/kei/pull/462
+[#464]: https://github.com/rhoopr/kei/pull/464
+[#465]: https://github.com/rhoopr/kei/pull/465
+[#466]: https://github.com/rhoopr/kei/pull/466
+[#467]: https://github.com/rhoopr/kei/pull/467
+[#468]: https://github.com/rhoopr/kei/pull/468
+[#470]: https://github.com/rhoopr/kei/pull/470
+[#471]: https://github.com/rhoopr/kei/pull/471
+[#472]: https://github.com/rhoopr/kei/pull/472
+[#473]: https://github.com/rhoopr/kei/pull/473
+[#474]: https://github.com/rhoopr/kei/pull/474
 
 ---
 
