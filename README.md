@@ -28,7 +28,7 @@
 > [!WARNING]
 > kei is pre-release software. Minor versions may contain breaking changes.
 > 
-> Check CHANGELOG before updating.
+> Check [CHANGELOG.md](CHANGELOG.md) before updating.
 
 > [!IMPORTANT]
 > **v0.20 is scheduled for May 26, 2026 and is a breaking config release.** The `:main` Docker tag is the v0.20 release candidate.
