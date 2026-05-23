@@ -27,10 +27,13 @@
 
 > [!WARNING]
 > kei is pre-release software. Minor versions may contain breaking changes.
+> 
 > Check CHANGELOG before updating.
 
 > [!IMPORTANT]
-> **v0.20 is scheduled for May 26, 2026 and is a breaking config release.** The `:main` Docker tag is the v0.20 release candidate. The old "everything can be a CLI flag or `KEI_*` env var" model is being replaced by a smaller source model:
+> **v0.20 is scheduled for May 26, 2026 and is a breaking config release.** The `:main` Docker tag is the v0.20 release candidate.
+>
+> The old "everything can be a CLI flag or `KEI_*` env var" model is being replaced by a smaller source model:
 >
 > - TOML is for settings you want to keep.
 > - CLI flags are for one run or one action.
