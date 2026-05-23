@@ -478,6 +478,25 @@ pub(crate) async fn resolve_libraries(
     Ok(chosen)
 }
 
+pub(crate) async fn resolve_cross_zone_libraries_for_album_hydration<Fut>(
+    selection: &crate::selection::Selection,
+    all_libraries: Fut,
+) -> anyhow::Result<Vec<icloud::photos::PhotoLibrary>>
+where
+    Fut: std::future::Future<Output = anyhow::Result<Vec<icloud::photos::PhotoLibrary>>>,
+{
+    use crate::selection::AlbumSelector;
+    use anyhow::Context;
+
+    if matches!(selection.albums, AlbumSelector::None) {
+        return Ok(Vec::new());
+    }
+
+    all_libraries
+        .await
+        .context("failed to resolve cross-zone album hydration libraries")
+}
+
 /// Match a `--library` entry (full zone name or truncated 8-char form)
 /// against a live zone, case-insensitive. The truncated form is what
 /// `{library}` renders into paths, so users can copy a path segment and
@@ -648,6 +667,7 @@ fn smart_folder_name_set() -> rustc_hash::FxHashSet<&'static str> {
 pub(crate) async fn resolve_passes(
     library: &icloud::photos::PhotoLibrary,
     selection: &crate::selection::Selection,
+    cross_zone_libraries: &[icloud::photos::PhotoLibrary],
 ) -> anyhow::Result<AlbumPlan> {
     use crate::selection::{AlbumSelector, SmartFolderSelector};
 
@@ -667,6 +687,11 @@ pub(crate) async fn resolve_passes(
 
     let empty = empty_exclude_ids();
     let mut passes: Vec<AlbumPass> = Vec::new();
+    let cross_zone_album_sources: Vec<icloud::photos::PhotoAlbum> = cross_zone_libraries
+        .iter()
+        .filter(|source| source.zone_name() != library.zone_name())
+        .map(icloud::photos::PhotoLibrary::all)
+        .collect();
 
     // Stable, alphabetised pass order so logs and dry-run output don't
     // jitter with HashMap iteration order.
@@ -675,6 +700,7 @@ pub(crate) async fn resolve_passes(
         selected_album_names,
         PassKind::Album,
         &empty,
+        &cross_zone_album_sources,
         &mut passes,
     );
     drain_named_into_passes(
@@ -682,6 +708,7 @@ pub(crate) async fn resolve_passes(
         selected_smart_names,
         PassKind::SmartFolder,
         &empty,
+        &[],
         &mut passes,
     );
 
@@ -896,6 +923,7 @@ fn drain_named_into_passes(
     mut names: Vec<String>,
     kind: PassKind,
     empty_excludes: &std::sync::Arc<rustc_hash::FxHashSet<String>>,
+    cross_zone_sources: &[icloud::photos::PhotoAlbum],
     passes: &mut Vec<AlbumPass>,
 ) {
     names.sort();
@@ -903,6 +931,15 @@ fn drain_named_into_passes(
         let Some(album) = album_map.remove(name.as_str()) else {
             tracing::warn!(category = ?kind, name = %name, "Selected entry disappeared from map, skipping");
             continue;
+        };
+        let album = if kind == PassKind::Album && !cross_zone_sources.is_empty() {
+            let sources = cross_zone_sources
+                .iter()
+                .map(|source| source.clone_for_cross_zone_source())
+                .collect();
+            album.with_cross_zone_sources(sources)
+        } else {
+            album
         };
         passes.push(AlbumPass {
             kind,
@@ -1024,7 +1061,7 @@ mod tests {
         let library = stub_library(mock);
         let sel = selection_with_albums(AlbumSelector::None, true);
 
-        let plan = resolve_passes(&library, &sel).await.unwrap();
+        let plan = resolve_passes(&library, &sel, &[]).await.unwrap();
         assert_eq!(plan.passes.len(), 1);
         assert!(plan.passes[0].exclude_ids.is_empty());
     }
@@ -1036,7 +1073,7 @@ mod tests {
         let library = stub_library(mock);
         let sel = selection_with_albums(AlbumSelector::None, false);
 
-        let plan = resolve_passes(&library, &sel).await.unwrap();
+        let plan = resolve_passes(&library, &sel, &[]).await.unwrap();
         assert!(plan.passes.is_empty());
     }
 
@@ -1054,7 +1091,7 @@ mod tests {
             false,
         );
 
-        let plan = resolve_passes(&library, &sel).await.unwrap();
+        let plan = resolve_passes(&library, &sel, &[]).await.unwrap();
         assert_eq!(plan.passes.len(), 1);
         assert!(plan.passes[0].exclude_ids.is_empty());
     }
@@ -1071,7 +1108,7 @@ mod tests {
             false,
         );
 
-        let err = resolve_passes(&library, &sel).await.unwrap_err();
+        let err = resolve_passes(&library, &sel, &[]).await.unwrap_err();
         assert!(err.to_string().contains("not found"), "msg: {err}");
     }
 
@@ -1088,7 +1125,7 @@ mod tests {
             false,
         );
 
-        let err = resolve_passes(&library, &sel).await.unwrap_err();
+        let err = resolve_passes(&library, &sel, &[]).await.unwrap_err();
         assert!(err.to_string().contains("smart folder"), "msg: {err}");
     }
 
@@ -1106,7 +1143,7 @@ mod tests {
             false,
         );
 
-        let plan = resolve_passes(&library, &sel).await.unwrap();
+        let plan = resolve_passes(&library, &sel, &[]).await.unwrap();
         assert_eq!(plan.passes.len(), 2);
         for p in &plan.passes {
             assert!(p.exclude_ids.is_empty());
@@ -1125,7 +1162,7 @@ mod tests {
             true,
         );
 
-        let plan = resolve_passes(&library, &sel).await.unwrap();
+        let plan = resolve_passes(&library, &sel, &[]).await.unwrap();
         assert_eq!(plan.passes.len(), 2, "1 album pass + 1 unfiled pass");
         assert!(plan.passes[0].exclude_ids.is_empty());
         assert!(
@@ -1148,7 +1185,7 @@ mod tests {
             false,
         );
 
-        let plan = resolve_passes(&library, &sel).await.unwrap();
+        let plan = resolve_passes(&library, &sel, &[]).await.unwrap();
         assert_eq!(plan.passes.len(), 1, "Family is filtered out");
     }
 
@@ -1168,7 +1205,7 @@ mod tests {
             unfiled: false,
         };
 
-        let plan = resolve_passes(&library, &sel).await.unwrap();
+        let plan = resolve_passes(&library, &sel, &[]).await.unwrap();
         assert_eq!(plan.passes.len(), 1);
         assert_eq!(plan.passes[0].album.name.as_ref(), "Favorites");
     }
@@ -1187,7 +1224,7 @@ mod tests {
             unfiled: false,
         };
 
-        let err = resolve_passes(&library, &sel).await.unwrap_err();
+        let err = resolve_passes(&library, &sel, &[]).await.unwrap_err();
         assert!(
             err.to_string().contains("not an Apple smart folder"),
             "msg: {err}"
@@ -1298,7 +1335,7 @@ mod tests {
                 unfiled: false,
             };
 
-            let plan = resolve_passes(&library, &sel).await.unwrap();
+            let plan = resolve_passes(&library, &sel, &[]).await.unwrap();
             let names: BTreeSet<String> = plan
                 .passes
                 .iter()
@@ -1325,7 +1362,7 @@ mod tests {
         let library = stub_library(mock);
         let sel = selection_with_albums(AlbumSelector::None, true);
 
-        let plan = resolve_passes(&library, &sel).await.unwrap();
+        let plan = resolve_passes(&library, &sel, &[]).await.unwrap();
         assert_eq!(plan.passes.len(), 1);
         assert!(plan.passes[0].exclude_ids.is_empty());
     }
@@ -1348,7 +1385,7 @@ mod tests {
             false,
         );
 
-        let err = resolve_passes(&library, &sel).await.unwrap_err();
+        let err = resolve_passes(&library, &sel, &[]).await.unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("Vacationn") && msg.contains("Vacation") && msg.contains("Family"),
@@ -1374,7 +1411,7 @@ mod tests {
             false,
         );
 
-        let err = resolve_passes(&library, &sel).await.unwrap_err();
+        let err = resolve_passes(&library, &sel, &[]).await.unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("Vacationn"),
@@ -1589,8 +1626,55 @@ mod tests {
             false,
         );
 
-        let plan = resolve_passes(&library, &sel).await.unwrap();
+        let plan = resolve_passes(&library, &sel, &[]).await.unwrap();
         assert!(plan.passes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cross_zone_hydration_libraries_skip_fetch_without_album_selection() {
+        let sel = Selection {
+            albums: AlbumSelector::None,
+            smart_folders: SmartFolderSelector::Named {
+                included: names(&["Favorites"]),
+                excluded: BTreeSet::new(),
+            },
+            libraries: crate::selection::LibrarySelector::default(),
+            unfiled: false,
+        };
+
+        let libraries = resolve_cross_zone_libraries_for_album_hydration(&sel, async {
+            panic!("all_libraries must not be polled without album selection")
+        })
+        .await
+        .unwrap();
+
+        assert!(libraries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cross_zone_hydration_libraries_propagate_fetch_failure() {
+        let sel = selection_with_albums(
+            AlbumSelector::Named {
+                included: names(&["Vacation"]),
+                excluded: BTreeSet::new(),
+            },
+            false,
+        );
+
+        let err = resolve_cross_zone_libraries_for_album_hydration(&sel, async {
+            Err::<Vec<PhotoLibrary>, anyhow::Error>(anyhow::anyhow!("library listing failed"))
+        })
+        .await
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("failed to resolve cross-zone album hydration libraries"),
+            "missing context: {msg}"
+        );
+        assert!(
+            msg.contains("library listing failed"),
+            "missing cause: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -1616,7 +1700,7 @@ mod tests {
             unfiled: true,
         };
 
-        let plan = resolve_passes(&library, &sel).await.unwrap();
+        let plan = resolve_passes(&library, &sel, &[]).await.unwrap();
         let kinds: Vec<(String, PassKind)> = plan
             .passes
             .iter()
@@ -1697,7 +1781,7 @@ libraries = ["shared"]
             .ok(serde_json::json!({"records": []}));
         let library = stub_library(mock);
 
-        let plan = resolve_passes(&library, &cfg.filters.selection)
+        let plan = resolve_passes(&library, &cfg.filters.selection, &[])
             .await
             .unwrap();
         let pairs: Vec<(String, PassKind)> = plan
