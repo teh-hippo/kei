@@ -10,7 +10,6 @@ If you can't use GitHub advisories, email github@robhooper.xyz with "kei securit
 
 - Credential leakage (passwords, session tokens, cookies exposed in logs, temp files, or error output)
 - Authentication bypass or session hijacking
-- Data corruption or silent data loss
 - Path traversal or arbitrary file writes outside the download directory
 
 General bugs (crashes, incorrect downloads, UI issues) are fine as regular [GitHub issues](https://github.com/rhoopr/kei/issues).
