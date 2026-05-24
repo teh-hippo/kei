@@ -31,9 +31,9 @@
 > Check [CHANGELOG.md](CHANGELOG.md) before updating.
 
 > [!IMPORTANT]
-> **v0.20 is scheduled for May 26, 2026 and is a breaking config release.** The `:main` Docker tag is the v0.20 release candidate.
+> **v0.20 is a breaking config release.**
 >
-> The old "everything can be a CLI flag or `KEI_*` env var" model is being replaced by a smaller source model:
+> The old "everything can be a CLI flag or `KEI_*` env var" model was replaced by a smaller source model:
 >
 > - TOML is for settings you want to keep.
 > - CLI flags are for one run or one action.
@@ -62,7 +62,7 @@
 brew install rhoopr/kei/kei             # Homebrew
 
 docker pull ghcr.io/rhoopr/kei:latest   # Docker tagged release
-docker pull ghcr.io/rhoopr/kei:main     # v0.20 release candidate
+docker pull ghcr.io/rhoopr/kei:0.20.0   # Docker pinned release
 ```
 
 Pre-built binaries for macOS, Linux, and Windows are on the [Releases page](https://github.com/rhoopr/kei/releases). For Docker Compose, building from source, FreeBSD, and other install paths, see the [Install wiki page](https://github.com/rhoopr/kei/wiki/Install).

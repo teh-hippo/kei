@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [0.20.0] - 2026-05-24
+
 ### Added
 
 - **v0.20 migration guide and example config.** Added `docs/v0.20-migration.md` and `example.config.toml` to show every supported TOML key, default, and allowed value. README, Docker Compose, and migration docs now describe the v0.20 source model: TOML for persistent settings, CLI flags for one-run actions, and env vars for secrets or runtime glue. ([#411])
@@ -23,10 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Watch and full-sync runs make fewer Apple and SQLite calls.** Idle watch cycles can skip album refresh when `/changes/database` reports no selected-library changes. Multi-pass full syncs preload download state once, batch same-library album counts, bound known-count streams, and run independent album streams concurrently. ([#416], [#464], [#465], [#466], [#467], [#468])
 - **Download scheduling now keeps iCloud URLs fresher.** Full download enumeration stays close to the worker pool so signed URLs spend less time waiting before transfer. Cleanup retries target the exact failed asset/version/path entries instead of retrying the whole library. ([#473])
 - **Service behavior is safer to preview and easier to operate.** `kei install --dry-run` on Linux and macOS prints the service artifact without writing unit/plist files or log directories. Linux system install previews work without root. `kei status` gives clearer background-sync guidance, Docker and generated Linux systemd units set `MALLOC_ARENA_MAX=2`, and Linux uninstall restores the pre-install linger state when kei recorded it. ([#413], [#417], [#451], [#471], [#472])
+- **Sync internals have narrower ownership boundaries.** Selection config, post-cycle reporting, cycle execution, download planning/finalization, and state access were split into smaller owner modules and role traits. These changes keep the v0.20 behavior easier to test without changing the user command shape. ([#418], [#449], [#450], [#452], [#453], [#455], [#456])
+- **Release validation now carries more of the release-candidate checks.** The repo-owned full-test path covers release archive smoke tests, Docker image smoke tests, live import rehearsal, service lifecycle checks, and stricter sync safety assertions. ([#457], [#459], [#460], [#471], [#488], [#489], [#490])
 
 ### Removed
 
-- **Old v0.13-v0.19 compatibility names were removed.** v0.20 rejects the deprecated durable flags, env mirrors, TOML keys, and hidden command aliases from the warning window. Removed names include `--directory` / `KEI_DIRECTORY`, `--threads-num`, `--cookie-directory`, `[auth].cookie_directory`, `[download].threads_num`, `[metrics].port`, `--exclude-album` / `KEI_EXCLUDE_ALBUM`, `{album}` in the base folder template, implicit `--album all` from that token, `[filters].album`, `[filters].exclude_albums`, `[filters].library`, and the legacy `kei setup` / `kei retry-failed` / `kei reset-state` aliases. Use the v0.20 TOML keys and current subcommands instead. ([#402], [#403], [#405], [#406], [#409])
+- **Old v0.13-v0.19 compatibility names were removed.** v0.20 rejects the deprecated durable flags, env mirrors, TOML keys, and hidden command aliases from the warning window. Removed names include `--directory` / `KEI_DIRECTORY`, `--threads-num`, `--cookie-directory`, `[auth].cookie_directory`, `[download].threads_num`, `[metrics].port`, `--exclude-album` / `KEI_EXCLUDE_ALBUM`, `{album}` in the base folder template, implicit `--album all` from that token, `[filters].album`, `[filters].exclude_albums`, `[filters].library`, and the legacy `kei setup` / `kei retry-failed` / `kei reset-state` aliases. Use the v0.20 TOML keys and current subcommands instead. ([#402], [#403], [#405], [#406], [#409], [#485])
 - **Import-only durable flags and env mirrors were removed.** `import-existing` now reads durable matching settings from TOML, like sync. `--library`, `--recent`, `--dry-run`, `--force-empty`, `--no-progress-bar`, and `--strict` remain one-off import controls. ([#408])
 
 ### Fixed
@@ -35,10 +41,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Interrupted downloads remain resumable.** Shutdown during a response body now leaves the `.part` file in place, skips downloaded/failed state updates for interrupted in-flight assets, and resumes with byte-range validation on the next run. ([#421])
 - **Expired iCloud CDN URLs no longer poison sync tokens.** HTTP 410 is treated as an expired signed URL. The current URL batch aborts with an interrupted partial result so tokens don't advance past work that must be re-enumerated. ([#473])
 - **Cross-zone album members are downloaded from their source library.** Album relations that point outside the selected owner zone now fetch the referenced member from its source CloudKit zone. Stale or orphaned relation records warn instead of failing the album. ([#474])
-- **Sync-token and state-write failures are safer.** Config-hash purge failures force a full enumeration without persisting the unsafe hash; `complete_sync_run` failures count as state-write failures even on zero-download runs; full-enumeration fetchers and pass streams must agree on the token before it advances; repeated deferred state-write failures stop more downloads from streaming. ([#444], [#445], [#446], [#447], [#454])
+- **Sync-token and state-write failures are safer.** Config-hash purge failures force a full enumeration without persisting the unsafe hash; `complete_sync_run` failures count as state-write failures even on zero-download runs; full-enumeration fetchers and pass streams must agree on the token before it advances; repeated deferred state-write failures stop more downloads from streaming. Incomplete CloudKit pagination, per-record errors, non-finished indexing, failed zone discovery, and malformed advertised resources now block token advancement. ([#444], [#445], [#446], [#447], [#454], [#480])
+- **Recent-limited syncs no longer look like incomplete enumeration.** Sparse `--recent` windows don't trip the pagination-undercount failure path, recent-limited full syncs don't advance zone sync tokens, and smaller signed-URL download pages no longer narrow the requested recent window. ([#483], [#484])
+- **Media validation rejects known extension/content mismatches.** Downloads now check common magic-byte mismatches before promotion so HTML or otherwise wrong content can't land as a selected media file. ([#480])
 - **Suspicious successful syncs are louder.** Deferred state-write retries log at info level with retry metadata, and a completed full sync that enumerates zero assets warns without changing the exit code. `sync --retry-failed` no-op runs stay quiet. ([#419])
 - **Terminal Apple auth failures get their own exit path.** Apple `/signin/complete` responses with `serviceErrors[].code = "-20209"` or `"-20101"` now surface as terminal auth errors with account recovery or stored-password update steps, and kei exits 4 instead of the generic auth exit. ([#420])
+- **Credential deletion reports partial failures.** Clearing saved credentials now reports when one backend fails instead of presenting the cleanup as wholly successful. ([#480])
 - **Session files survive permission-denied reads.** kei no longer deletes session files when reading them fails with `PermissionDenied`, and the log includes a `PUID`/`PGID` hint for Docker users. ([#400])
+- **`import-existing` handles Ctrl+C cleanly.** SIGINT now cancels the import scan through kei's shutdown path so the next run resumes from the last committed database state. ([#487])
 - **Unicode-stripped filenames no longer collapse to extension-only paths.** When stripping Unicode leaves an empty stem, sync and import fall back to fingerprint filenames for primary files, extras, size variants, and live-photo MOV paths. ([#462])
 - **Malformed HEIF `iloc` data no longer panics in the pinned parser.** `mp4-atom` is pinned to the crates.io `0.11.0` release with the HEIF fixes kei depends on. ([#412], [#461], [#470])
 - **Narrow CloudKit and Windows service panic paths now return errors.** CloudKit enumeration/cache failures and Windows SCM mutex failures now surface as errors instead of panics. ([#448])
@@ -62,6 +72,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [#413]: https://github.com/rhoopr/kei/pull/413
 [#416]: https://github.com/rhoopr/kei/pull/416
 [#417]: https://github.com/rhoopr/kei/pull/417
+[#418]: https://github.com/rhoopr/kei/pull/418
 [#419]: https://github.com/rhoopr/kei/pull/419
 [#420]: https://github.com/rhoopr/kei/pull/420
 [#421]: https://github.com/rhoopr/kei/pull/421
@@ -70,8 +81,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [#446]: https://github.com/rhoopr/kei/pull/446
 [#447]: https://github.com/rhoopr/kei/pull/447
 [#448]: https://github.com/rhoopr/kei/pull/448
+[#449]: https://github.com/rhoopr/kei/pull/449
+[#450]: https://github.com/rhoopr/kei/pull/450
 [#451]: https://github.com/rhoopr/kei/pull/451
+[#452]: https://github.com/rhoopr/kei/pull/452
+[#453]: https://github.com/rhoopr/kei/pull/453
 [#454]: https://github.com/rhoopr/kei/pull/454
+[#455]: https://github.com/rhoopr/kei/pull/455
+[#456]: https://github.com/rhoopr/kei/pull/456
+[#457]: https://github.com/rhoopr/kei/pull/457
+[#459]: https://github.com/rhoopr/kei/pull/459
+[#460]: https://github.com/rhoopr/kei/pull/460
 [#461]: https://github.com/rhoopr/kei/pull/461
 [#462]: https://github.com/rhoopr/kei/pull/462
 [#464]: https://github.com/rhoopr/kei/pull/464
@@ -84,6 +104,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [#472]: https://github.com/rhoopr/kei/pull/472
 [#473]: https://github.com/rhoopr/kei/pull/473
 [#474]: https://github.com/rhoopr/kei/pull/474
+[#480]: https://github.com/rhoopr/kei/pull/480
+[#483]: https://github.com/rhoopr/kei/pull/483
+[#484]: https://github.com/rhoopr/kei/pull/484
+[#485]: https://github.com/rhoopr/kei/pull/485
+[#487]: https://github.com/rhoopr/kei/pull/487
+[#488]: https://github.com/rhoopr/kei/pull/488
+[#489]: https://github.com/rhoopr/kei/pull/489
+[#490]: https://github.com/rhoopr/kei/pull/490
 
 ---
 
@@ -1276,7 +1304,8 @@ The following Python icloudpd features are not yet available. Links go to tracki
 
 ---
 
-[Unreleased]: https://github.com/rhoopr/kei/compare/v0.14.2...HEAD
+[Unreleased]: https://github.com/rhoopr/kei/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/rhoopr/kei/compare/v0.14.2...v0.20.0
 [0.14.2]: https://github.com/rhoopr/kei/compare/v0.14.1...v0.14.2
 [0.14.1]: https://github.com/rhoopr/kei/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/rhoopr/kei/compare/v0.13.3...v0.14.0
