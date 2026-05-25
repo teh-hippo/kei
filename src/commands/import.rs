@@ -23,8 +23,9 @@ use crate::systemd::SystemdNotifier;
 use crate::types::FileMatchPolicy;
 
 use super::service::{
-    init_photos_service, resolve_cross_zone_libraries_for_album_hydration, resolve_libraries,
-    resolve_passes,
+    build_collection_context, collection_libraries, init_photos_service, pass_scope_for_zone,
+    resolve_cross_zone_libraries_for_album_hydration, resolve_libraries, resolve_passes_for_scope,
+    zone_name_set,
 };
 
 /// Value of the `stage` field on the one-shot tracing event emitted by
@@ -804,11 +805,16 @@ pub(crate) async fn run_import_existing(
     // the same passes sync would, and each pass uses its own
     // `folder_structure_*` template when deriving expected paths.
     let selection = build_import_selection(toml_filters, &selector)?;
-    let cross_zone_libraries = resolve_cross_zone_libraries_for_album_hydration(
-        &selection,
-        photos_service.all_libraries(),
-    )
-    .await?;
+    let all_libraries = photos_service.all_libraries().await?;
+    let cross_zone_libraries =
+        resolve_cross_zone_libraries_for_album_hydration(&selection, async {
+            Ok::<_, anyhow::Error>(all_libraries.clone())
+        })
+        .await?;
+    let collection_libraries = collection_libraries(&selection, &libraries, &all_libraries);
+    let collection_context = build_collection_context(&selection, collection_libraries).await?;
+    let selected_zones = zone_name_set(&libraries);
+    let collection_zones = zone_name_set(collection_libraries);
 
     let prior_db_total = db.get_summary().await?.total_assets;
     if prior_db_total > 0 && !args.force_empty {
@@ -841,12 +847,23 @@ pub(crate) async fn run_import_existing(
     // once per library scan, not once per pass.
     let mut dir_cache = DirCache::new();
 
-    for library in &libraries {
+    for library in &all_libraries {
         let zone = library.zone_name();
+        let pass_scope = pass_scope_for_zone(&selection, zone, &selected_zones, &collection_zones);
+        if pass_scope.is_empty() {
+            continue;
+        }
         tracing::debug!(zone = %zone, "Scanning library");
         let library_config = download_config.with_library(zone);
 
-        let plan = resolve_passes(library, &selection, &cross_zone_libraries).await?;
+        let plan = resolve_passes_for_scope(
+            library,
+            &selection,
+            pass_scope,
+            &collection_context,
+            &cross_zone_libraries,
+        )
+        .await?;
         if plan.passes.is_empty() {
             tracing::debug!(zone = %zone, "No passes resolved; nothing to import");
             continue;
@@ -927,7 +944,9 @@ fn build_import_selection(
 
     Ok(Selection {
         albums: parse_album_selector(&raw_albums, true)?,
+        albums_explicit: !raw_albums.is_empty(),
         smart_folders: parse_smart_folder_selector(&raw_smart_folders)?,
+        smart_folders_explicit: !raw_smart_folders.is_empty(),
         libraries: libraries.clone(),
         unfiled,
     })
@@ -1018,10 +1037,13 @@ mod build_selection_tests {
     //! Sync vs. import-existing parity for the current selector resolution.
     //! Both commands must produce the same `Selection` from the same TOML.
     use super::build_import_selection;
-    use crate::commands::resolve_cross_zone_libraries_for_album_hydration;
+    use crate::commands::{
+        collection_libraries, pass_scope_for_zone,
+        resolve_cross_zone_libraries_for_album_hydration, zone_name_set,
+    };
     use crate::config::TomlFilters;
-    use crate::icloud::photos::PhotoLibrary;
     use crate::selection::{AlbumSelector, LibrarySelector, Selection, SmartFolderSelector};
+    use crate::test_helpers::MockPhotosSession;
     use std::collections::BTreeSet;
 
     fn primary() -> LibrarySelector {
@@ -1060,7 +1082,9 @@ mod build_selection_tests {
             selection,
             Selection {
                 albums: AlbumSelector::default(),
+                albums_explicit: false,
                 smart_folders: SmartFolderSelector::None,
+                smart_folders_explicit: false,
                 libraries: primary(),
                 unfiled: true,
             }
@@ -1068,23 +1092,113 @@ mod build_selection_tests {
     }
 
     #[tokio::test]
-    async fn default_import_album_selection_requires_cross_zone_resolution() {
+    async fn default_import_album_selection_skips_cross_zone_resolution() {
         let selection = build_import_selection(None, &primary()).expect("ok");
 
-        let err = resolve_cross_zone_libraries_for_album_hydration(&selection, async {
-            Err::<Vec<PhotoLibrary>, anyhow::Error>(anyhow::anyhow!("all-libraries unavailable"))
+        let libraries = resolve_cross_zone_libraries_for_album_hydration(&selection, async {
+            panic!("implicit default album scope must not request all libraries")
         })
         .await
-        .unwrap_err();
-        let msg = format!("{err:#}");
+        .unwrap();
+        assert!(libraries.is_empty());
+    }
+
+    fn test_library(zone_name: &str) -> crate::icloud::photos::PhotoLibrary {
+        crate::icloud::photos::PhotoLibrary::new_stub_with_zone(
+            Box::new(MockPhotosSession::new()),
+            zone_name,
+        )
+    }
+
+    fn smart_folder_filters_with_unfiled(unfiled: bool) -> TomlFilters {
+        TomlFilters {
+            smart_folders: Some(vec!["Hidden".to_string()]),
+            unfiled: Some(unfiled),
+            ..TomlFilters::default()
+        }
+    }
+
+    #[test]
+    fn import_scope_planning_shared_only_smart_folder_widens_zone_scope() {
+        let selector = crate::selection::parse_library_selector(&["shared".to_string()]).unwrap();
+        let selection =
+            build_import_selection(Some(&smart_folder_filters_with_unfiled(false)), &selector)
+                .expect("ok");
+        let primary = test_library("PrimarySync");
+        let shared = test_library("SharedSync-ABCD1234");
+        let selected_libraries = vec![shared.clone()];
+        let all_libraries = vec![primary.clone(), shared.clone()];
+
+        let collection = collection_libraries(&selection, &selected_libraries, &all_libraries);
+        let selected_zones = zone_name_set(&selected_libraries);
+        let collection_zones = zone_name_set(collection);
+
+        let primary_scope = pass_scope_for_zone(
+            &selection,
+            primary.zone_name(),
+            &selected_zones,
+            &collection_zones,
+        );
+        let shared_scope = pass_scope_for_zone(
+            &selection,
+            shared.zone_name(),
+            &selected_zones,
+            &collection_zones,
+        );
 
         assert!(
-            msg.contains("failed to resolve cross-zone album hydration libraries"),
-            "missing hydration context: {msg}"
+            primary_scope.include_smart_folders,
+            "explicit smart-folder selection should widen import pass planning beyond the library selector"
         );
         assert!(
-            msg.contains("all-libraries unavailable"),
-            "missing cause: {msg}"
+            shared_scope.include_smart_folders,
+            "import-existing planning should schedule smart-folder passes for selected shared zone"
+        );
+    }
+
+    #[test]
+    fn import_scope_planning_primary_only_still_filters_unfiled() {
+        let selector = crate::selection::parse_library_selector(&["primary".to_string()]).unwrap();
+        let selection =
+            build_import_selection(Some(&smart_folder_filters_with_unfiled(true)), &selector)
+                .expect("ok");
+        let primary = test_library("PrimarySync");
+        let shared = test_library("SharedSync-ABCD1234");
+        let selected_libraries = vec![primary.clone()];
+        let all_libraries = vec![primary.clone(), shared.clone()];
+
+        let collection = collection_libraries(&selection, &selected_libraries, &all_libraries);
+        let selected_zones = zone_name_set(&selected_libraries);
+        let collection_zones = zone_name_set(collection);
+
+        let primary_scope = pass_scope_for_zone(
+            &selection,
+            primary.zone_name(),
+            &selected_zones,
+            &collection_zones,
+        );
+        let shared_scope = pass_scope_for_zone(
+            &selection,
+            shared.zone_name(),
+            &selected_zones,
+            &collection_zones,
+        );
+
+        assert!(
+            primary_scope.include_smart_folders,
+            "import-existing planning should keep smart-folder passes in the selected primary zone"
+        );
+        assert!(
+            shared_scope.include_smart_folders,
+            "explicit smart-folder selection should widen import scope to shared zones too"
+        );
+        assert!(
+            primary_scope.include_unfiled,
+            "selected primary zone should keep unfiled pass when unfiled=true"
+        );
+        assert!(
+            !shared_scope.include_unfiled,
+            "library selector should still filter unfiled passes to selected zones"
         );
     }
 }
