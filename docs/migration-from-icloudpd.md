@@ -1,6 +1,6 @@
 # Migrating from `icloudpd`
 
-> Last updated on 5-25-26 for the v0.20 release candidate.
+> Last updated on 5-26-26 for v0.20.0.
 
 This guide is for moving an existing
 [`icloud-photos-downloader`](https://github.com/icloud-photos-downloader/icloud_photos_downloader)
@@ -16,8 +16,7 @@ The short version:
 kei can't reuse Python's `~/.pyicloud` cookies, so the first run still needs a
 fresh Apple login and 2FA approval. Your local photo files can stay in place.
 
-During the release candidate, use the Docker `:main` image if you test v0.20 in
-containers. Use `:latest` or pin `:0.20.0` after the release tag is published.
+For containers, use the Docker `:latest` image or pin `:0.20.0`.
 
 ## Step 1: import the existing tree
 
@@ -294,8 +293,7 @@ v0.20 removed the remaining v0.13 compatibility aliases:
 
 ## Docker migration
 
-During the release candidate, use `ghcr.io/rhoopr/kei:main`. After release, use
-`ghcr.io/rhoopr/kei:latest` or pin `ghcr.io/rhoopr/kei:0.20.0`. It uses `/config` and
+Use `ghcr.io/rhoopr/kei:latest` or pin `ghcr.io/rhoopr/kei:0.20.0`. It uses `/config` and
 `/photos` volumes. The image runs `kei service run --config /config/config.toml`
 by default, with `KEI_DATA_DIR=/config` as container runtime glue. Set
 `[download].directory = "/photos"` in the config file. `service run` uses a
@@ -306,7 +304,7 @@ A minimal compose file:
 ```yaml
 services:
   kei:
-    image: ghcr.io/rhoopr/kei:main
+    image: ghcr.io/rhoopr/kei:0.20.0
     container_name: kei
     restart: unless-stopped
     stop_grace_period: 30s

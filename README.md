@@ -31,7 +31,7 @@
 > Check [CHANGELOG.md](CHANGELOG.md) before updating.
 
 > [!IMPORTANT]
-> **v0.20 is the current release candidate and is a breaking config release.**
+> **v0.20 is a breaking config release.**
 >
 > The old "everything can be a CLI flag or `KEI_*` env var" model was replaced by a smaller source model:
 >
@@ -61,8 +61,8 @@
 ```sh
 brew install rhoopr/kei/kei             # Homebrew
 
-docker pull ghcr.io/rhoopr/kei:latest   # last tagged release
-docker pull ghcr.io/rhoopr/kei:main     # v0.20 release candidate
+docker pull ghcr.io/rhoopr/kei:latest
+docker pull ghcr.io/rhoopr/kei:0.20.0   # pin this release
 ```
 
 Pre-built binaries for macOS, Linux, and Windows are on the [Releases page](https://github.com/rhoopr/kei/releases). For Docker Compose, building from source, FreeBSD, and other install paths, see the [Install wiki page](https://github.com/rhoopr/kei/wiki/Install).
