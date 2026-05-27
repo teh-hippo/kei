@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.20.3] - 2026-05-27
+
+### Fixed
+
+- **sync_report.json now keeps sync-token receiver observations even when token advancement is not blocked.** Token telemetry fields (`sync_token_expected_receivers`, `sync_token_receivers_with_token`, `sync_token_receivers_missing`, `sync_token_receivers_blank`, `sync_token_receivers_dropped`, `sync_token_unique_values`) are now emitted whenever observation data exists, so operators can inspect iCloud-side token behavior on successful runs instead of seeing an empty diagnostics block unless `sync_token_blocked` is true. ([#504])
+
+[#504]: https://github.com/rhoopr/kei/pull/504
+
+---
+
 ## [0.20.2] - 2026-05-27
 
 ### Fixed
