@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.20.2] - 2026-05-27
+
+### Fixed
+
+- **Sync-token diagnostics now explain non-advance causes in plain language.** Retry-failed runs now state that they always enumerate fully, and JSON/terminal reporting now includes explicit reasons when token collection is unavailable so users can separate kei behavior from upstream iCloud token availability. ([#502])
+
+[#502]: https://github.com/rhoopr/kei/pull/502
+
+---
+
 ## [0.20.1] - 2026-05-27
 
 ### Fixed
