@@ -549,6 +549,7 @@ impl PhotoAlbum {
             total_count,
             PhotoStreamProfile::FastEnumeration { concurrency },
             None,
+            false,
         );
         tokio::spawn(async move {
             let panicked = await_fetcher_handles(handles).await;
@@ -580,6 +581,7 @@ impl PhotoAlbum {
             limit,
             total_count,
             PhotoStreamProfile::FastEnumeration { concurrency },
+            false,
         )
     }
 
@@ -600,6 +602,7 @@ impl PhotoAlbum {
             PhotoStreamProfile::BackpressuredDownload {
                 download_concurrency,
             },
+            true,
         )
     }
 
@@ -608,9 +611,15 @@ impl PhotoAlbum {
         limit: Option<u32>,
         total_count: Option<u64>,
         profile: PhotoStreamProfile,
+        preserve_blank_sync_tokens_for_diagnostics: bool,
     ) -> (PhotoStream, tokio::sync::oneshot::Receiver<Option<String>>) {
         if self.has_cross_zone_hydration() {
-            return self.photo_stream_with_cross_zone_hydration(limit, total_count, profile);
+            return self.photo_stream_with_cross_zone_hydration(
+                limit,
+                total_count,
+                profile,
+                preserve_blank_sync_tokens_for_diagnostics,
+            );
         }
 
         let (token_tx, token_rx) = tokio::sync::oneshot::channel();
@@ -622,6 +631,7 @@ impl PhotoAlbum {
             total_count,
             profile,
             Some(fetcher_sync_tokens.clone()),
+            preserve_blank_sync_tokens_for_diagnostics,
         );
         let album_name = Arc::clone(&self.name);
 
@@ -651,11 +661,16 @@ impl PhotoAlbum {
         limit: Option<u32>,
         total_count: Option<u64>,
         profile: PhotoStreamProfile,
+        preserve_blank_sync_tokens_for_diagnostics: bool,
     ) -> (PhotoStream, tokio::sync::oneshot::Receiver<Option<String>>) {
         let (tx, rx) = mpsc::channel::<anyhow::Result<PhotoAsset>>(500);
         let (token_tx, token_rx) = tokio::sync::oneshot::channel();
-        let (base_stream, base_token_rx) =
-            self.photo_stream_with_token_inner_no_cross_zone(limit, total_count, profile);
+        let (base_stream, base_token_rx) = self.photo_stream_with_token_inner_no_cross_zone(
+            limit,
+            total_count,
+            profile,
+            preserve_blank_sync_tokens_for_diagnostics,
+        );
         let Some(container_id) = self.container_id.clone() else {
             let _ = token_tx.send(None);
             return (
@@ -786,6 +801,7 @@ impl PhotoAlbum {
         limit: Option<u32>,
         total_count: Option<u64>,
         profile: PhotoStreamProfile,
+        preserve_blank_sync_tokens_for_diagnostics: bool,
     ) -> (PhotoStream, tokio::sync::oneshot::Receiver<Option<String>>) {
         let (token_tx, token_rx) = tokio::sync::oneshot::channel();
         let fetcher_sync_tokens: Arc<tokio::sync::Mutex<Vec<String>>> =
@@ -796,6 +812,7 @@ impl PhotoAlbum {
             total_count,
             profile,
             Some(fetcher_sync_tokens.clone()),
+            preserve_blank_sync_tokens_for_diagnostics,
         );
         let album_name = Arc::clone(&self.name);
 
@@ -1095,6 +1112,7 @@ impl PhotoAlbum {
         total_count: Option<u64>,
         profile: PhotoStreamProfile,
         fetcher_sync_tokens: Option<Arc<tokio::sync::Mutex<Vec<String>>>>,
+        preserve_blank_sync_tokens_for_diagnostics: bool,
     ) -> (PhotoStream, Vec<JoinHandle<()>>) {
         let plan = build_enumeration_plan(limit, total_count, self.page_size, profile);
         let (tx, rx) = mpsc::channel::<anyhow::Result<PhotoAsset>>(
@@ -1114,6 +1132,7 @@ impl PhotoAlbum {
                 range.limit,
                 fetcher_sync_tokens.clone(),
                 plan.page_size,
+                preserve_blank_sync_tokens_for_diagnostics,
             ));
         }
         // Drop our sender so channel closes when all fetchers finish.
@@ -1144,6 +1163,7 @@ impl PhotoAlbum {
         limit: Option<u32>,
         fetcher_sync_tokens: Option<Arc<tokio::sync::Mutex<Vec<String>>>>,
         page_size: usize,
+        preserve_blank_sync_tokens_for_diagnostics: bool,
     ) -> JoinHandle<()> {
         let session = self.session.clone_box();
         let service_endpoint = Arc::clone(&self.service_endpoint);
@@ -1158,6 +1178,7 @@ impl PhotoAlbum {
             let mut offset = start_offset;
             let mut total_sent: u64 = 0;
             let mut last_sync_token: Option<String> = None;
+            let mut saw_blank_sync_token = false;
             let mut pending_masters: FxHashMap<String, super::cloudkit::Record> =
                 FxHashMap::default();
             let mut consecutive_empty_pages: u32 = 0;
@@ -1218,8 +1239,20 @@ impl PhotoAlbum {
                 };
 
                 // Capture the zone-level syncToken from each page response.
-                if let Some(token) = &query.sync_token {
-                    last_sync_token = Some(token.clone());
+                // Treat blank tokens as missing so we never persist an
+                // unusable marker that forces the next cycle back to full.
+                if let Some(token) = query.sync_token.as_deref() {
+                    let trimmed = token.trim();
+                    if trimmed.is_empty() {
+                        saw_blank_sync_token = true;
+                        tracing::warn!(
+                            album = %name,
+                            offset,
+                            "Fetcher response contained blank syncToken; treating as unavailable"
+                        );
+                    } else {
+                        last_sync_token = Some(trimmed.to_string());
+                    }
                 }
 
                 let records = query.records;
@@ -1361,8 +1394,12 @@ impl PhotoAlbum {
                 }
             }
 
-            if let (Some(shared), Some(token)) = (&fetcher_sync_tokens, last_sync_token) {
-                shared.lock().await.push(token);
+            if let Some(shared) = &fetcher_sync_tokens {
+                if let Some(token) = last_sync_token {
+                    shared.lock().await.push(token);
+                } else if saw_blank_sync_token && preserve_blank_sync_tokens_for_diagnostics {
+                    shared.lock().await.push(String::new());
+                }
             }
         })
     }
@@ -1923,6 +1960,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_photo_stream_with_token_blank_sync_token_treated_as_none() {
+        use tokio_stream::StreamExt;
+
+        let mock = MockPhotosFlow::new()
+            .query_photo_page("master-1", Some(""))
+            .empty_query_page(Some(""))
+            .build();
+        let album = make_album_with_session(100, Box::new(mock));
+
+        let (stream, token_rx) = album.photo_stream_with_token(None, None, 1);
+        tokio::pin!(stream);
+
+        while let Some(result) = stream.next().await {
+            result.expect("photo asset should be Ok");
+        }
+
+        let token = token_rx.await.expect("oneshot should not be dropped");
+        assert_eq!(
+            token, None,
+            "blank syncToken must be treated as unavailable"
+        );
+    }
+
+    #[tokio::test]
     async fn test_photo_stream_with_token_last_token_wins() {
         use tokio_stream::StreamExt;
 
@@ -2022,6 +2083,7 @@ mod tests {
             None,
             PhotoStreamProfile::FastEnumeration { concurrency: 1 },
             None,
+            false,
         );
 
         assert_eq!(
@@ -2799,6 +2861,7 @@ mod tests {
             Some(10),
             PhotoStreamProfile::FastEnumeration { concurrency: 1 },
             None,
+            false,
         );
         tokio::pin!(stream);
 
@@ -2821,6 +2884,7 @@ mod tests {
             Some(10),
             PhotoStreamProfile::FastEnumeration { concurrency: 1 },
             None,
+            false,
         );
         tokio::pin!(stream);
 
@@ -2872,6 +2936,7 @@ mod tests {
             None,
             PhotoStreamProfile::FastEnumeration { concurrency: 1 },
             None,
+            false,
         );
         tokio::pin!(stream);
 
@@ -2910,6 +2975,7 @@ mod tests {
             None,
             PhotoStreamProfile::FastEnumeration { concurrency: 1 },
             None,
+            false,
         );
         tokio::pin!(stream);
 
@@ -2950,6 +3016,7 @@ mod tests {
             None,
             PhotoStreamProfile::FastEnumeration { concurrency: 1 },
             None,
+            false,
         );
         tokio::pin!(stream);
 
@@ -2993,6 +3060,7 @@ mod tests {
             None,
             PhotoStreamProfile::FastEnumeration { concurrency: 1 },
             None,
+            false,
         );
         tokio::pin!(stream);
 
