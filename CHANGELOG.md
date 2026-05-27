@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.20.1] - 2026-05-27
+
+### Fixed
+
+- **Count-only pagination shortfalls are no longer reported as sync failures.** Full-sync pagination gaps are now split from hard enumeration and download failures, so small count mismatches can be tolerated without marking a cycle partial-failure while still gating sync-token advancement when unsafe. Added explicit shortfall/token-safety reporting fields and metrics for monitoring. ([#499])
+
+[#499]: https://github.com/rhoopr/kei/pull/499
+
+---
+
 ## [0.20.0] - 2026-05-26
 
 ### Added
@@ -1313,7 +1323,8 @@ The following Python icloudpd features are not yet available. Links go to tracki
 
 ---
 
-[Unreleased]: https://github.com/rhoopr/kei/compare/main...HEAD
+[Unreleased]: https://github.com/rhoopr/kei/compare/v0.20.1...HEAD
+[0.20.1]: https://github.com/rhoopr/kei/compare/v0.20.0...v0.20.1
 [0.20.0]: https://github.com/rhoopr/kei/compare/v0.14.2...v0.20.0
 [0.14.2]: https://github.com/rhoopr/kei/compare/v0.14.1...v0.14.2
 [0.14.1]: https://github.com/rhoopr/kei/compare/v0.14.0...v0.14.1
