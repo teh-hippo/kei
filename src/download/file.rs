@@ -2180,6 +2180,8 @@ mod tests {
         first_chunk_len: usize,
         calls: std::sync::atomic::AtomicUsize,
         resume_requests: std::sync::Mutex<Vec<Option<u64>>>,
+        release_first_chunk: std::sync::Arc<tokio::sync::Notify>,
+        first_chunk_delivered: std::sync::Arc<tokio::sync::Notify>,
     }
 
     impl InterruptingResumeClient {
@@ -2189,15 +2191,25 @@ mod tests {
                 first_chunk_len,
                 calls: std::sync::atomic::AtomicUsize::new(0),
                 resume_requests: std::sync::Mutex::new(Vec::new()),
+                release_first_chunk: std::sync::Arc::new(tokio::sync::Notify::new()),
+                first_chunk_delivered: std::sync::Arc::new(tokio::sync::Notify::new()),
             }
         }
 
         fn pending_after_first_chunk(&self) -> DownloadResponse {
             let first_chunk = self.body[..self.first_chunk_len].to_vec();
-            let stream = futures_util::stream::unfold(Some(first_chunk), |next| async move {
-                match next {
-                    Some(chunk) => Some((Ok(Bytes::from(chunk)), None)),
-                    None => std::future::pending().await,
+            let release_first_chunk = std::sync::Arc::clone(&self.release_first_chunk);
+            let first_chunk_delivered = std::sync::Arc::clone(&self.first_chunk_delivered);
+            let stream = futures_util::stream::unfold(Some(first_chunk), move |next| {
+                let release_first_chunk = std::sync::Arc::clone(&release_first_chunk);
+                let first_chunk_delivered = std::sync::Arc::clone(&first_chunk_delivered);
+                async move {
+                    let Some(chunk) = next else {
+                        std::future::pending().await
+                    };
+                    release_first_chunk.notified().await;
+                    first_chunk_delivered.notify_one();
+                    Some((Ok(Bytes::from(chunk)), None))
                 }
             });
             DownloadResponse {
@@ -2223,6 +2235,14 @@ mod tests {
         fn resume_requests(&self) -> Vec<Option<u64>> {
             self.resume_requests.lock().unwrap().clone()
         }
+
+        fn release_first_chunk(&self) {
+            self.release_first_chunk.notify_one();
+        }
+
+        async fn wait_until_first_chunk_delivered(&self) {
+            self.first_chunk_delivered.notified().await;
+        }
     }
 
     #[async_trait::async_trait]
@@ -2242,24 +2262,12 @@ mod tests {
         }
     }
 
-    async fn wait_for_part_len(part_path: &Path, expected_len: u64) {
-        for _ in 0..100 {
-            if std::fs::metadata(part_path).is_ok_and(|meta| meta.len() == expected_len) {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        }
-        panic!(
-            "part file {} did not reach {expected_len} bytes",
-            part_path.display()
-        );
-    }
-
     #[tokio::test]
     async fn download_file_interrupted_mid_body_keeps_part_and_resumes() {
         let mut body = vec![0xFF, 0xD8, 0xFF, 0xE0];
         body.extend((4..128u8).map(|n| n.wrapping_mul(3)));
-        let client = InterruptingResumeClient::new(body.clone(), 4);
+        let first_chunk_len = 4;
+        let client = InterruptingResumeClient::new(body.clone(), first_chunk_len);
         let dir = TempDir::new().unwrap();
         let download_path = dir.path().join("interrupted.jpg");
         let checksum = base64::engine::general_purpose::STANDARD.encode([0x42u8; 32]);
@@ -2289,7 +2297,24 @@ mod tests {
                 },
             );
             let cancel_after_partial = async {
-                wait_for_part_len(&part_path, 4).await;
+                client.release_first_chunk();
+                client.wait_until_first_chunk_delivered().await;
+                let mut partial_bytes_are_visible = false;
+                for _ in 0..1000 {
+                    let part_len = tokio::fs::metadata(&part_path)
+                        .await
+                        .map(|meta| meta.len())
+                        .unwrap_or(0);
+                    if part_len == first_chunk_len as u64 {
+                        partial_bytes_are_visible = true;
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                assert!(
+                    partial_bytes_are_visible,
+                    "test setup should wait until the first chunk reaches the .part file"
+                );
                 shutdown_token.cancel();
             };
             let (result, ()) = tokio::join!(download, cancel_after_partial);
