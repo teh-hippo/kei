@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `sync_report.json`, logs, notifications, and Prometheus metrics now include `full_enumeration_reason` when kei has to run a full enumeration, so operators can tell whether a full scan came from missing or invalid sync tokens, retry or pending rows, metadata backfill, config drift, explicit retry-failed mode, or a requested full sync. ([#511])
+
+### Fixed
+
+- Watch-mode `/changes/database` prechecks no longer advance `db_sync_token` when Apple returns an empty complete page. kei still skips that wakeup, but the next wakeup rechecks from the previous token instead of treating the empty response as a confirmed checkpoint. ([#503])
+- JSON CDN error responses identified by content type are rejected before `.part` writes, matching the existing HTML error-page rejection. Valid or unknown media bytes still save when size checks pass. ([#512])
+- Password redaction now catches secrets split across adjacent log writes, so passwords passed by CLI or env are not exposed when a writer chunks the log line. ([#516])
+- HEIF XMP extraction now converts unsupported `infe` v1 metadata entries into normal metadata rewrite failures instead of panicking on malformed or unusual HEIC files. ([#516])
+- Password-file permission warnings now fire after a file first becomes readable or permissive; an earlier missing or secure file state no longer suppresses a later warning. ([#516])
+
+[#503]: https://github.com/rhoopr/kei/pull/503
+[#511]: https://github.com/rhoopr/kei/pull/511
+[#512]: https://github.com/rhoopr/kei/pull/512
+[#516]: https://github.com/rhoopr/kei/pull/516
+
 ---
 
 ## [0.20.4] - 2026-05-27
@@ -74,14 +91,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Explicit album and smart-folder selection is collection-scoped.** When users ask for albums or smart folders by config, sync and `import-existing` resolve those passes across every visible library. Unfiled photos still follow `[filters].libraries`, so a primary-only unfiled pass does not unexpectedly widen to shared libraries. Named sensitive smart folders such as `Hidden` and `Recently Deleted` follow the same collection scope. ([#492], [#493])
 - **Setup and listing guide multi-library users more clearly.** `kei config setup` still defaults to all visible libraries, but now writes library-scoped unfiled templates by default when that choice would otherwise mix primary and shared files. `kei list libraries` now labels primary/shared zones and prints the selector values users can paste into `[filters].libraries`. `--recent` help now says the cap is per selected library, album, or smart-folder pass. ([#495])
 - **Service behavior is safer to preview and easier to operate.** `kei install --dry-run` on Linux and macOS prints the service artifact without writing unit/plist files or log directories. Linux system install previews work without root. `kei status` gives clearer background-sync guidance, Docker and generated Linux systemd units set `MALLOC_ARENA_MAX=2`, and Linux uninstall restores the pre-install linger state when kei recorded it. ([#413], [#417], [#451], [#471], [#472])
-- **Sync internals have narrower ownership boundaries.** Selection config, post-cycle reporting, cycle execution, download planning/finalization, and state access were split into smaller owner modules and role traits. These changes keep the v0.20 behavior easier to test without changing the user command shape. ([#418], [#449], [#450], [#452], [#453], [#455], [#456])
-- **Release validation now carries more of the release-candidate checks.** The repo-owned full-test path covers release archive smoke tests, Docker image smoke tests, live import rehearsal, service lifecycle checks, and stricter sync safety assertions. ([#457], [#459], [#460], [#471], [#488], [#489], [#490])
 
 ### Removed
 
 - **Old v0.13-v0.19 compatibility names were removed.** v0.20 rejects the deprecated durable flags, env mirrors, TOML keys, and hidden command aliases from the warning window. Removed names include `--directory` / `KEI_DIRECTORY`, `--threads-num`, `--cookie-directory`, `[auth].cookie_directory`, `[download].threads_num`, `[metrics].port`, `--exclude-album` / `KEI_EXCLUDE_ALBUM`, `{album}` in the base folder template, implicit `--album all` from that token, `[filters].album`, `[filters].exclude_albums`, `[filters].library`, and the legacy `kei setup` / `kei retry-failed` / `kei reset-state` aliases. Use the v0.20 TOML keys and current subcommands instead. ([#402], [#403], [#405], [#406], [#409], [#485])
 - **Import-only durable flags and env mirrors were removed.** `import-existing` now reads durable matching settings from TOML, like sync. `--library`, `--recent`, `--dry-run`, `--force-empty`, `--no-progress-bar`, and `--strict` remain one-off import controls. ([#408])
-- **Stale local docs and old logo experiments were removed.** The deleted v0.13 migration note and synctoken diagnostic scratch guide had drifted behind the v0.20 config model. Current migration guidance now lives in `docs/v0.20-migration.md` and the CloudKit synctoken reference remains in `docs/synctoken-reference.md`. ([#494])
+- **Stale v0.13 migration guidance was removed.** Current migration guidance now lives in `docs/v0.20-migration.md`, and the CloudKit synctoken reference remains in `docs/synctoken-reference.md`. ([#494])
 
 ### Fixed
 
