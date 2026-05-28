@@ -61,8 +61,9 @@
 ```sh
 brew install rhoopr/kei/kei             # Homebrew
 
-docker pull ghcr.io/rhoopr/kei:latest
-docker pull ghcr.io/rhoopr/kei:0.20.4   # pin this release
+docker pull ghcr.io/rhoopr/kei:latest   # pull the latest released kei version
+docker pull ghcr.io/rhoopr/kei:0.20.4   # pin a specific kei release
+docker pull ghcr.io/rhoopr/kei:main     # pull the newest main branch build (frequently updated)
 ```
 
 Pre-built binaries for macOS, Linux, and Windows are on the [Releases page](https://github.com/rhoopr/kei/releases). For Docker Compose, building from source, FreeBSD, and other install paths, see the [Install wiki page](https://github.com/rhoopr/kei/wiki/Install).
@@ -108,7 +109,6 @@ Sync what matters:
 - Sync your full iCloud Photos library, selected albums, smart folders, shared libraries, or only recent media.
 - Keep unfiled photos and shared-library media organized without manual sorting.
 - Filter by media type, filename, date, and library when you only want part of the archive.
-- Explicit album and smart-folder filters are collection-scoped across visible libraries. That includes `Hidden` and `Recently Deleted` when you ask for them. Library selection still scopes unfiled passes.
 - Details: [Configuration](https://github.com/rhoopr/kei/wiki/Configuration)
 
 Run it your way:
