@@ -36,9 +36,6 @@ docker pull ghcr.io/rhoopr/kei:latest
 
 Pre-built binaries for macOS, Linux, and Windows are on the [Releases page](https://github.com/rhoopr/kei/releases). For Docker Compose, source builds, FreeBSD, and NAS setup, see [Install](https://github.com/rhoopr/kei/wiki/Install).
 
-> [!IMPORTANT]
-> kei needs iCloud Photos web access. If `Advanced Data Protection` is on, turn it off and enable "Access iCloud Data on the Web" in your Apple ID settings. See [Authentication](https://github.com/rhoopr/kei/wiki/Authentication#advanced-data-protection-adp).
-
 ## Start
 
 > [!IMPORTANT]
@@ -91,6 +88,10 @@ kei list albums
 - Maintenance commands for status checks, verification, reconcile, reset, and existing-file import.
 
 Today kei syncs iCloud Photos. Immich, Google Takeout, Nextcloud, and Ente support are on the roadmap.
+
+> [!IMPORTANT]
+> kei needs iCloud Photos web access. If `Advanced Data Protection` is on, turn it off and enable "Access iCloud Data on the Web" in your Apple ID settings. See [Authentication](https://github.com/rhoopr/kei/wiki/Authentication#advanced-data-protection-adp).
+
 
 ## Common setups
 
