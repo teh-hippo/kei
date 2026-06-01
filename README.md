@@ -62,7 +62,7 @@
 brew install rhoopr/kei/kei             # Homebrew
 
 docker pull ghcr.io/rhoopr/kei:latest   # latest released version
-docker pull ghcr.io/rhoopr/kei:0.20.4   # pin a specific release
+docker pull ghcr.io/rhoopr/kei:0.21.0   # pin a specific release
 docker pull ghcr.io/rhoopr/kei:main     # newest main branch build (frequently updated)
 ```
 

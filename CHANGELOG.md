@@ -9,25 +9,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [0.21.0] - 2026-06-01
+
 ### Added
 
 - `sync_report.json`, logs, notifications, and Prometheus metrics now include `full_enumeration_reason` when kei has to run a full enumeration, so operators can tell whether a full scan came from missing or invalid sync tokens, retry or pending rows, metadata backfill, config drift, explicit retry-failed mode, or a requested full sync. ([#511])
 - `--recent-scope` and `[filters].recent_scope` let count-form recent syncs choose either one library-wide recent frontier (`global`, the default) or a separate recent window for each selected album, smart folder, or unfiled pass (`per-filter`). ([#519])
+- Album-filtered incremental syncs can now use trusted album membership snapshots and targeted backfill instead of falling back to full enumeration for every selected-album run. ([#520], [#523], [#525], [#526], [#531])
+- Deferred unfiled full-sync passes now emit periodic progress logs with the library, pass type, enumerated asset count, expected count, and elapsed time. ([#540])
+
+### Changed
+
+- Count-form `recent` limits now default to a single library-wide recent window before album, smart-folder, unfiled, media, filename, and date filters narrow that set. Set `recent_scope = "per-filter"` to keep the old per-filter window shape. ([#519])
+- Incremental sync can now split selected smart-folder refreshes from album and unfiled work, letting unfiled changes use `/changes/zone` when the smart-folder pass needs its own refresh. ([#528])
+- Path-affecting download config drift now forces a full reconciliation and clears stored zone tokens so known assets are planned into the new directory or filename template. ([#533])
 
 ### Fixed
 
+- Watch mode now stops before the next sync cycle if it cannot reacquire the iCloud session lock after idle sleep, instead of continuing toward another sync without the lock. ([#544])
+- Resumed downloads now validate `Content-Range` before appending to an existing `.part` file, and XMP Toolkit metadata rewrites now use the same durable write path as downloaded media. ([#543])
+- Full-enumeration sync tokens are now blocked when iCloud count results exceed the records kei actually enumerated, when full-query asset/master records cannot be paired safely, or when an empty-page termination is ambiguous. ([#541])
+- Incremental zone tokens are now blocked when source delete or hidden-state writes fail, including zero-row updates that would otherwise look successful. ([#542])
+- Deferred unfiled streams are reopened after album passes finish, keeping signed iCloud URLs fresher and avoiding zero-download expired-URL outcomes. The same fix stops per-pass album templates from causing repeated "verifying all files" runs. ([#539])
 - Watch-mode `/changes/database` prechecks no longer advance `db_sync_token` when Apple returns an empty complete page. kei still skips that wakeup, but the next wakeup rechecks from the previous token instead of treating the empty response as a confirmed checkpoint. ([#503])
 - JSON CDN error responses identified by content type are rejected before `.part` writes, matching the existing HTML error-page rejection. Valid or unknown media bytes still save when size checks pass. ([#512])
 - Password redaction now catches secrets split across adjacent log writes, so passwords passed by CLI or env are not exposed when a writer chunks the log line. ([#516])
 - HEIF XMP extraction now converts unsupported `infe` v1 metadata entries into normal metadata rewrite failures instead of panicking on malformed or unusual HEIC files. ([#516])
 - Password-file permission warnings now fire after a file first becomes readable or permissive; an earlier missing or secure file state no longer suppresses a later warning. ([#516])
 - Recent and lower-date-bounded full syncs now keep their enumeration bounded without advancing normal full-enumeration zone tokens. `skip_created_after` still drains past the newer prefix so older matching assets are not missed. ([#519])
+- Full-enumeration and count-form recent token diagnostics now report more precise blocked-token and fallback reasons, including incomplete album relation hydration. ([#518], [#510])
+- Password commands that emit invalid UTF-8 are rejected cleanly, CloudKit `/changes/database` responses with missing `zones` default to an empty zone list, and downloaded rows now persist the verified download checksum. ([#535])
+- The live import rehearsal now seeds its test album with `--recent-scope per-filter`, so the selected album contributes files even when the account-wide newest assets are elsewhere. ([#534])
 
 [#503]: https://github.com/rhoopr/kei/pull/503
+[#510]: https://github.com/rhoopr/kei/pull/510
 [#511]: https://github.com/rhoopr/kei/pull/511
 [#512]: https://github.com/rhoopr/kei/pull/512
 [#516]: https://github.com/rhoopr/kei/pull/516
+[#518]: https://github.com/rhoopr/kei/pull/518
 [#519]: https://github.com/rhoopr/kei/pull/519
+[#520]: https://github.com/rhoopr/kei/pull/520
+[#523]: https://github.com/rhoopr/kei/pull/523
+[#525]: https://github.com/rhoopr/kei/pull/525
+[#526]: https://github.com/rhoopr/kei/pull/526
+[#528]: https://github.com/rhoopr/kei/pull/528
+[#531]: https://github.com/rhoopr/kei/pull/531
+[#533]: https://github.com/rhoopr/kei/pull/533
+[#534]: https://github.com/rhoopr/kei/pull/534
+[#535]: https://github.com/rhoopr/kei/pull/535
+[#539]: https://github.com/rhoopr/kei/pull/539
+[#540]: https://github.com/rhoopr/kei/pull/540
+[#541]: https://github.com/rhoopr/kei/pull/541
+[#542]: https://github.com/rhoopr/kei/pull/542
+[#543]: https://github.com/rhoopr/kei/pull/543
+[#544]: https://github.com/rhoopr/kei/pull/544
 
 ---
 
@@ -1375,7 +1412,8 @@ The following Python icloudpd features are not yet available. Links go to tracki
 
 ---
 
-[Unreleased]: https://github.com/rhoopr/kei/compare/v0.20.4...HEAD
+[Unreleased]: https://github.com/rhoopr/kei/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/rhoopr/kei/compare/v0.20.4...v0.21.0
 [0.20.4]: https://github.com/rhoopr/kei/compare/v0.20.3...v0.20.4
 [0.20.3]: https://github.com/rhoopr/kei/compare/v0.20.2...v0.20.3
 [0.20.2]: https://github.com/rhoopr/kei/compare/v0.20.1...v0.20.2
