@@ -20,6 +20,7 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub(super) struct DownloadResponse {
     pub status: u16,
     pub content_length: Option<u64>,
+    pub content_range: Option<String>,
     pub content_type: Option<String>,
     pub stream: Pin<Box<dyn Stream<Item = Result<Bytes, BoxError>> + Send>>,
 }
@@ -51,6 +52,11 @@ impl DownloadClient for Client {
         let response = request.send().await?;
         let status = response.status().as_u16();
         let content_length = response.content_length();
+        let content_range = response
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .map(std::string::ToString::to_string);
         let content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -62,6 +68,7 @@ impl DownloadClient for Client {
         Ok(DownloadResponse {
             status,
             content_length,
+            content_range,
             content_type,
             stream: Box::pin(stream),
         })
@@ -324,6 +331,11 @@ async fn attempt_download<C: DownloadClient>(
     }
 
     let content_length = response.content_length;
+    let content_range = response.content_range;
+
+    if status == 206 && resume_offset > 0 {
+        validate_resume_content_range(content_range.as_deref(), resume_offset, &path_str)?;
+    }
 
     // If we resumed and the server advertises a Content-Length that doesn't
     // reconcile with the API-reported size, the resource on the server has
@@ -785,6 +797,55 @@ fn rejecting_content_type_reason(content_type: &str) -> Option<&'static str> {
         _ if essence.ends_with("+json") => Some("JSON"),
         _ => None,
     }
+}
+
+fn validate_resume_content_range(
+    content_range: Option<&str>,
+    resume_offset: u64,
+    path: &str,
+) -> Result<(), DownloadError> {
+    let Some(content_range) = content_range else {
+        return Err(DownloadError::InvalidContent {
+            path: path.into(),
+            reason: "206 Partial Content response omitted Content-Range for resume".into(),
+        });
+    };
+    let Some(start) = parse_content_range_start(content_range) else {
+        return Err(DownloadError::InvalidContent {
+            path: path.into(),
+            reason: format!("malformed Content-Range for resume: {content_range}").into(),
+        });
+    };
+    if start != resume_offset {
+        return Err(DownloadError::InvalidContent {
+            path: path.into(),
+            reason: format!(
+                "Content-Range start {start} does not match existing .part size {resume_offset}"
+            )
+            .into(),
+        });
+    }
+    Ok(())
+}
+
+fn parse_content_range_start(content_range: &str) -> Option<u64> {
+    let mut parts = content_range.split_whitespace();
+    let unit = parts.next()?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    let range_and_total = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let (range, _total) = range_and_total.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let start = start.parse::<u64>().ok()?;
+    let end = end.parse::<u64>().ok()?;
+    if end < start {
+        return None;
+    }
+    Some(start)
 }
 
 /// Inspect the first bytes of a downloaded file for known-bad sentinels that
@@ -1537,6 +1598,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_content_range_start_accepts_valid_byte_ranges() {
+        assert_eq!(parse_content_range_start("bytes 4-7/8"), Some(4));
+        assert_eq!(parse_content_range_start("Bytes 100-179/*"), Some(100));
+    }
+
+    #[test]
+    fn parse_content_range_start_rejects_malformed_ranges() {
+        assert_eq!(parse_content_range_start("items 4-7/8"), None);
+        assert_eq!(parse_content_range_start("bytes 7-4/8"), None);
+        assert_eq!(parse_content_range_start("bytes */8"), None);
+        assert_eq!(parse_content_range_start("bytes 4-7"), None);
+    }
+
+    #[test]
     fn classify_magic_basic_image_types() {
         assert_eq!(classify_magic("jpg", &[0xFF, 0xD8]), Some(true));
         assert_eq!(classify_magic("jpeg", &[0xFF, 0xD8]), Some(true));
@@ -1709,6 +1784,7 @@ mod tests {
     struct StubDownloadClient {
         status: u16,
         content_length: Option<u64>,
+        content_range: Option<String>,
         content_type: Option<String>,
         body: Vec<u8>,
     }
@@ -1718,6 +1794,7 @@ mod tests {
             Self {
                 status: 200,
                 content_length: Some(body.len() as u64),
+                content_range: None,
                 content_type: None,
                 body: body.to_vec(),
             }
@@ -1737,6 +1814,11 @@ mod tests {
             self.content_type = Some(ct.to_string());
             self
         }
+
+        fn with_content_range(mut self, content_range: &str) -> Self {
+            self.content_range = Some(content_range.to_string());
+            self
+        }
     }
 
     #[async_trait::async_trait]
@@ -1744,12 +1826,19 @@ mod tests {
         async fn fetch(
             &self,
             _url: &str,
-            _resume_from: Option<u64>,
+            resume_from: Option<u64>,
         ) -> Result<DownloadResponse, BoxError> {
             let chunks: Vec<Result<Bytes, BoxError>> = vec![Ok(Bytes::from(self.body.clone()))];
+            let content_range = self.content_range.clone().or_else(|| {
+                resume_from.and_then(|start| {
+                    let end = start.checked_add(self.body.len() as u64)?.checked_sub(1)?;
+                    Some(format!("bytes {start}-{end}/*"))
+                })
+            });
             Ok(DownloadResponse {
                 status: self.status,
                 content_length: self.content_length,
+                content_range,
                 content_type: self.content_type.clone(),
                 stream: Box::pin(futures_util::stream::iter(chunks)),
             })
@@ -1822,6 +1911,7 @@ mod tests {
         let client = StubDownloadClient {
             status: 200,
             content_length: Some(100),
+            content_range: None,
             content_type: None,
             body: body.to_vec(),
         };
@@ -1991,6 +2081,7 @@ mod tests {
         let client = StubDownloadClient {
             status: 206,
             content_length: Some(second_half.len() as u64),
+            content_range: None,
             content_type: None,
             body: second_half.clone(),
         };
@@ -2014,6 +2105,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn download_file_resume_wrong_content_range_keeps_existing_part_and_errors() {
+        let (download_path, part_path, _dir) = setup_download_dir("bad_range", "jpg");
+        let first_half = [0xFF, 0xD8, 0xFF, 0xE0];
+        std::fs::write(&part_path, first_half).unwrap();
+
+        let second_half = vec![0x00, 0x10, 0x4A, 0x46];
+        let client = StubDownloadClient::ok(&second_half)
+            .with_status(206)
+            .with_content_range("bytes 0-3/8");
+
+        let err = attempt_download(
+            &client,
+            "http://stub",
+            &download_path,
+            &part_path,
+            false,
+            Some(8),
+            None,
+            None,
+        )
+        .await
+        .expect_err("mismatched Content-Range must fail before append");
+
+        assert!(
+            matches!(err, DownloadError::InvalidContent { .. }),
+            "expected InvalidContent for wrong Content-Range, got: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&part_path).unwrap(),
+            first_half,
+            "existing .part bytes must remain unchanged for a future safe retry"
+        );
+        assert!(
+            !download_path.exists(),
+            "wrong range must not promote final path"
+        );
+    }
+
+    #[tokio::test]
     async fn attempt_download_resume_rejects_version_rotation_via_content_length() {
         // If the .part carries K bytes from version A and the server's Range
         // response's Content-Length (+ resume_offset) totals a different size
@@ -2028,6 +2158,7 @@ mod tests {
         let client = StubDownloadClient {
             status: 206,
             content_length: Some(80),
+            content_range: None,
             content_type: None,
             body: vec![0xBB; 80],
         };
@@ -2137,6 +2268,10 @@ mod tests {
                 Ok(DownloadResponse {
                     status: if resume_from.is_some() { 206 } else { 200 },
                     content_length: Some(self.body.len() as u64),
+                    content_range: resume_from.map(|start| {
+                        let end = start + self.body.len() as u64 - 1;
+                        format!("bytes {start}-{end}/*")
+                    }),
                     content_type: None,
                     stream: Box::pin(futures_util::stream::iter(chunks)),
                 })
@@ -2215,6 +2350,7 @@ mod tests {
             DownloadResponse {
                 status: 200,
                 content_length: Some(self.body.len() as u64),
+                content_range: None,
                 content_type: Some("image/jpeg".to_string()),
                 stream: Box::pin(stream),
             }
@@ -2227,6 +2363,11 @@ mod tests {
             DownloadResponse {
                 status: 206,
                 content_length: Some((self.body.len() - offset) as u64),
+                content_range: Some(format!(
+                    "bytes {resume_from}-{}/{}",
+                    self.body.len() - 1,
+                    self.body.len()
+                )),
                 content_type: Some("image/jpeg".to_string()),
                 stream: Box::pin(futures_util::stream::iter(chunks)),
             }
@@ -2413,6 +2554,7 @@ mod tests {
                 Ok(DownloadResponse {
                     status: self.fail_status,
                     content_length: None,
+                    content_range: None,
                     content_type: None,
                     stream: Box::pin(futures_util::stream::iter(chunks)),
                 })
@@ -2421,6 +2563,7 @@ mod tests {
                 Ok(DownloadResponse {
                     status: 200,
                     content_length: Some(self.body.len() as u64),
+                    content_range: None,
                     content_type: None,
                     stream: Box::pin(futures_util::stream::iter(chunks)),
                 })
@@ -2814,7 +2957,8 @@ mod tests {
                 .respond_with(
                     ResponseTemplate::new(206)
                         .set_body_bytes(full_body[4..].to_vec())
-                        .insert_header("content-length", "4"),
+                        .insert_header("content-length", "4")
+                        .insert_header("content-range", "bytes 4-7/8"),
                 )
                 .expect(1)
                 .mount(&server)
@@ -3350,6 +3494,7 @@ mod tests {
         let client = StubDownloadClient {
             status: 200,
             content_length: Some(0),
+            content_range: None,
             content_type: None,
             body: vec![],
         };
@@ -3483,6 +3628,7 @@ mod tests {
             Ok(DownloadResponse {
                 status: 200,
                 content_length: Some(self.body.len() as u64),
+                content_range: None,
                 content_type: None,
                 stream: Box::pin(futures_util::stream::iter(chunks)),
             })
