@@ -11,6 +11,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.21.1] - 2026-06-02
+
+### Changed
+
+- README now leads with the current install paths, sync workflow, Docker example, and day-to-day usage. ([#545])
+
+### Fixed
+
+- Files changed by EXIF/XMP metadata embedding no longer get redownloaded as `-<size>` duplicates when iCloud still reports the same asset checksum. kei now confirms the DB-recorded destination path before treating a size mismatch as a filename collision. ([#554], fixes [#553])
+
+[#545]: https://github.com/rhoopr/kei/pull/545
+[#553]: https://github.com/rhoopr/kei/issues/553
+[#554]: https://github.com/rhoopr/kei/pull/554
+
+---
+
 ## [0.21.0] - 2026-06-01
 
 ### Added
@@ -1412,7 +1428,8 @@ The following Python icloudpd features are not yet available. Links go to tracki
 
 ---
 
-[Unreleased]: https://github.com/rhoopr/kei/compare/v0.21.0...HEAD
+[Unreleased]: https://github.com/rhoopr/kei/compare/v0.21.1...HEAD
+[0.21.1]: https://github.com/rhoopr/kei/compare/v0.21.0...v0.21.1
 [0.21.0]: https://github.com/rhoopr/kei/compare/v0.20.4...v0.21.0
 [0.20.4]: https://github.com/rhoopr/kei/compare/v0.20.3...v0.20.4
 [0.20.3]: https://github.com/rhoopr/kei/compare/v0.20.2...v0.20.3
