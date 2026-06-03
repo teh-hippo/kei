@@ -9,11 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.2] - 2026-06-02
+
 ### Fixed
 
-- Embedded metadata writes now skip HEIC/HEIF/AVIF files with a warning instead of using the mp4-atom rewrite path that could corrupt Apple HEIC item graphs. JPEG/TIFF embedded writes and XMP sidecars still run. ([#552])
+- Disabled embedded HEIC/HEIF/AVIF metadata rewrites because the current `mp4-atom`-backed path can corrupt Apple HEIC item graphs. JPEG/TIFF embedded writes and XMP sidecars remain supported. ([#555], fixes [#552])
 
 [#552]: https://github.com/rhoopr/kei/issues/552
+[#555]: https://github.com/rhoopr/kei/pull/555
 
 ---
 
