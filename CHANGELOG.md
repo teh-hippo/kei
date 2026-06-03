@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.3] - 2026-06-03
+
+### Fixed
+
+- Full-enumeration sync tokens now advance when a CloudKit count gap is fully explained by duplicate asset IDs already seen in the API stream. Real pagination shortfalls still block token advancement. ([#557])
+- Pending and failed retry fallback is now scoped by library, so retry work in one CloudKit zone no longer forces unrelated libraries back to full enumeration. ([#557])
+
+[#557]: https://github.com/rhoopr/kei/pull/557
+
+---
+
 ## [0.21.2] - 2026-06-02
 
 ### Fixed
@@ -1437,7 +1448,9 @@ The following Python icloudpd features are not yet available. Links go to tracki
 
 ---
 
-[Unreleased]: https://github.com/rhoopr/kei/compare/v0.21.1...HEAD
+[Unreleased]: https://github.com/rhoopr/kei/compare/v0.21.3...HEAD
+[0.21.3]: https://github.com/rhoopr/kei/compare/v0.21.2...v0.21.3
+[0.21.2]: https://github.com/rhoopr/kei/compare/v0.21.1...v0.21.2
 [0.21.1]: https://github.com/rhoopr/kei/compare/v0.21.0...v0.21.1
 [0.21.0]: https://github.com/rhoopr/kei/compare/v0.20.4...v0.21.0
 [0.20.4]: https://github.com/rhoopr/kei/compare/v0.20.3...v0.20.4
