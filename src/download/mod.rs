@@ -223,6 +223,14 @@ pub struct SyncStats {
     pub exif_failures: usize,
     pub state_write_failures: usize,
     pub enumeration_errors: usize,
+    /// Best-effort count-probe failures observed before full enumeration.
+    /// These are reported separately from producer enumeration errors because
+    /// a naturally drained CloudKit stream with usable sync tokens can still
+    /// be complete even when the count side-channel was flaky.
+    pub count_probe_failures: usize,
+    /// Pending DB rows pruned after a clean full enumeration proved they were
+    /// not re-seen. State-only cleanup; media files are never deleted.
+    pub stale_pending_pruned: u64,
     /// Number of count-only CloudKit pagination shortfall warnings observed.
     /// These are not hard enumeration failures and do not imply download
     /// failures.
@@ -329,6 +337,8 @@ impl SyncStats {
         self.exif_failures += other.exif_failures;
         self.state_write_failures += other.state_write_failures;
         self.enumeration_errors += other.enumeration_errors;
+        self.count_probe_failures += other.count_probe_failures;
+        self.stale_pending_pruned += other.stale_pending_pruned;
         self.pagination_shortfall_warnings += other.pagination_shortfall_warnings;
         self.pagination_shortfall_assets += other.pagination_shortfall_assets;
         self.enumeration_incomplete = self.enumeration_incomplete || other.enumeration_incomplete;
@@ -2735,6 +2745,24 @@ async fn has_metadata_backfill_work(config: &DownloadConfig) -> bool {
     }
 }
 
+fn should_prune_stale_pending_after_full_enumeration(
+    sync_result: &SyncResult,
+    config: &DownloadConfig,
+    controls: DownloadControls,
+    shutdown_token: &CancellationToken,
+) -> bool {
+    sync_result.full_enumeration_ran
+        && matches!(sync_result.outcome, DownloadOutcome::Success)
+        && sync_result.stats.enumeration_errors == 0
+        && !sync_result.stats.enumeration_incomplete
+        && !sync_result.stats.interrupted
+        && config.recent.is_none()
+        && config.skip_created_before.is_none()
+        && !controls.run_mode.is_dry_run()
+        && !controls.run_mode.only_print_filenames()
+        && !shutdown_token.is_cancelled()
+}
+
 fn set_full_enumeration_reason(result: &mut SyncResult, reason: FullEnumerationReason) {
     if result.full_enumeration_ran && result.stats.full_enumeration_reason.is_none() {
         result.stats.full_enumeration_reason = Some(reason);
@@ -3267,6 +3295,39 @@ pub async fn download_photos_with_sync(
         }
     };
 
+    let mut result = result;
+    if let (Ok(sync_result), Some(db)) = (&mut result, config.state_db.as_ref()) {
+        if should_prune_stale_pending_after_full_enumeration(
+            sync_result,
+            config.as_ref(),
+            controls,
+            &shutdown_token,
+        ) {
+            match db
+                .prune_stale_pending_not_seen_since(&config.library, sync_started_at)
+                .await
+            {
+                Ok(pruned) if pruned > 0 => {
+                    sync_result.stats.stale_pending_pruned = pruned;
+                    tracing::warn!(
+                        count = pruned,
+                        library = %config.library,
+                        diagnostic = "stale_pending_pruned",
+                        "Pruned stale pending state rows after clean full enumeration"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        library = %config.library,
+                        "Failed to prune stale pending rows"
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
     // Pending is transient — anything still pending after a complete sync either
     // wasn't enumerated or failed silently. Skip on interrupt where pending is expected.
     if let Some(db) = &config.state_db {
@@ -3291,11 +3352,9 @@ pub async fn download_photos_with_sync(
 
 /// Fold per-pass `album.len()` results into a `(counts, error_count)` tuple,
 /// logging a `warn!` for each failure. Errors are mapped to a count of 0 so
-/// downstream concurrency math still has a value, but the returned error
-/// count is the load-bearing signal: callers must treat it as an enumeration
-/// failure that suppresses sync token advancement (a swallowed `len()` error
-/// previously caused `total = 0`, which silently bypassed the pagination
-/// undercount check and advanced the token past un-enumerated change events).
+/// downstream progress and concurrency math still has a value. The returned
+/// error count is diagnostic only: callers must not turn a failed count
+/// side-channel into a semantic completeness bound.
 fn fold_pass_count_results(
     results: Vec<anyhow::Result<u64>>,
     passes: &[crate::commands::AlbumPass],
@@ -3311,9 +3370,8 @@ fn fold_pass_count_results(
                 tracing::warn!(
                     album = %pass.album,
                     error = %e,
-                    "Failed to query album length; treating count as 0 and \
-                     blocking sync token advancement to force full \
-                     re-enumeration on next run"
+                    "Failed to query album length; treating count as a display-only \
+                     zero and relying on the record stream for completeness"
                 );
                 0
             }
@@ -3372,23 +3430,25 @@ async fn build_pass_count_plan(
     // HTTP call. This matters for default multi-pass syncs and especially
     // `-a all`, where the old per-pass count probe scaled linearly before
     // the first byte of the first download.
-    // Capture per-pass `len()` errors instead of swallowing them as zero.
-    // A swallowed `len()` failure converted `total` to 0, which short-circuited
-    // the pagination-undercount check at line ~1450 (it only fires when
-    // `total > 0`); the cycle then returned `Success` with zero assets and the
-    // sync token advanced past un-enumerated change events. Treat any failure
-    // as a per-album enumeration error so token advancement is suppressed.
+    // Capture per-pass `len()` errors separately from stream errors. A failed
+    // count endpoint is not itself proof that records/query was incomplete,
+    // so token safety below is decided by natural stream completion and
+    // sync-token usability instead of a fabricated count bound.
     let pass_albums: Vec<&crate::icloud::photos::PhotoAlbum> =
         passes.iter().map(|pass| &pass.album).collect();
     let pass_count_results = crate::icloud::photos::PhotoAlbum::len_many(&pass_albums).await;
     let (display_counts, len_errors) = fold_pass_count_results(pass_count_results, passes);
-    let stream_total_counts = display_counts.iter().copied().map(Some).collect();
-    let exact_total = capped_exact_total(&display_counts, config.recent);
+    let stream_total_counts = if len_errors > 0 {
+        vec![None; passes.len()]
+    } else {
+        display_counts.iter().copied().map(Some).collect()
+    };
+    let exact_total = (len_errors == 0).then(|| capped_exact_total(&display_counts, config.recent));
 
     PassCountPlan {
         display_counts,
         stream_total_counts,
-        exact_total: Some(exact_total),
+        exact_total,
         len_errors,
     }
 }
@@ -3509,7 +3569,7 @@ async fn download_photos_full_with_token(
     // instead of serializing round trips across albums. Download workers are
     // divided across active pass pipelines so real downloads do not multiply
     // the user-selected `[download].threads` by the number of albums.
-    let (mut streaming_result, token_receivers) = if needs_per_pass {
+    let (streaming_result, token_receivers) = if needs_per_pass {
         let mut combined_result = StreamingResult {
             // Enumeration is "complete" only when every pass finished
             // its stream cleanly. Start optimistic; flip to false on the
@@ -3786,16 +3846,11 @@ async fn download_photos_full_with_token(
         (result, token_receivers)
     };
 
-    // Fold `len()` failures into the streaming result's enumeration error
-    // tally so `build_download_outcome` returns `PartialFailure`. This is the
-    // signal `should_store_sync_token` reads to suppress token advancement.
-    streaming_result.enumeration_errors += len_errors;
-    // A `len()` failure on any pass means we never had a reliable
-    // total to enumerate against, so the per-zone enumeration marker must
-    // stay set even if the producer drained its (possibly truncated) stream.
-    if len_errors > 0 {
-        streaming_result.enumeration_complete = false;
-    }
+    // Count-probe failures stay diagnostic unless the primary records/query
+    // stream also proves unsafe. Do not fold them into `enumeration_errors`
+    // or force `enumeration_complete = false`; otherwise a flaky count
+    // endpoint can trap users in repeated full enumeration after CloudKit
+    // delivered a naturally drained stream and a usable token.
     if exact_total.is_some() {
         exact_total = Some(capped_exact_total(&pagination_counts, config.recent));
     }
@@ -3867,8 +3922,8 @@ async fn download_photos_full_with_token(
     let token_eligible = config.recent.is_none()
         && config.skip_created_before.is_none()
         && !controls.run_mode.only_print_filenames()
-        && !count_lookup_failed
         && !pagination_undercount
+        && streaming_result.enumeration_complete
         && streaming_result.enumeration_errors == 0;
     let mut token_block_reason: Option<&'static str> = None;
     let mut token_expected_receivers: Option<usize> = None;
@@ -3965,6 +4020,7 @@ async fn download_photos_full_with_token(
     .await?;
     stats.pagination_shortfall_warnings = pagination_shortfall_warnings;
     stats.pagination_shortfall_assets = pagination_shortfall_assets;
+    stats.count_probe_failures = len_errors;
     if token_eligible {
         stats.sync_token_expected_receivers = token_expected_receivers;
         stats.sync_token_receivers_with_token = token_receivers_with_token;
@@ -3973,14 +4029,14 @@ async fn download_photos_full_with_token(
         stats.sync_token_receivers_dropped = token_receivers_dropped;
         stats.sync_token_unique_values = token_unique_values;
     }
-    if count_lookup_failed {
-        stats.sync_token_blocked = true;
-        stats.sync_token_blocked_reason = Some(ICLOUD_ALBUM_COUNT_ERROR_REASON);
-        stats.sync_token_blocked_source =
-            Some(sync_token_blocked_source(ICLOUD_ALBUM_COUNT_ERROR_REASON));
-        stats.sync_token_blocked_explanation = Some(sync_token_blocked_explanation(
-            ICLOUD_ALBUM_COUNT_ERROR_REASON,
-        ));
+    if count_lookup_failed && token_eligible && sync_token.is_some() {
+        if !stats.sync_token_blocked {
+            tracing::warn!(
+                count_probe_failures = len_errors,
+                "Count probes failed, but records/query completed naturally with a usable \
+                 sync token; recording diagnostic and allowing token advancement"
+            );
+        }
     } else if pagination_undercount {
         stats.sync_token_blocked = true;
         stats.sync_token_blocked_reason = Some("pagination_shortfall");
@@ -4006,6 +4062,14 @@ async fn download_photos_full_with_token(
         stats.sync_token_blocked_reason = Some(reason);
         stats.sync_token_blocked_source = Some(sync_token_blocked_source(reason));
         stats.sync_token_blocked_explanation = Some(sync_token_blocked_explanation(reason));
+    } else if count_lookup_failed && !stats.sync_token_blocked {
+        stats.sync_token_blocked = true;
+        stats.sync_token_blocked_reason = Some(ICLOUD_ALBUM_COUNT_ERROR_REASON);
+        stats.sync_token_blocked_source =
+            Some(sync_token_blocked_source(ICLOUD_ALBUM_COUNT_ERROR_REASON));
+        stats.sync_token_blocked_explanation = Some(sync_token_blocked_explanation(
+            ICLOUD_ALBUM_COUNT_ERROR_REASON,
+        ));
     }
 
     // Clear enumeration-in-progress markers when the producer reached the
@@ -6153,19 +6217,7 @@ mod tests {
         // Seed the destination so the single enumerated asset is skipped
         // on-disk and the test isolates count-only shortfall behavior.
         let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
-        let pass_config = config.with_pass(&passes[0]);
-        let expected_path = filter::expected_paths_for(&asset, &pass_config)
-            .into_iter()
-            .next()
-            .expect("mock asset should have an expected path");
-        tokio::fs::create_dir_all(expected_path.path.parent().expect("path has parent"))
-            .await
-            .expect("create parent dir");
-        tokio::fs::write(&expected_path.path, vec![0u8; 1024])
-            .await
-            .expect("seed existing file");
-        seed_downloaded_state_for_expected_path(&mut config, &pass_config, &asset, &expected_path)
-            .await;
+        seed_existing_file_for_asset(&mut config, &passes[0], &asset).await;
 
         let result = download_photos_full_with_token(
             &Client::new(),
@@ -6205,12 +6257,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_album_count_is_enumeration_error_and_blocks_sync_token() {
+    async fn malformed_album_count_blocks_token_on_ambiguous_empty_tail() {
+        let records = mock_photo_records_with_filename("MASTER_BEFORE_GAP", "before-gap.jpg");
+        let later_records = mock_photo_records_with_filename("MASTER_AFTER_GAP", "after-gap.jpg");
         let session = MockPhotosFlow::new()
             .album_count_response(json!({
                 "batch": [{"records": [{"fields": {"itemCount": {"value": "not-a-count"}}}]}]
             }))
+            .query_page(records.clone(), Some("zone-token"))
             .empty_query_page(Some("zone-token"))
+            .empty_query_page(Some("zone-token"))
+            .empty_query_page(Some("zone-token"))
+            .empty_query_page(Some("zone-token"))
+            .empty_query_page(Some("zone-token"))
+            .query_page(later_records, Some("zone-token"))
             .build();
         let passes = vec![AlbumPass {
             kind: PassKind::Album,
@@ -6222,6 +6282,10 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         config.directory = Arc::from(dir.path());
         config.concurrent_downloads = 1;
+        config.file_match_policy = FileMatchPolicy::NameId7;
+
+        let asset = PhotoAsset::new(records[0].clone(), records[1].clone());
+        seed_existing_file_for_asset(&mut config, &passes[0], &asset).await;
 
         let result = download_photos_full_with_token(
             &Client::new(),
@@ -6237,7 +6301,12 @@ mod tests {
             result.outcome,
             DownloadOutcome::PartialFailure { failed_count: 1 }
         ));
+        assert_eq!(
+            result.stats.assets_seen, 1,
+            "enumeration must not walk past the ambiguous empty-tail terminator"
+        );
         assert_eq!(result.stats.enumeration_errors, 1);
+        assert_eq!(result.stats.count_probe_failures, 1);
         assert_eq!(result.stats.pagination_shortfall_warnings, 0);
         assert_eq!(result.stats.pagination_shortfall_assets, 0);
         assert!(result.stats.sync_token_blocked);
@@ -6245,18 +6314,11 @@ mod tests {
             result.stats.sync_token_blocked_reason,
             Some(ICLOUD_ALBUM_COUNT_ERROR_REASON)
         );
-        assert_eq!(result.stats.sync_token_blocked_source, Some("icloud"));
-        assert_eq!(
-            result.stats.sync_token_blocked_explanation,
-            Some(sync_token_blocked_explanation(
-                ICLOUD_ALBUM_COUNT_ERROR_REASON
-            ))
-        );
         assert_eq!(result.sync_token, None);
     }
 
     #[tokio::test]
-    async fn missing_album_count_item_count_is_enumeration_error_not_zero() {
+    async fn missing_album_count_item_count_blocks_ambiguous_empty_tail() {
         let session = MockPhotosFlow::new()
             .album_count_response(json!({
                 "batch": [{"records": [{"fields": {}}]}]
@@ -6290,6 +6352,51 @@ mod tests {
         ));
         assert_eq!(result.stats.assets_seen, 0);
         assert_eq!(result.stats.enumeration_errors, 1);
+        assert_eq!(result.stats.count_probe_failures, 1);
+        assert!(result.stats.sync_token_blocked);
+        assert_eq!(
+            result.stats.sync_token_blocked_reason,
+            Some(ICLOUD_ALBUM_COUNT_ERROR_REASON)
+        );
+        assert_eq!(result.sync_token, None);
+    }
+
+    #[tokio::test]
+    async fn malformed_album_count_still_blocks_when_stream_errors() {
+        let session = MockPhotosFlow::new()
+            .album_count_response(json!({
+                "batch": [{"records": [{"fields": {"itemCount": {"value": "not-a-count"}}}]}]
+            }))
+            .error("stream failed")
+            .build();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: mock_album("Hidden", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 1;
+
+        let result = download_photos_full_with_token(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("stream error should produce a sync result");
+
+        assert!(matches!(
+            result.outcome,
+            DownloadOutcome::PartialFailure { failed_count: 1 }
+        ));
+        assert_eq!(result.stats.enumeration_errors, 1);
+        assert_eq!(result.stats.count_probe_failures, 1);
+        assert!(result.stats.sync_token_blocked);
         assert_eq!(
             result.stats.sync_token_blocked_reason,
             Some(ICLOUD_ALBUM_COUNT_ERROR_REASON)
@@ -9470,6 +9577,8 @@ mod tests {
             exif_failures: 1,
             state_write_failures: 2,
             enumeration_errors: 3,
+            count_probe_failures: 4,
+            stale_pending_pruned: 5,
             pagination_shortfall_warnings: 1,
             pagination_shortfall_assets: 9,
             enumeration_incomplete: false,
@@ -9517,6 +9626,8 @@ mod tests {
             exif_failures: 4,
             state_write_failures: 5,
             enumeration_errors: 6,
+            count_probe_failures: 7,
+            stale_pending_pruned: 8,
             pagination_shortfall_warnings: 2,
             pagination_shortfall_assets: 11,
             enumeration_incomplete: true,
@@ -9552,6 +9663,14 @@ mod tests {
         assert_eq!(acc.exif_failures, 5, "exif_failures must sum");
         assert_eq!(acc.state_write_failures, 7, "state_write_failures must sum");
         assert_eq!(acc.enumeration_errors, 9, "enumeration_errors must sum");
+        assert_eq!(
+            acc.count_probe_failures, 11,
+            "count_probe_failures must sum"
+        );
+        assert_eq!(
+            acc.stale_pending_pruned, 13,
+            "stale_pending_pruned must sum"
+        );
         assert_eq!(
             acc.pagination_shortfall_warnings, 3,
             "pagination shortfall warnings must sum"
