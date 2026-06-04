@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.4] - 2026-06-04
+
+### Changed
+
+- Error messages across auth, config, selection, download, iCloud, service, state, setup, and sync paths now use plainer, more actionable wording. CLI flags, config keys, schema, and runtime behavior are unchanged. ([#572])
+- Expected token-suppression notices for `--recent` and lower-date-bounded runs now log at `INFO` instead of `WARN`. True unsafe token conditions still warn. ([#566], fixes [#556])
+
+### Fixed
+
+- Live Photo MOV companions now reuse an existing size-deduped primary photo stem instead of planning an asset-id-suffixed duplicate. ([#560])
+- Same-name, same-size path collisions now use deterministic asset-id suffixes instead of skipping the second asset. ([#561], fixes [#546])
+- Incomplete producer enumeration now fails the cycle partially, reports `enumeration_incomplete`, and blocks sync-token advancement instead of treating a canceled stream as complete. ([#562], fixes [#547])
+- Missing or malformed iCloud album count responses now report a count-probe failure instead of a false zero, while clean full enumerations can still advance zone tokens when only that count side channel failed. ([#563], [#571], fixes [#548])
+- Known media extensions with unsupported response content types now fail before kei records a download or advances sync tokens, while valid media bytes with mismatched extensions still save. ([#564], fixes [#551])
+- State-backed files that are smaller than iCloud's reported size are now redownloaded instead of being skipped as already present. ([#568])
+- Incremental soft-deletes for untracked `CPLMaster` records no longer force the same zone changes to replay forever. Asset deletes and real state-write failures still block token advancement. ([#569], fixes [#567])
+- Clean library-scoped full enumerations now prune stale pending rows left behind by older runs and report the pruned count. ([#571])
+
+[#546]: https://github.com/rhoopr/kei/issues/546
+[#547]: https://github.com/rhoopr/kei/issues/547
+[#548]: https://github.com/rhoopr/kei/issues/548
+[#551]: https://github.com/rhoopr/kei/issues/551
+[#556]: https://github.com/rhoopr/kei/issues/556
+[#560]: https://github.com/rhoopr/kei/pull/560
+[#561]: https://github.com/rhoopr/kei/pull/561
+[#562]: https://github.com/rhoopr/kei/pull/562
+[#563]: https://github.com/rhoopr/kei/pull/563
+[#564]: https://github.com/rhoopr/kei/pull/564
+[#566]: https://github.com/rhoopr/kei/pull/566
+[#567]: https://github.com/rhoopr/kei/issues/567
+[#568]: https://github.com/rhoopr/kei/pull/568
+[#569]: https://github.com/rhoopr/kei/pull/569
+[#571]: https://github.com/rhoopr/kei/pull/571
+[#572]: https://github.com/rhoopr/kei/pull/572
+
+---
+
 ## [0.21.3] - 2026-06-03
 
 ### Fixed
@@ -1448,7 +1485,8 @@ The following Python icloudpd features are not yet available. Links go to tracki
 
 ---
 
-[Unreleased]: https://github.com/rhoopr/kei/compare/v0.21.3...HEAD
+[Unreleased]: https://github.com/rhoopr/kei/compare/v0.21.4...HEAD
+[0.21.4]: https://github.com/rhoopr/kei/compare/v0.21.3...v0.21.4
 [0.21.3]: https://github.com/rhoopr/kei/compare/v0.21.2...v0.21.3
 [0.21.2]: https://github.com/rhoopr/kei/compare/v0.21.1...v0.21.2
 [0.21.1]: https://github.com/rhoopr/kei/compare/v0.21.0...v0.21.1
