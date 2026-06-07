@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.5] - 2026-06-07
+
+### Fixed
+
+- `kei service run` now keeps sending systemd watchdog heartbeats through long sync cycles and watch sleeps after readiness, so systemd no longer restarts healthy services with `WatchdogSec=` enabled. ([#576], fixes [#574])
+- Replayed incremental source-state deletes and hidden updates for records kei never tracked no longer block zone-token advancement, while real state-write failures still do. ([#577], fixes [#575])
+- Live import and auth tests now expect the current `import-existing` error text for missing download directories and duration-form `--recent` rejection. ([#578])
+
+[#574]: https://github.com/rhoopr/kei/issues/574
+[#575]: https://github.com/rhoopr/kei/issues/575
+[#576]: https://github.com/rhoopr/kei/pull/576
+[#577]: https://github.com/rhoopr/kei/pull/577
+[#578]: https://github.com/rhoopr/kei/pull/578
+
+---
+
 ## [0.21.4] - 2026-06-04
 
 ### Changed
@@ -1485,7 +1501,8 @@ The following Python icloudpd features are not yet available. Links go to tracki
 
 ---
 
-[Unreleased]: https://github.com/rhoopr/kei/compare/v0.21.4...HEAD
+[Unreleased]: https://github.com/rhoopr/kei/compare/v0.21.5...HEAD
+[0.21.5]: https://github.com/rhoopr/kei/compare/v0.21.4...v0.21.5
 [0.21.4]: https://github.com/rhoopr/kei/compare/v0.21.3...v0.21.4
 [0.21.3]: https://github.com/rhoopr/kei/compare/v0.21.2...v0.21.3
 [0.21.2]: https://github.com/rhoopr/kei/compare/v0.21.1...v0.21.2
