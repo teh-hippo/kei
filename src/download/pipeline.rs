@@ -455,6 +455,93 @@ async fn adopt_pending_derived_path(
     Some(existing_path)
 }
 
+fn state_path_size_allows_skip(
+    asset: &PhotoAsset,
+    version_size: VersionSizeKey,
+    path: &Path,
+    on_disk_size: u64,
+    expected_size: u64,
+) -> bool {
+    if expected_size > 0 && on_disk_size < expected_size {
+        tracing::warn!(
+            asset_id = %asset.id(),
+            version_size = %version_size.as_str(),
+            path = %path.display(),
+            on_disk_size,
+            expected_size,
+            "State path is smaller than expected; re-downloading instead of skipping"
+        );
+        return false;
+    }
+    true
+}
+
+fn stored_path_matches_current_collision_family(
+    asset_id: &str,
+    derived: &DerivedPath,
+    stored_path: &Path,
+) -> bool {
+    if stored_path.parent() != derived.path.parent() {
+        return false;
+    }
+
+    let current_filename = derived.filename.as_str();
+    let Some(stored_filename) = stored_path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+
+    if filenames_match_ampm_equivalent(stored_filename, current_filename)
+        || filenames_match_ampm_equivalent(
+            stored_filename,
+            &super::paths::add_dedup_suffix(current_filename, derived.size),
+        )
+        || filenames_match_ampm_equivalent(
+            stored_filename,
+            &super::paths::insert_suffix(current_filename, asset_id),
+        )
+    {
+        return true;
+    }
+
+    let Some((current_stem, current_ext)) = current_filename.rsplit_once('.') else {
+        let prefix = format!("{current_filename}-{asset_id}-");
+        if stored_filename
+            .strip_prefix(&prefix)
+            .is_some_and(|ordinal| ordinal.parse::<u64>().is_ok())
+        {
+            return true;
+        }
+        let normalized_prefix = format!(
+            "{}-{asset_id}-",
+            super::paths::normalize_ampm(current_filename)
+        );
+        return super::paths::normalize_ampm(stored_filename)
+            .strip_prefix(&normalized_prefix)
+            .is_some_and(|ordinal| ordinal.parse::<u64>().is_ok());
+    };
+    let Some((stored_stem, stored_ext)) = stored_filename.rsplit_once('.') else {
+        return false;
+    };
+    if stored_ext != current_ext {
+        return false;
+    }
+    let prefix = format!("{current_stem}-{asset_id}-");
+    if stored_stem
+        .strip_prefix(&prefix)
+        .is_some_and(|ordinal| ordinal.parse::<u64>().is_ok())
+    {
+        return true;
+    }
+    let normalized_prefix = format!("{}-{asset_id}-", super::paths::normalize_ampm(current_stem));
+    super::paths::normalize_ampm(stored_stem)
+        .strip_prefix(&normalized_prefix)
+        .is_some_and(|ordinal| ordinal.parse::<u64>().is_ok())
+}
+
+fn filenames_match_ampm_equivalent(a: &str, b: &str) -> bool {
+    a == b || super::paths::normalize_ampm(a) == super::paths::normalize_ampm(b)
+}
+
 fn state_confirmed_current_path_exists(
     ctx: &DownloadContext,
     config: &DownloadConfig,
@@ -464,8 +551,9 @@ fn state_confirmed_current_path_exists(
 ) -> Option<PathBuf> {
     let stored_path =
         ctx.downloaded_local_path(&task.library, &task.asset_id, task.version_size)?;
+    let derived_paths = derive_expected_paths(asset, config);
 
-    for derived in derive_expected_paths(asset, config) {
+    for derived in &derived_paths {
         if derived.version_size != task.version_size {
             continue;
         }
@@ -475,19 +563,37 @@ fn state_confirmed_current_path_exists(
             continue;
         };
         if existing_path == stored_path {
-            if derived.size > 0 && existing_size < derived.size {
-                tracing::warn!(
-                    asset_id = %asset.id(),
-                    version_size = %derived.version_size.as_str(),
-                    path = %existing_path.display(),
-                    on_disk_size = existing_size,
-                    expected_size = derived.size,
-                    "State path is smaller than expected; re-downloading instead of skipping"
-                );
-                return None;
+            if state_path_size_allows_skip(
+                asset,
+                derived.version_size,
+                &existing_path,
+                existing_size,
+                derived.size,
+            ) {
+                return Some(existing_path);
             }
+            return None;
+        }
+    }
+
+    for derived in &derived_paths {
+        if derived.version_size != task.version_size {
+            continue;
+        }
+        if !stored_path_matches_current_collision_family(asset.id(), derived, stored_path) {
+            continue;
+        }
+        let (existing_path, existing_size) = task_planner.existing_path_with_size(stored_path)?;
+        if state_path_size_allows_skip(
+            asset,
+            task.version_size,
+            &existing_path,
+            existing_size,
+            derived.size,
+        ) {
             return Some(existing_path);
         }
+        return None;
     }
 
     None
@@ -3267,10 +3373,7 @@ pub(super) fn log_sync_summary(title: &str, stats: &super::SyncStats) {
             ));
         }
         if stats.skipped.ampm_variant > 0 {
-            reasons.push(format!(
-                "{} live photo variants",
-                stats.skipped.ampm_variant
-            ));
+            reasons.push(format!("{} AM/PM variants", stats.skipped.ampm_variant));
         }
         if stats.skipped.retry_exhausted > 0 {
             reasons.push(format!(
@@ -5837,6 +5940,335 @@ mod tests {
             failed.is_empty(),
             "metadata-mutated downloaded file should remain downloaded, not failed"
         );
+    }
+
+    fn identity_suffixed_path_for(bare_path: &Path, asset_id: &str) -> PathBuf {
+        let filename = bare_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("test path must have a UTF-8 filename");
+        bare_path.with_file_name(crate::download::paths::insert_suffix(filename, asset_id))
+    }
+
+    fn suffixed_collision_asset(id: &str, checksum: &str) -> PhotoAsset {
+        TestPhotoAsset::new(id)
+            .filename("IMG_1816.HEIC")
+            .item_type("public.heic")
+            .orig_file_type("public.heic")
+            .orig_size(1234)
+            .orig_url("https://p01.icloud-content.com/IMG_1816.HEIC")
+            .orig_checksum(checksum)
+            .build()
+    }
+
+    fn suffixed_ampm_collision_asset(id: &str, checksum: &str) -> PhotoAsset {
+        TestPhotoAsset::new(id)
+            .filename("Screenshot 2025-01-14 at 1.40.01\u{202F}PM.PNG")
+            .item_type("public.png")
+            .orig_file_type("public.png")
+            .orig_size(1234)
+            .orig_url("https://p01.icloud-content.com/Screenshot.PNG")
+            .orig_checksum(checksum)
+            .build()
+    }
+
+    /// Regression for #594: a downloaded asset stored at an identity-suffixed
+    /// collision path must be matched by its recorded state path, not only by
+    /// the bare derived path.
+    #[tokio::test]
+    async fn suffixed_downloaded_file_is_on_disk_skipped() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::SqliteStateDb;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+
+        let asset_b = suffixed_collision_asset("SUFFIXED_B", "ck_suffixed_b");
+        let bare_path = crate::download::filter::expected_paths_for(&asset_b, &config)
+            .first()
+            .expect("test asset must derive an expected path")
+            .path
+            .clone();
+        let suffixed_path = identity_suffixed_path_for(&bare_path, asset_b.id());
+        fs::create_dir_all(bare_path.parent().unwrap()).unwrap();
+        fs::write(&bare_path, vec![0u8; 1234]).unwrap();
+        fs::write(&suffixed_path, vec![1u8; 1234]).unwrap();
+
+        let record = crate::test_helpers::TestAssetRecord::new("SUFFIXED_B")
+            .checksum("ck_suffixed_b")
+            .filename("IMG_1816.HEIC")
+            .size(1234)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "SUFFIXED_B",
+            "original",
+            &suffixed_path,
+            "local_checksum_for_suffixed_file",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset_b)]),
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .expect("sync must complete");
+
+        assert_eq!(result.downloaded, 0, "asset must not be re-downloaded");
+        assert_eq!(
+            result.skip_summary.on_disk, 1,
+            "suffixed downloaded file must count as an on-disk skip"
+        );
+        assert!(result.failed.is_empty());
+        assert!(
+            !identity_suffixed_path_for(&bare_path, "SUFFIXED_B-2").exists(),
+            "sync must not create an ordinal duplicate for the same asset"
+        );
+        let failed = db.get_failed().await.unwrap();
+        assert!(failed.is_empty(), "suffixed file should remain downloaded");
+    }
+
+    /// Same state-path family as #594, with the AM/PM whitespace variant that
+    /// import-existing and normal on-disk probes already treat as equivalent.
+    #[tokio::test]
+    async fn ampm_variant_suffixed_downloaded_file_is_on_disk_skipped() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::SqliteStateDb;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path());
+        config.keep_unicode_in_filenames = true;
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+
+        let asset = suffixed_ampm_collision_asset("AMPM_SUFFIXED_B", "ck_ampm_suffixed_b");
+        let bare_path = crate::download::filter::expected_paths_for(&asset, &config)
+            .first()
+            .expect("test asset must derive an expected path")
+            .path
+            .clone();
+        let regular_space_filename = bare_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("test path must have a UTF-8 filename")
+            .replace('\u{202F}', " ");
+        let regular_space_bare_path = bare_path.with_file_name(regular_space_filename);
+        let suffixed_path = identity_suffixed_path_for(&regular_space_bare_path, asset.id());
+        fs::create_dir_all(bare_path.parent().unwrap()).unwrap();
+        fs::write(&suffixed_path, vec![1u8; 1234]).unwrap();
+
+        let record = crate::test_helpers::TestAssetRecord::new("AMPM_SUFFIXED_B")
+            .checksum("ck_ampm_suffixed_b")
+            .filename("Screenshot 2025-01-14 at 1.40.01\u{202F}PM.PNG")
+            .size(1234)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "AMPM_SUFFIXED_B",
+            "original",
+            &suffixed_path,
+            "local_checksum_for_ampm_suffixed_file",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset)]),
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .expect("sync must complete");
+
+        assert_eq!(result.downloaded, 0, "asset must not be re-downloaded");
+        assert_eq!(
+            result.skip_summary.on_disk, 1,
+            "AM/PM-equivalent suffixed file must count as an on-disk skip"
+        );
+        assert!(result.failed.is_empty());
+        let failed = db.get_failed().await.unwrap();
+        assert!(failed.is_empty(), "suffixed file should remain downloaded");
+    }
+
+    /// Same #594 path, but the recorded suffixed file is too small. The
+    /// state-backed skip must not hide local truncation.
+    #[tokio::test]
+    async fn truncated_suffixed_downloaded_file_is_forwarded_not_on_disk_skipped() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::SqliteStateDb;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+
+        let asset_b = suffixed_collision_asset("TRUNCATED_SUFFIXED_B", "ck_truncated_suffixed_b");
+        let bare_path = crate::download::filter::expected_paths_for(&asset_b, &config)
+            .first()
+            .expect("test asset must derive an expected path")
+            .path
+            .clone();
+        let suffixed_path = identity_suffixed_path_for(&bare_path, asset_b.id());
+        fs::create_dir_all(bare_path.parent().unwrap()).unwrap();
+        fs::write(&bare_path, vec![0u8; 1234]).unwrap();
+        fs::write(&suffixed_path, []).unwrap();
+
+        let record = crate::test_helpers::TestAssetRecord::new("TRUNCATED_SUFFIXED_B")
+            .checksum("ck_truncated_suffixed_b")
+            .filename("IMG_1816.HEIC")
+            .size(1234)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "TRUNCATED_SUFFIXED_B",
+            "original",
+            &suffixed_path,
+            "local_checksum_for_truncated_suffixed_file",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset_b)]),
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .expect("sync must complete");
+
+        assert_eq!(
+            result.skip_summary.on_disk, 0,
+            "truncated suffixed file must not be counted as an on-disk skip"
+        );
+        let failed = db.get_failed().await.unwrap();
+        assert_eq!(
+            failed.len(),
+            1,
+            "truncated suffixed file must be forwarded for re-download"
+        );
+        assert_eq!(&*failed[0].id, "TRUNCATED_SUFFIXED_B");
+    }
+
+    /// A state-backed identity-suffixed skip is valid only for the current
+    /// path family. An existing file recorded under an old directory must not
+    /// satisfy a new configured target after path-affecting config drift.
+    #[tokio::test]
+    async fn old_directory_state_path_is_forwarded_not_on_disk_skipped() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::SqliteStateDb;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let old_dir = TempDir::new().unwrap();
+        let new_dir = TempDir::new().unwrap();
+        let mut old_config = DownloadConfig::test_default();
+        old_config.directory = Arc::from(old_dir.path());
+        let old_config = Arc::new(old_config);
+        let mut new_config = DownloadConfig::test_default();
+        new_config.directory = Arc::from(new_dir.path());
+        new_config.state_db = Some(db.clone());
+        let new_config = Arc::new(new_config);
+
+        let asset = suffixed_collision_asset("OLD_DIR_SUFFIXED_B", "ck_old_dir_suffixed_b");
+        let old_bare_path = crate::download::filter::expected_paths_for(&asset, &old_config)
+            .first()
+            .expect("test asset must derive an old expected path")
+            .path
+            .clone();
+        let old_suffixed_path = identity_suffixed_path_for(&old_bare_path, asset.id());
+        fs::create_dir_all(old_bare_path.parent().unwrap()).unwrap();
+        fs::write(&old_suffixed_path, vec![1u8; 1234]).unwrap();
+
+        let new_bare_path = crate::download::filter::expected_paths_for(&asset, &new_config)
+            .first()
+            .expect("test asset must derive a new expected path")
+            .path
+            .clone();
+        assert!(
+            !new_bare_path.exists(),
+            "new configured target must be absent"
+        );
+
+        let record = crate::test_helpers::TestAssetRecord::new("OLD_DIR_SUFFIXED_B")
+            .checksum("ck_old_dir_suffixed_b")
+            .filename("IMG_1816.HEIC")
+            .size(1234)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "OLD_DIR_SUFFIXED_B",
+            "original",
+            &old_suffixed_path,
+            "local_checksum_for_old_suffixed_file",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(asset)]),
+            &new_config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .expect("sync must complete");
+
+        assert_eq!(
+            result.skip_summary.on_disk, 0,
+            "old directory state path must not count as a current on-disk skip"
+        );
+        let failed = db.get_failed().await.unwrap();
+        assert_eq!(
+            failed.len(),
+            1,
+            "missing new target must be forwarded for re-download"
+        );
+        assert_eq!(&*failed[0].id, "OLD_DIR_SUFFIXED_B");
     }
 
     /// Data-sacred regression for state-backed on-disk skips.
