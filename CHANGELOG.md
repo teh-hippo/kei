@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.6] - 2026-06-08
+
+### Added
+
+- Added a public product charter and roadmap, linked from the README, to describe kei's product promise, target users, non-goals, and v0.22 stability priorities. ([#579])
+
+### Fixed
+
+- Files already downloaded at identity-suffixed collision paths are now recognized on later syncs, including AM/PM whitespace variants, so `name-size-dedup-with-suffix` no longer redownloads them as new duplicates. Truncated recorded files still redownload instead of being trusted. ([#595], fixes [#594])
+
+[#579]: https://github.com/rhoopr/kei/pull/579
+[#594]: https://github.com/rhoopr/kei/issues/594
+[#595]: https://github.com/rhoopr/kei/pull/595
+
+---
+
 ## [0.21.5] - 2026-06-07
 
 ### Fixed
