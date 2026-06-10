@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.7] - 2026-06-10
+
+### Fixed
+
+- Fresh iCloud logins now continue when Apple returns HTTP 409 after accepting a valid 2FA code, including the `X-Apple-Edp` response shape reported by affected accounts. Other 409 responses still fail unless the body confirms `securityCode.valid == true`. ([#597], fixes [#596])
+
+[#596]: https://github.com/rhoopr/kei/issues/596
+[#597]: https://github.com/rhoopr/kei/pull/597
+
+---
+
 ## [0.21.6] - 2026-06-08
 
 ### Added
@@ -1517,7 +1528,9 @@ The following Python icloudpd features are not yet available. Links go to tracki
 
 ---
 
-[Unreleased]: https://github.com/rhoopr/kei/compare/v0.21.5...HEAD
+[Unreleased]: https://github.com/rhoopr/kei/compare/v0.21.7...HEAD
+[0.21.7]: https://github.com/rhoopr/kei/compare/v0.21.6...v0.21.7
+[0.21.6]: https://github.com/rhoopr/kei/compare/v0.21.5...v0.21.6
 [0.21.5]: https://github.com/rhoopr/kei/compare/v0.21.4...v0.21.5
 [0.21.4]: https://github.com/rhoopr/kei/compare/v0.21.3...v0.21.4
 [0.21.3]: https://github.com/rhoopr/kei/compare/v0.21.2...v0.21.3
