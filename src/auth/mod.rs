@@ -37,8 +37,23 @@ pub use self::session::SharedSession;
 
 /// Path to the session data file for a given user, without needing a `Session`.
 pub fn session_file_path(cookie_dir: &Path, apple_id: &str) -> PathBuf {
-    let sanitized = session::sanitize_username(apple_id);
-    cookie_dir.join(format!("{sanitized}.session"))
+    auth_file_path(cookie_dir, apple_id, ".session")
+}
+
+/// Path to the validation cache file for a given user.
+pub(crate) fn validation_cache_file_path(cookie_dir: &Path, apple_id: &str) -> PathBuf {
+    auth_file_path(cookie_dir, apple_id, ".cache")
+}
+
+/// Path to the persisted cookie jar for a given user.
+pub(crate) fn cookiejar_file_path(cookie_dir: &Path, apple_id: &str) -> PathBuf {
+    auth_file_path(cookie_dir, apple_id, "")
+}
+
+fn auth_file_path(cookie_dir: &Path, apple_id: &str, suffix: &str) -> PathBuf {
+    let mut filename = session::sanitize_username(apple_id);
+    filename.push_str(suffix);
+    cookie_dir.join(filename)
 }
 
 /// Result of a successful authentication, including the account data payload.
