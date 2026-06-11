@@ -139,8 +139,8 @@ impl MediaType {
     }
 
     /// True for `Photo` and the still-image side of a Live Photo. Used by
-    /// the friendly summary card to bucket the cycle's downloads as
-    /// "photos" vs "videos" without each call site re-spelling the match.
+    /// sync stats to bucket the cycle's downloads as "photos" vs "videos"
+    /// without each call site re-spelling the match.
     pub fn is_photo_like(self) -> bool {
         matches!(self, Self::Photo | Self::LivePhotoImage)
     }
@@ -449,6 +449,20 @@ pub struct SyncRunStats {
     pub enumeration_errors: u64,
     /// Whether the sync was interrupted (shutdown, re-auth, etc.).
     pub interrupted: bool,
+    /// Count-only CloudKit total observed before a reliable full enumeration.
+    /// `None` for incremental, dry-run, recent-limited, or count-error runs.
+    pub api_total_at_start: Option<u64>,
+    /// True when the run aggregated at least one reliable library total and
+    /// at least one library without a comparable total.
+    pub api_total_at_start_partial: bool,
+    /// Number of cross-cycle inventory-drop warnings detected this run.
+    pub inventory_drop_warnings: u64,
+    /// Previous API total for the largest inventory drop.
+    pub inventory_drop_previous_total: Option<u64>,
+    /// Current API total for the largest inventory drop.
+    pub inventory_drop_current_total: Option<u64>,
+    /// Library where the largest inventory drop was observed.
+    pub inventory_drop_library: Option<String>,
 }
 
 /// Summary of the current state database.
@@ -464,10 +478,36 @@ pub struct SyncSummary {
     pub failed: u64,
     /// Total size in bytes of downloaded assets.
     pub downloaded_bytes: u64,
+    /// Time of the newest sync run that is still marked running.
+    pub active_sync_started: Option<DateTime<Utc>>,
+    /// Zones with a live or uncleared full-enumeration progress marker.
+    pub active_enumeration_zones: Vec<String>,
     /// Time of the last completed sync run (if any).
     pub last_sync_completed: Option<DateTime<Utc>>,
     /// Time of the last sync run start (if any).
     pub last_sync_started: Option<DateTime<Utc>>,
+    /// Raw status of the latest sync run.
+    pub last_sync_status: Option<String>,
+    /// Asset failures recorded by the latest sync run.
+    pub last_sync_assets_failed: u64,
+    /// Enumeration errors recorded by the latest sync run.
+    pub last_sync_enumeration_errors: u64,
+    /// Whether the latest sync run was interrupted.
+    pub last_sync_interrupted: bool,
+    /// Latest persisted count-only CloudKit inventory total, if the last run
+    /// had a reliable full-enumeration snapshot.
+    pub last_api_total_at_start: Option<u64>,
+    /// True when `last_api_total_at_start` covers only the libraries that had
+    /// reliable full-enumeration totals.
+    pub last_api_total_at_start_partial: bool,
+    /// Whether the latest run detected a cross-cycle inventory drop.
+    pub last_inventory_drop_detected: bool,
+    /// Previous API total for the latest inventory warning.
+    pub last_inventory_drop_previous_total: Option<u64>,
+    /// Current API total for the latest inventory warning.
+    pub last_inventory_drop_current_total: Option<u64>,
+    /// Library where the latest inventory warning was observed.
+    pub last_inventory_drop_library: Option<String>,
 }
 
 #[cfg(test)]

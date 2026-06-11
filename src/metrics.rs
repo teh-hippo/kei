@@ -429,7 +429,7 @@ impl MetricsHandle {
 
     /// Increment the counter for failed DB summary reads.
     ///
-    /// Call this whenever [`get_summary`](crate::state::StateDb::get_summary)
+    /// Call this whenever [`get_summary`](crate::state::ReportStateStore::get_summary)
     /// returns an error during a metrics update so the failure is visible in
     /// the `/metrics` output rather than only in the log.
     pub(crate) fn record_db_summary_failure(&self) {
@@ -1133,8 +1133,20 @@ mod tests {
             pending,
             failed,
             downloaded_bytes,
+            active_sync_started: None,
+            active_enumeration_zones: Vec::new(),
             last_sync_completed: None,
             last_sync_started: None,
+            last_sync_status: None,
+            last_sync_assets_failed: 0,
+            last_sync_enumeration_errors: 0,
+            last_sync_interrupted: false,
+            last_api_total_at_start: None,
+            last_api_total_at_start_partial: false,
+            last_inventory_drop_detected: false,
+            last_inventory_drop_previous_total: None,
+            last_inventory_drop_current_total: None,
+            last_inventory_drop_library: None,
         }
     }
 
@@ -1244,6 +1256,11 @@ mod tests {
     /// of lock contention.
     #[tokio::test]
     async fn spawn_server_with_staleness_threshold_does_not_panic_inside_runtime() {
+        if crate::test_helpers::skip_if_loopback_bind_blocked(
+            "spawn_server_with_staleness_threshold_does_not_panic_inside_runtime",
+        ) {
+            return;
+        }
         let token = CancellationToken::new();
         // Port 0 lets the OS pick a free ephemeral port.
         let result = spawn_server(
@@ -1266,6 +1283,11 @@ mod tests {
     /// directly against a `State`) cannot see.
     #[tokio::test]
     async fn spawn_server_serves_metrics_and_healthz_over_http() {
+        if crate::test_helpers::skip_if_loopback_bind_blocked(
+            "spawn_server_serves_metrics_and_healthz_over_http",
+        ) {
+            return;
+        }
         let token = CancellationToken::new();
         let (handle, task, addr) = spawn_server(
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),

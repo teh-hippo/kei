@@ -1,8 +1,8 @@
 //! Personality layer: friendly UX wrapping for CLI output.
 //!
-//! Two modes: `Friendly` adds verb-cycling spinners, ETA wording, summary
-//! cards, and curated phase narration. `Off` keeps v0.13 behaviour byte-for-byte
-//! for journals, pipes, JSON consumers, and explicit `--log-level` users.
+//! Two modes: `Friendly` adds terminal progress, short narration, and concise
+//! summaries. `Off` keeps v0.13 behaviour byte-for-byte for journals, pipes,
+//! JSON consumers, and explicit `--log-level` users.
 //!
 //! The gate is a single function (`resolve_mode`) so every consumer sees the
 //! same answer for a given environment. New surfaces should call
@@ -11,17 +11,12 @@
 
 pub mod active_bar;
 pub mod album_divider;
-pub mod bar_render;
-pub mod cycler;
-pub mod format;
 pub mod narration;
-pub mod pace;
-pub mod sparkline;
+pub(crate) mod progress;
+pub(crate) mod progress_card;
 pub mod summary;
-pub mod theme;
 pub mod tracing;
 pub mod tty_echo;
-pub mod verbs;
 
 use std::env;
 use std::io::IsTerminal;
@@ -29,7 +24,7 @@ use std::io::IsTerminal;
 /// Friendly UX mode resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
-    /// Verb cycling, summary card, sign-off, curated phase lines.
+    /// Terminal progress, short narration, and concise summaries.
     Friendly,
     /// v0.13 behaviour: structured tracing with target+timestamp, plain bars.
     #[default]

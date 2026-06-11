@@ -679,6 +679,23 @@ pub async fn authenticate_srp(
 /// After the retry budget is exhausted, the last response is returned as
 /// `Ok`; the caller's status-match sees the lingering 429/5xx and produces
 /// the user-facing `AuthError`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SrpPostErrorClass {
+    Network,
+    Other,
+}
+
+fn classify_srp_post_error(error: &anyhow::Error) -> SrpPostErrorClass {
+    let Some(reqwest_error) = error.downcast_ref::<reqwest::Error>() else {
+        return SrpPostErrorClass::Other;
+    };
+    if reqwest_error.status().is_none() {
+        SrpPostErrorClass::Network
+    } else {
+        SrpPostErrorClass::Other
+    }
+}
+
 async fn srp_post<F>(
     transport: &mut impl SrpTransport,
     step: &'static str,
@@ -721,10 +738,7 @@ where
             }
             Err(e) => {
                 let is_last = attempt + 1 >= total_attempts;
-                let is_network_error = e
-                    .downcast_ref::<reqwest::Error>()
-                    .is_some_and(|r| r.status().is_none());
-                if is_last || !is_network_error {
+                if is_last || classify_srp_post_error(&e) != SrpPostErrorClass::Network {
                     return Err(e);
                 }
                 let delay = AUTH_RETRY_CONFIG.delay_for_retry(attempt);
@@ -923,6 +937,53 @@ mod tests {
             .unwrap_err()
             .downcast::<AuthError>()
             .expect("typed AuthError")
+    }
+
+    fn reqwest_status_error(status: u16) -> anyhow::Error {
+        let response = http::Response::builder()
+            .status(status)
+            .body(Vec::<u8>::new())
+            .expect("response");
+        reqwest::Response::from(response)
+            .error_for_status()
+            .expect_err("status should be an error")
+            .into()
+    }
+
+    #[tokio::test]
+    async fn classify_srp_post_error_detects_statusless_reqwest_error() {
+        let err: anyhow::Error = reqwest::Client::new()
+            .get("http://")
+            .send()
+            .await
+            .expect_err("invalid URL should produce a statusless reqwest error")
+            .into();
+
+        assert_eq!(classify_srp_post_error(&err), SrpPostErrorClass::Network);
+    }
+
+    #[test]
+    fn classify_srp_post_error_treats_status_and_plain_errors_as_other() {
+        let status = reqwest_status_error(503);
+        assert_eq!(classify_srp_post_error(&status), SrpPostErrorClass::Other);
+
+        let plain = anyhow::anyhow!("plain failure");
+        assert_eq!(classify_srp_post_error(&plain), SrpPostErrorClass::Other);
+    }
+
+    #[test]
+    fn classify_srp_post_error_detects_context_wrapped_network_error() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let err: anyhow::Error = rt
+            .block_on(reqwest::Client::new().get("http://").send())
+            .expect_err("invalid URL should produce a statusless reqwest error")
+            .into();
+        let err = err.context("SRP init");
+
+        assert_eq!(classify_srp_post_error(&err), SrpPostErrorClass::Network);
     }
 
     /// 401 at /signin/init is not a bad-password signal — Apple hasn't yet
@@ -1409,7 +1470,7 @@ mod tests {
     /// `FidoNotSupported` error with the key names Apple disclosed.
     #[tokio::test]
     async fn srp_wiremock_fsa_challenge_returns_fido_not_supported() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         Mock::given(method("POST"))
             .and(wm_path("/appleauth/auth/signin/init"))
             .respond_with(ResponseTemplate::new(200).set_body_string(wm_srp_init_body()))
@@ -1461,7 +1522,7 @@ mod tests {
     /// future refactor that over-broadens the detection check.
     #[tokio::test]
     async fn srp_wiremock_ordinary_2fa_passes_through() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         Mock::given(method("POST"))
             .and(wm_path("/appleauth/auth/signin/init"))
             .respond_with(ResponseTemplate::new(200).set_body_string(wm_srp_init_body()))
@@ -1499,7 +1560,7 @@ mod tests {
     /// observed.
     #[tokio::test]
     async fn srp_wiremock_key_names_only_returns_fido_not_supported() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         Mock::given(method("POST"))
             .and(wm_path("/appleauth/auth/signin/init"))
             .respond_with(ResponseTemplate::new(200).set_body_string(wm_srp_init_body()))
@@ -1539,7 +1600,7 @@ mod tests {
     /// "FIDO present".
     #[tokio::test]
     async fn srp_wiremock_unparsable_409_falls_through_to_2fa() {
-        let server = MockServer::start().await;
+        let server = crate::start_wiremock_or_skip!();
         Mock::given(method("POST"))
             .and(wm_path("/appleauth/auth/signin/init"))
             .respond_with(ResponseTemplate::new(200).set_body_string(wm_srp_init_body()))

@@ -276,11 +276,11 @@ pub struct SyncArgs {
 /// running terminal rendering or force friendly mode off.
 #[derive(Parser, Debug, Clone, Default)]
 pub struct FriendlyArgs {
-    /// Use friendly progress UI (default on interactive terminals)
+    /// Use friendly terminal progress and summaries (default on interactive terminals)
     #[arg(
         long,
         overrides_with = "no_friendly",
-        long_help = "Use friendly progress UI (verb-cycling spinners, curated phase narration, summary card, sign-off). \
+        long_help = "Use friendly terminal progress and summaries. \
                      Default: on for plain TTYs, off in service/container/journal contexts and whenever a \
                      machine-output mode (`--only-print-filenames` or TOML report JSON) or an explicit \
                      `--log-level` / `RUST_LOG` is in play. `--friendly` overrides the TOML `[ui] friendly` \
@@ -288,11 +288,11 @@ pub struct FriendlyArgs {
     )]
     pub friendly: bool,
 
-    /// Disable friendly progress UI
+    /// Disable friendly terminal progress and summaries
     #[arg(
         long,
         overrides_with = "friendly",
-        long_help = "Force friendly progress messages off and use the plain tracing output. \
+        long_help = "Force friendly terminal progress and summaries off and use the plain tracing output. \
                      Overrides `--friendly`, the TOML `[ui] friendly` setting, and the auto-detected default. \
                      Use this when piping kei output to a log aggregator on an interactive TTY where \
                      auto-detection would otherwise enable friendly mode."
@@ -316,6 +316,18 @@ pub struct StatusArgs {
     /// Show downloaded assets
     #[arg(long)]
     pub downloaded: bool,
+}
+
+/// Arguments for local diagnostics.
+#[derive(Parser, Debug, Clone)]
+pub struct DoctorArgs {
+    /// Emit a redacted JSON diagnostics report
+    #[arg(long)]
+    pub json: bool,
+
+    /// Include live iCloud checks. The default doctor run is local-only.
+    #[arg(long)]
+    pub live: bool,
 }
 
 /// Arguments for the import-existing command.
@@ -585,6 +597,9 @@ pub enum Command {
     /// Show sync status and database summary
     Status(StatusArgs),
 
+    /// Run redacted local diagnostics for support
+    Doctor(DoctorArgs),
+
     /// Import existing local files into the state database
     ImportExisting(ImportArgs),
 
@@ -592,8 +607,8 @@ pub enum Command {
     Verify(VerifyArgs),
 
     /// Reconcile state database with files on disk: mark assets as
-    /// failed when their local file is missing, so the next sync
-    /// re-downloads them.
+    /// failed when their local file is missing or truncated, so the
+    /// next sync re-downloads them.
     Reconcile(ReconcileArgs),
 
     /// Register kei as a system service (launchd on macOS, systemd on
@@ -847,6 +862,7 @@ fn subcommand_display_name(cmd: &Command) -> &'static str {
         Command::Reset { .. } => "reset",
         Command::Config { .. } => "config",
         Command::Status(_) => "status",
+        Command::Doctor(_) => "doctor",
         Command::ImportExisting(_) => "import-existing",
         Command::Verify(_) => "verify",
         Command::Reconcile(_) => "reconcile",
@@ -1080,6 +1096,7 @@ impl Command {
             Self::Reset { .. }
             | Self::Config { .. }
             | Self::Status(_)
+            | Self::Doctor(_)
             | Self::Verify(_)
             | Self::Reconcile(_)
             | Self::Install(_)

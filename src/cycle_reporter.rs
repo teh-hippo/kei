@@ -18,7 +18,6 @@ use crate::state::{self, ReportStateStore};
 
 /// Stable dependencies and resolved options used by the post-cycle reporter.
 pub(crate) struct CycleReporter<'a, D: ReportStateStore + ?Sized> {
-    username: &'a str,
     watch_mode: bool,
     report_path: Option<&'a Path>,
     run_options: RunOptions,
@@ -35,7 +34,6 @@ where
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CycleReporter")
-            .field("username", &self.username)
             .field("watch_mode", &self.watch_mode)
             .field("report_path", &self.report_path)
             .field("run_options", &self.run_options)
@@ -50,7 +48,6 @@ where
 
 /// Constructor input for [`CycleReporter`].
 pub(crate) struct CycleReporterConfig<'a, D: ReportStateStore + ?Sized> {
-    pub(crate) username: &'a str,
     pub(crate) watch_mode: bool,
     pub(crate) report_path: Option<&'a Path>,
     pub(crate) run_options: RunOptions,
@@ -67,7 +64,6 @@ where
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CycleReporterConfig")
-            .field("username", &self.username)
             .field("watch_mode", &self.watch_mode)
             .field("report_path", &self.report_path)
             .field("run_options", &self.run_options)
@@ -80,13 +76,73 @@ where
     }
 }
 
-/// Facts produced by one sync cycle that reporters may render or persist.
+/// Canonical facts produced by one sync cycle that reporters render or persist.
 #[derive(Debug)]
-pub(crate) struct CycleReportInput<'a> {
+pub(crate) struct CycleFacts<'a> {
     pub(crate) stats: &'a SyncStats,
     pub(crate) failed_count: usize,
-    pub(crate) session_expired: bool,
     pub(crate) elapsed: Duration,
+    pub(crate) status: CycleStatus,
+}
+
+impl<'a> CycleFacts<'a> {
+    pub(crate) fn new(
+        stats: &'a SyncStats,
+        failed_count: usize,
+        session_expired: bool,
+        elapsed: Duration,
+    ) -> Self {
+        Self {
+            stats,
+            failed_count,
+            elapsed,
+            status: classify_cycle(stats, failed_count, session_expired),
+        }
+    }
+}
+
+/// Post-cycle outcome shared by report JSON, health, metrics, friendly output,
+/// and notification rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CycleStatus {
+    Success,
+    Failed,
+    SessionExpired,
+    Interrupted,
+}
+
+impl CycleStatus {
+    pub(crate) const fn as_report_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failed => "partial_failure",
+            Self::SessionExpired => "session_expired",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
+/// Classify the completed sync cycle once for every output surface.
+///
+/// Priority: `session_expired` > `interrupted` > `partial_failure` > `success`.
+///
+/// Session expiration is the actionable operator signal even if some downloads
+/// also failed. Interruption beats partial failure because cancellation can
+/// leave transient per-asset failures from in-flight work.
+pub(crate) fn classify_cycle(
+    stats: &SyncStats,
+    failed_count: usize,
+    session_expired: bool,
+) -> CycleStatus {
+    if session_expired {
+        CycleStatus::SessionExpired
+    } else if stats.interrupted {
+        CycleStatus::Interrupted
+    } else if failed_count > 0 {
+        CycleStatus::Failed
+    } else {
+        CycleStatus::Success
+    }
 }
 
 impl<'a, D> CycleReporter<'a, D>
@@ -95,7 +151,6 @@ where
 {
     pub(crate) fn new(config: CycleReporterConfig<'a, D>) -> Self {
         Self {
-            username: config.username,
             watch_mode: config.watch_mode,
             report_path: config.report_path,
             run_options: config.run_options,
@@ -123,7 +178,7 @@ where
     pub(crate) async fn report_completed_cycle(
         &self,
         health: &mut HealthStatus,
-        input: CycleReportInput<'_>,
+        input: CycleFacts<'_>,
     ) {
         let friendly_summary = self.friendly_summary().await;
         self.report_friendly_output(&input, friendly_summary.as_ref());
@@ -144,7 +199,7 @@ where
             Err(e) => {
                 tracing::debug!(
                     error = %e,
-                    "post-cycle summary unavailable; rendering card without library totals"
+                    "post-cycle summary unavailable; rendering friendly summary without library totals"
                 );
                 None
             }
@@ -153,66 +208,38 @@ where
 
     fn report_friendly_output(
         &self,
-        input: &CycleReportInput<'_>,
+        input: &CycleFacts<'_>,
         library_after_summary: Option<&state::types::SyncSummary>,
     ) {
         let downloaded_u64 = u64::try_from(input.stats.downloaded).unwrap_or(u64::MAX);
-        if let Some(library_after) = library_after_summary {
-            let after = library_after.downloaded_bytes;
-            let before = after.saturating_sub(input.stats.bytes_downloaded);
-            crate::personality::narration::downloaded_phase_to_stderr(
-                self.personality_mode,
-                downloaded_u64,
-                before,
-                after,
-            );
-        }
-        crate::personality::narration::verified_phase_to_stderr(
-            self.personality_mode,
-            downloaded_u64,
-        );
-        if let Some(library_after) = library_after_summary {
-            let stats = input.stats;
-            let card = crate::personality::summary::SummaryCard {
-                photos_new: u64::try_from(stats.photos_downloaded).unwrap_or(u64::MAX),
-                videos_new: u64::try_from(stats.videos_downloaded).unwrap_or(u64::MAX),
-                skipped_total: u64::try_from(stats.skipped.total() - stats.skipped.duplicates)
-                    .unwrap_or(u64::MAX),
-                skipped_already_present: u64::try_from(
-                    stats.skipped.by_state + stats.skipped.on_disk,
-                )
-                .unwrap_or(u64::MAX),
-                failed: u64::try_from(stats.failed).unwrap_or(u64::MAX),
-                elapsed: input.elapsed,
-                bytes_downloaded: stats.bytes_downloaded,
-                library_total_assets: library_after.total_assets,
-                library_total_bytes: library_after.downloaded_bytes,
-            };
-            card.print_to_stderr(self.personality_mode);
-            crate::personality::summary::print_recap_to_stderr(
-                self.personality_mode,
-                &input.stats.recap,
-            );
-        }
-
-        crate::personality::narration::signoff_to_stderr(
-            self.personality_mode,
-            &crate::personality::narration::CycleSummary {
-                downloaded: downloaded_u64,
-                failed: u64::try_from(input.failed_count).unwrap_or(u64::MAX),
-                elapsed: input.elapsed,
-                watch_mode: self.watch_mode,
-            },
-        );
+        let skipped_total = input
+            .stats
+            .skipped
+            .total()
+            .saturating_sub(input.stats.skipped.duplicates);
+        let library_totals =
+            library_after_summary.map(|summary| crate::personality::summary::LibraryTotals {
+                files: summary.downloaded,
+                bytes: summary.downloaded_bytes,
+            });
+        let summary = crate::personality::summary::FinalSummary {
+            downloaded: downloaded_u64,
+            skipped_total: u64::try_from(skipped_total).unwrap_or(u64::MAX),
+            failed: u64::try_from(input.failed_count).unwrap_or(u64::MAX),
+            elapsed: input.elapsed,
+            library_totals,
+        };
+        summary.print_to_stderr(self.personality_mode);
     }
 
-    fn update_health(&self, health: &mut HealthStatus, input: &CycleReportInput<'_>) {
-        if input.session_expired {
-            health.record_failure("session expired");
-        } else if input.failed_count > 0 {
-            health.record_failure(&format!("{} sync failures", input.failed_count));
-        } else {
-            health.record_success();
+    fn update_health(&self, health: &mut HealthStatus, input: &CycleFacts<'_>) {
+        match input.status {
+            CycleStatus::Success => health.record_success(),
+            CycleStatus::Failed => {
+                health.record_failure(&format!("{} sync failures", input.failed_count));
+            }
+            CycleStatus::SessionExpired => health.record_failure("session expired"),
+            CycleStatus::Interrupted => health.record_failure("sync interrupted"),
         }
         health.write(self.health_dir);
     }
@@ -220,13 +247,13 @@ where
     async fn update_metrics(
         &self,
         health: &HealthStatus,
-        input: &CycleReportInput<'_>,
+        input: &CycleFacts<'_>,
         friendly_summary: Option<&state::types::SyncSummary>,
     ) {
         let Some(handle) = self.metrics_handle else {
             return;
         };
-        if input.session_expired {
+        if input.status == CycleStatus::SessionExpired {
             handle.record_session_expiration();
         }
         handle.update(input.stats, health).await;
@@ -249,21 +276,16 @@ where
         }
     }
 
-    async fn write_json_report(&self, input: &CycleReportInput<'_>) {
+    async fn write_json_report(&self, input: &CycleFacts<'_>) {
         let Some(report_path) = self.report_path else {
             return;
         };
-        let status = report::sync_status_str(
-            input.session_expired,
-            input.stats.interrupted,
-            input.failed_count,
-        );
         let (failed_assets, failed_assets_truncated) = self.failed_asset_sample().await;
         let report = report::SyncReport {
             version: "2",
             kei_version: env!("CARGO_PKG_VERSION"),
             timestamp: chrono::Utc::now().to_rfc3339(),
-            status: status.to_string(),
+            status: input.status.as_report_str().to_string(),
             options: self.run_options.clone(),
             stats: input.stats.clone(),
             failed_assets,
@@ -311,25 +333,31 @@ where
         }
     }
 
-    fn notify_cycle_outcome(&self, input: &CycleReportInput<'_>) {
-        if input.session_expired {
-            return;
-        }
-        let data = notifications::SyncNotificationData::from(input.stats);
-        if input.failed_count > 0 {
-            self.notifier.notify(
-                notifications::Event::SyncFailed,
-                &format!("{} sync failures", input.failed_count),
-                self.username,
-                Some(&data),
-            );
-        } else {
-            self.notifier.notify(
+    fn notify_cycle_outcome(&self, input: &CycleFacts<'_>) {
+        let notification_data = notifications::SyncNotificationData::from(input.stats);
+        match input.status {
+            CycleStatus::Success => self.notifier.notify(
                 notifications::Event::SyncComplete,
                 "Sync completed successfully",
-                self.username,
-                Some(&data),
-            );
+                &self.run_options.username,
+                Some(&notification_data),
+                self.report_path,
+            ),
+            CycleStatus::Failed => self.notifier.notify(
+                notifications::Event::SyncFailed,
+                &format!("{} sync failures", input.failed_count),
+                &self.run_options.username,
+                Some(&notification_data),
+                self.report_path,
+            ),
+            CycleStatus::Interrupted => self.notifier.notify(
+                notifications::Event::SyncFailed,
+                "Sync interrupted",
+                &self.run_options.username,
+                Some(&notification_data),
+                self.report_path,
+            ),
+            CycleStatus::SessionExpired => {}
         }
     }
 }
@@ -370,7 +398,6 @@ mod tests {
         metrics_handle: Option<&'a MetricsHandle>,
     ) -> CycleReporter<'a, state::SqliteStateDb> {
         CycleReporter::new(CycleReporterConfig {
-            username: "reporter@example.com",
             watch_mode: false,
             report_path,
             run_options: run_options(),
@@ -415,6 +442,52 @@ mod tests {
         serde_json::from_str(&contents).unwrap()
     }
 
+    #[test]
+    fn classify_cycle_zero_assets_no_failures_is_success() {
+        assert_eq!(
+            classify_cycle(&SyncStats::default(), 0, false),
+            CycleStatus::Success
+        );
+    }
+
+    #[test]
+    fn classify_cycle_any_failure_is_failed() {
+        assert_eq!(
+            classify_cycle(&SyncStats::default(), 1, false),
+            CycleStatus::Failed
+        );
+        assert_eq!(
+            classify_cycle(&SyncStats::default(), 999, false),
+            CycleStatus::Failed
+        );
+    }
+
+    #[test]
+    fn classify_cycle_session_expired_dominates_failure_count() {
+        assert_eq!(
+            classify_cycle(&SyncStats::default(), 42, true),
+            CycleStatus::SessionExpired
+        );
+    }
+
+    #[test]
+    fn classify_cycle_interrupted_beats_partial_failure() {
+        let stats = SyncStats {
+            interrupted: true,
+            ..SyncStats::default()
+        };
+        assert_eq!(classify_cycle(&stats, 5, false), CycleStatus::Interrupted);
+    }
+
+    #[test]
+    fn classify_cycle_session_expired_beats_interrupted() {
+        let stats = SyncStats {
+            interrupted: true,
+            ..SyncStats::default()
+        };
+        assert_eq!(classify_cycle(&stats, 7, true), CycleStatus::SessionExpired);
+    }
+
     #[cfg(unix)]
     fn shell_quote(path: &Path) -> String {
         format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
@@ -425,7 +498,7 @@ mod tests {
         let script_path = dir.join("notify.sh");
         let output_path = shell_quote(output_path);
         let body = format!(
-            "#!/bin/sh\nprintf '%s|%s|%s|%s|%s|%s|%s\\n' \"$KEI_EVENT\" \"$KEI_MESSAGE\" \"$KEI_FAILED\" \"$KEI_ENUMERATION_ERRORS\" \"$KEI_PAGINATION_SHORTFALL_WARNINGS\" \"$KEI_SYNC_TOKEN_BLOCKED\" \"${{KEI_SYNC_TOKEN_BLOCK_REASON:-}}\" > {output_path}\n"
+            "#!/bin/sh\nprintf '%s|%s|%s|%s|%s|%s\\n' \"$KEI_EVENT\" \"$KEI_MESSAGE\" \"$KEI_ICLOUD_USERNAME\" \"${{KEI_DOWNLOADED:-}}\" \"${{KEI_FAILED:-}}\" \"${{KEI_REPORT_JSON:-}}\" > {output_path}\n"
         );
         std::fs::write(&script_path, body).unwrap();
         script_path
@@ -473,12 +546,7 @@ mod tests {
         reporter
             .report_completed_cycle(
                 health,
-                CycleReportInput {
-                    stats,
-                    failed_count,
-                    session_expired,
-                    elapsed: Duration::from_secs(7),
-                },
+                CycleFacts::new(stats, failed_count, session_expired, Duration::from_secs(7)),
             )
             .await;
     }
@@ -670,6 +738,13 @@ mod tests {
                     assets_failed: u64::try_from(case.stats.failed).unwrap(),
                     enumeration_errors: u64::try_from(case.stats.enumeration_errors).unwrap(),
                     interrupted: case.stats.interrupted,
+                    api_total_at_start: case.stats.api_total_at_start,
+                    api_total_at_start_partial: case.stats.api_total_at_start_partial,
+                    inventory_drop_warnings: u64::try_from(case.stats.inventory_drop_warnings)
+                        .unwrap(),
+                    inventory_drop_previous_total: case.stats.inventory_drop_previous_total,
+                    inventory_drop_current_total: case.stats.inventory_drop_current_total,
+                    inventory_drop_library: case.stats.inventory_drop_library.clone(),
                 },
             )
             .await
@@ -790,14 +865,12 @@ mod tests {
 
             let notification = wait_for_notification_output(&notification_output).await;
             let expected_notification = format!(
-                "{}|{}|{}|{}|{}|{}|{}",
+                "{}|{}|reporter@example.com|{}|{}|{}",
                 case.expected_notification,
                 case.expected_notification_message,
+                case.stats.downloaded,
                 case.stats.failed,
-                case.stats.enumeration_errors,
-                case.stats.pagination_shortfall_warnings,
-                case.stats.sync_token_blocked,
-                case.stats.sync_token_blocked_reason.unwrap_or("")
+                report_path.display()
             );
             assert_eq!(
                 notification.trim(),
@@ -928,7 +1001,8 @@ mod tests {
         report_cycle(&reporter, &mut health, &stats, 0, false).await;
 
         let health_json = parse_json(&dir.path().join("health.json"));
-        assert_eq!(health_json["consecutive_failures"], 0);
+        assert_eq!(health_json["consecutive_failures"], 1);
+        assert_eq!(health_json["last_error"], "sync interrupted");
         let report_json = parse_json(&report_path);
         assert_eq!(report_json["status"], "interrupted");
     }

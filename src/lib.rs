@@ -210,7 +210,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RedactingMakeWriter {
 /// `pb.suspend(|| tracing::warn!(...))` while already holding indicatif's
 /// `MultiProgress` write lock - a `println` call from inside the closure
 /// would re-enter that same `RwLock` and deadlock. Narration outside that
-/// context (greeting, sign-off, stop-signal) routes through `println`
+/// context (greeting, final summary, stop-signal) routes through `println`
 /// directly via `personality::active_bar::println_above_bars`.
 pub(crate) struct BarSuspendingStderr;
 
@@ -340,6 +340,38 @@ fn classify_exit_error(e: &anyhow::Error) -> ExitClassification {
     } else {
         ExitClassification::Other
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliParseRenderStream {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CliParseExit<'a> {
+    rendered: &'a str,
+    code: u8,
+    stream: CliParseRenderStream,
+}
+
+/// Classify clap/CLI parser exits before normal runtime error handling.
+///
+/// Help/version are successful parse exits that must print to stdout. Invalid
+/// arguments must preserve clap's stderr routing and concrete exit code. Keep
+/// this separate from [`classify_exit_error`] so CLI parse behavior does not
+/// accidentally fall through to the generic `anyhow` exit classifier.
+fn classify_cli_parse_exit(e: &anyhow::Error) -> Option<CliParseExit<'_>> {
+    let parse_err = e.downcast_ref::<cli::ParseCliError>()?;
+    Some(CliParseExit {
+        rendered: parse_err.rendered(),
+        code: u8::try_from(parse_err.exit_code()).unwrap_or(1),
+        stream: if parse_err.use_stderr() {
+            CliParseRenderStream::Stderr
+        } else {
+            CliParseRenderStream::Stdout
+        },
+    })
 }
 
 #[expect(
@@ -475,8 +507,8 @@ fn make_provider_from_auth(
 }
 
 use commands::{
-    run_config_show, run_import_existing, run_list, run_login, run_password, run_reconcile,
-    run_reset_state, run_reset_sync_token, run_status, run_verify,
+    run_config_show, run_doctor, run_import_existing, run_list, run_login, run_password,
+    run_reconcile, run_reset_state, run_reset_sync_token, run_status, run_verify,
 };
 
 /// Get the database path for a given auth config, merging with TOML defaults.
@@ -597,16 +629,14 @@ pub fn main_inner() -> ExitCode {
     match rt.block_on(run(env_password)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            if let Some(parse_err) = e.downcast_ref::<cli::ParseCliError>() {
+            if let Some(parse_exit) = classify_cli_parse_exit(&e) {
                 #[allow(clippy::print_stdout, reason = "clap routes help/version to stdout")]
                 #[allow(clippy::print_stderr, reason = "clap routes parse failures to stderr")]
-                if parse_err.use_stderr() {
-                    eprint!("{}", parse_err.rendered());
-                } else {
-                    print!("{}", parse_err.rendered());
+                match parse_exit.stream {
+                    CliParseRenderStream::Stdout => print!("{}", parse_exit.rendered),
+                    CliParseRenderStream::Stderr => eprint!("{}", parse_exit.rendered),
                 }
-                let code = u8::try_from(parse_err.exit_code()).unwrap_or(1);
-                return ExitCode::from(code);
+                return ExitCode::from(parse_exit.code);
             }
 
             let classification = classify_exit_error(&e);
@@ -677,7 +707,13 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     let can_auto_create =
         !config_path.exists() && config_path.parent().is_some_and(std::path::Path::is_dir);
     let config_required = config_explicitly_set && !can_auto_create;
-    let mut toml_config = config::load_toml_config(&config_path, config_required)?;
+    let is_doctor_command = matches!(cli.command, Some(cli::Command::Doctor(_)));
+    let (mut toml_config, toml_config_error) =
+        match config::load_toml_config(&config_path, config_required) {
+            Ok(config) => (config, None),
+            Err(e) if is_doctor_command => (None, Some(e.to_string())),
+            Err(e) => return Err(e),
+        };
 
     // Resolve log level: --log-level > --verbose > TOML > default (info).
     // `--verbose` is a friendlier alias for `--log-level info` and is
@@ -798,6 +834,16 @@ async fn run(env_password: Option<String>) -> anyhow::Result<()> {
     let (is_one_shot, pw, sync) = match command {
         Command::Status(args) => {
             return run_status(args, &globals, toml_config.as_ref()).await;
+        }
+        Command::Doctor(args) => {
+            return run_doctor(
+                args,
+                &globals,
+                toml_config.as_ref(),
+                &config_path,
+                toml_config_error,
+            )
+            .await;
         }
         Command::Reset { what } => match what {
             cli::ResetCommand::State { yes } => {
@@ -1459,6 +1505,39 @@ mod tests {
             !c.should_log(),
             "2FA-required must not emit a final error log; that path is the success branch"
         );
+    }
+
+    #[test]
+    fn classify_cli_parse_exit_routes_help_to_stdout_success() {
+        let parse_err = cli::parse_cli_with_sources(["kei", "--help"])
+            .expect_err("help exits through ParseCliError");
+        let e = anyhow::Error::from(parse_err);
+
+        let c = classify_cli_parse_exit(&e).expect("parse error should classify");
+
+        assert_eq!(c.code, 0);
+        assert_eq!(c.stream, CliParseRenderStream::Stdout);
+        assert!(c.rendered.contains("Usage:"));
+    }
+
+    #[test]
+    fn classify_cli_parse_exit_routes_invalid_args_to_stderr() {
+        let parse_err = cli::parse_cli_with_sources(["kei", "--definitely-not-a-real-flag"])
+            .expect_err("invalid arg exits through ParseCliError");
+        let e = anyhow::Error::from(parse_err).context("while parsing startup args");
+
+        let c = classify_cli_parse_exit(&e).expect("context-wrapped parse error should classify");
+
+        assert_eq!(c.code, 2);
+        assert_eq!(c.stream, CliParseRenderStream::Stderr);
+        assert!(c.rendered.contains("definitely-not-a-real-flag"));
+    }
+
+    #[test]
+    fn classify_cli_parse_exit_ignores_non_parse_errors() {
+        let e = anyhow::anyhow!("not a cli parse error");
+
+        assert_eq!(classify_cli_parse_exit(&e), None);
     }
 
     #[test]

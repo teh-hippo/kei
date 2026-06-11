@@ -23,6 +23,7 @@
 #   4  test_shell_*    auto-discovered shell suites       --live
 #   5  live_*          binary smokes (run_live_smokes.sh) --live
 #   5.5  live_import_rehearsal                            --live
+#   opt  live_cross_zone_album when KEI_FULL_TEST_CROSS_ZONE_ALBUM is set --live
 #   6  service_smoke   just service-smoke when supported
 #   opt  real_service_lifecycle when KEI_FULL_TEST_REAL_SERVICE=1 --live
 #   finalize_run + diff_runs on success
@@ -34,6 +35,7 @@
 # Exit code:
 #   0   no failed phases (skips + rate-limited are not failures)
 #   1   first failed phase exits non-zero immediately
+#   64  unsupported local userland (missing GNU-ish helper behavior)
 #   65  another /full-test run is in progress (begin_run refused)
 
 set -euo pipefail
@@ -61,6 +63,9 @@ cleanup_failed_run() {
   exit "$rc"
 }
 trap cleanup_failed_run EXIT
+
+# --- Userland --------------------------------------------------------------
+"$script_dir/check_userland.sh"
 
 # --- Begin -----------------------------------------------------------------
 run_id=$("$script_dir/begin_run.sh") || exit $?
@@ -90,6 +95,8 @@ mkdir -p "$full_tmp_dir"
 export TMPDIR="$full_tmp_dir"
 export TEMP="$full_tmp_dir"
 export TMP="$full_tmp_dir"
+export KEI_TEST_SCRATCH_DIR="${KEI_TEST_SCRATCH_DIR:-$full_tmp_dir/shell}"
+mkdir -p "$KEI_TEST_SCRATCH_DIR"
 
 tp() { "$script_dir/time_phase.sh" "$@"; }
 run_phase() {
@@ -151,7 +158,7 @@ run_phase docker_multiarch -- just docker multiarch
 # --- Phase 2 (cont.): docker smokes ---------------------------------------
 run_phase docker_version       -- docker run --rm "$KEI_DOCKER_IMAGE" --version
 run_phase docker_help          -- docker run --rm "$KEI_DOCKER_IMAGE" --help
-run_phase docker_default_cmd   -- bash -c "timeout 8 docker run --rm -e ICLOUD_USERNAME=dummy@example.com $KEI_DOCKER_IMAGE; rc=\$?; [[ \$rc -ne 2 ]]"
+run_phase docker_default_cmd   -- bash -c 'timeout 8 docker run --rm -e ICLOUD_USERNAME=dummy@example.com "$KEI_DOCKER_IMAGE"; rc=$?; [[ $rc -ne 2 ]]'
 
 # --- Phase 3: live cargo --------------------------------------------------
 run_live_phase test_live -- env ICLOUD_TEST_COOKIE_DIR="$ICLOUD_TEST_COOKIE_DIR" just test live
@@ -164,6 +171,9 @@ current_phase="test_shell"
 current_phase="live_smokes"
 "$script_dir/run_live_smokes.sh"
 run_live_phase live_import_rehearsal -- "$script_dir/run_live_import_rehearsal.sh"
+if [[ -n "${KEI_FULL_TEST_CROSS_ZONE_ALBUM:-}" ]]; then
+  run_live_phase live_cross_zone_album -- "$script_dir/run_cross_zone_album_hydration.sh"
+fi
 
 # --- Phase 6: service smoke ------------------------------------------------
 if ! command -v systemd-analyze >/dev/null 2>&1 && ! command -v plutil >/dev/null 2>&1; then

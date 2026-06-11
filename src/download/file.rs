@@ -157,8 +157,7 @@ pub(super) async fn download_file<C: DownloadClient>(
 }
 
 /// Friendly-mode variant of `download_file`. Identical except `mode`
-/// controls the `iCloud hiccup. Retrying in Ns...` / `Back on track.` /
-/// `That one is being stubborn...` narration around retry pauses.
+/// controls retry-pause and retry-recovery narration.
 #[allow(
     clippy::too_many_arguments,
     reason = "mode is a UX gate, not a behavior knob, so folding it into DownloadOpts/DownloadLimits would muddy those types' semantics"
@@ -530,6 +529,7 @@ pub(super) async fn rename_part_to_final(
             Ok(())
         }
         Ok(PublishResult::DestinationExists) => {
+            // CONTRACT: FILE_PUBLISH_NO_OVERWRITE
             // Another task won the race — clean up our .part file.
             tracing::debug!(
                 path = %final_path.display(),
@@ -2850,7 +2850,7 @@ mod tests {
 
         #[tokio::test]
         async fn real_client_retries_on_503_then_succeeds() {
-            let server = MockServer::start().await;
+            let server = crate::start_wiremock_or_skip!();
             let jpeg_body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
 
             Mock::given(method("GET"))
@@ -2878,7 +2878,7 @@ mod tests {
 
         #[tokio::test]
         async fn real_client_retries_on_429_then_succeeds() {
-            let server = MockServer::start().await;
+            let server = crate::start_wiremock_or_skip!();
             let jpeg_body = vec![0xFF, 0xD8, 0xFF, 0xE0];
 
             Mock::given(method("GET"))
@@ -2903,7 +2903,7 @@ mod tests {
 
         #[tokio::test]
         async fn real_client_exhausts_retries_on_persistent_500() {
-            let server = MockServer::start().await;
+            let server = crate::start_wiremock_or_skip!();
 
             Mock::given(method("GET"))
                 .and(path("/broken.jpg"))
@@ -2922,7 +2922,7 @@ mod tests {
 
         #[tokio::test]
         async fn real_client_aborts_on_404_no_retry() {
-            let server = MockServer::start().await;
+            let server = crate::start_wiremock_or_skip!();
 
             Mock::given(method("GET"))
                 .and(path("/missing.jpg"))
@@ -2940,7 +2940,7 @@ mod tests {
 
         #[tokio::test]
         async fn real_client_rejects_html_content_type() {
-            let server = MockServer::start().await;
+            let server = crate::start_wiremock_or_skip!();
 
             Mock::given(method("GET"))
                 .and(path("/error-page.heic"))
@@ -2961,7 +2961,7 @@ mod tests {
 
         #[tokio::test]
         async fn real_client_resume_with_range_header() {
-            let server = MockServer::start().await;
+            let server = crate::start_wiremock_or_skip!();
             let full_body = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
 
             Mock::given(method("GET"))
@@ -3015,7 +3015,7 @@ mod tests {
         /// future refactor that fell through to the rename step.
         #[tokio::test]
         async fn truncated_response_does_not_promote_to_final_path() {
-            let server = MockServer::start().await;
+            let server = crate::start_wiremock_or_skip!();
 
             // Body is 4 bytes of valid JPEG SOI/JFIF signature; we tell
             // the client Content-Length=8 so the post-stream check fires.
@@ -3098,7 +3098,7 @@ mod tests {
         /// ignored ENOENT on the part-open path tells us.
         #[tokio::test]
         async fn download_to_missing_parent_dir_surfaces_error() {
-            let server = MockServer::start().await;
+            let server = crate::start_wiremock_or_skip!();
             let body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0xAA, 0xBB, 0xCC, 0xDD];
 
             Mock::given(method("GET"))
@@ -3170,7 +3170,7 @@ mod tests {
         /// mixed 200-byte file with stale prefix.
         #[tokio::test]
         async fn pre_existing_part_file_replaced_atomically_on_fresh_download() {
-            let server = MockServer::start().await;
+            let server = crate::start_wiremock_or_skip!();
 
             // 200-byte payload starting with JPEG SOI/JFIF signature so
             // content-type sniffing accepts it. The remaining bytes are
@@ -3266,7 +3266,7 @@ mod tests {
             let limit = 64 * 1024u64;
             let expected_secs = body_size as f64 / limit as f64;
 
-            let server = MockServer::start().await;
+            let server = crate::start_wiremock_or_skip!();
             Mock::given(method("GET"))
                 .and(path("/throttle.bin"))
                 .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
@@ -3435,7 +3435,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rename_part_to_final_destination_already_exists() {
+    async fn contract_file_publish_no_overwrite_destination_already_exists() {
         let dir = TempDir::new().unwrap();
         let part = dir.path().join("photo.part");
         let final_path = dir.path().join("photo.jpg");

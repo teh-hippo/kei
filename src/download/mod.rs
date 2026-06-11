@@ -11,6 +11,7 @@ pub(crate) mod finalize;
 pub(crate) mod heif;
 pub(crate) mod limiter;
 pub mod metadata;
+pub(crate) mod metadata_rewrite;
 pub mod paths;
 pub(crate) mod pipeline;
 pub(crate) mod planner;
@@ -28,6 +29,7 @@ pub(crate) use filter::determine_media_type;
 pub(crate) use filter::AssetGroupings;
 use filter::DownloadTask;
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,12 +43,17 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use futures_util::stream::{self, StreamExt};
 use futures_util::Stream;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::icloud::photos::asset::ChangeEvent;
 use crate::icloud::photos::{PhotoAsset, SyncTokenError};
 use crate::retry::RetryConfig;
-use crate::state::{DownloadStateStore, MetadataRewriteStore, StateDb, VersionSizeKey};
+use crate::state::{
+    DownloadStateStore, MembershipStore, MetadataRewriteStore, ReportStateStore, SyncTokenStore,
+    VersionSizeKey,
+};
 use crate::types::{
     AssetVersionSize, ChangeReason, FileMatchPolicy, LivePhotoMode, LivePhotoMovFilenamePolicy,
     RawPolicy,
@@ -77,12 +84,34 @@ pub enum SyncMode {
     },
 }
 
+pub(crate) trait DownloadStore:
+    DownloadStateStore + MembershipStore + MetadataRewriteStore + ReportStateStore + SyncTokenStore
+{
+}
+
+impl<T> DownloadStore for T where
+    T: DownloadStateStore
+        + MembershipStore
+        + MetadataRewriteStore
+        + ReportStateStore
+        + SyncTokenStore
+{
+}
+
 /// Bounded reason vocabulary for full enumeration runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FullEnumerationReason {
     NoStoredToken,
+    #[allow(
+        dead_code,
+        reason = "kept as a stable report vocabulary value for older fallback reports"
+    )]
     RetryFailedRows,
+    #[allow(
+        dead_code,
+        reason = "kept as a stable report vocabulary value for older fallback reports"
+    )]
     PendingRows,
     MetadataBackfill,
     #[allow(
@@ -120,6 +149,47 @@ impl FullEnumerationReason {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IncrementalErrorClass {
+    TokenFallback,
+    TransientFailure,
+    StaticFallback,
+}
+
+/// Classify incremental-enumeration failures before deciding whether to fall
+/// back to a full records/query pass.
+///
+/// Token errors that CloudKit explicitly marks unsafe fall back to full
+/// enumeration. Auth and transport transients bubble up because a full pass
+/// would likely hit the same service condition. Other static/decode errors
+/// fall back so malformed token responses do not strand the user.
+fn classify_incremental_error(error: &anyhow::Error) -> IncrementalErrorClass {
+    if error
+        .downcast_ref::<SyncTokenError>()
+        .is_some_and(SyncTokenError::should_fallback_to_full)
+    {
+        return IncrementalErrorClass::TokenFallback;
+    }
+    if error
+        .downcast_ref::<crate::auth::error::AuthError>()
+        .is_some()
+        || error
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(is_transient_reqwest_error)
+    {
+        return IncrementalErrorClass::TransientFailure;
+    }
+    IncrementalErrorClass::StaticFallback
+}
+
+fn is_transient_reqwest_error(error: &reqwest::Error) -> bool {
+    error
+        .status()
+        .is_some_and(|status| status == 429 || status.as_u16() >= 500)
+        || error.is_timeout()
+        || error.is_connect()
+}
+
 /// One-shot runtime behavior for a sync pass.
 ///
 /// Kept outside [`DownloadConfig`] so path/filter/download decisions do not
@@ -148,7 +218,7 @@ impl DownloadRunMode {
 /// Presentation knobs for the download pipeline.
 ///
 /// The core config owns what to download. This owns how progress and friendly
-/// narration are shown while that work runs.
+/// retry narration are shown while that work runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DownloadReporting {
     pub(crate) no_progress_bar: bool,
@@ -216,6 +286,10 @@ pub struct SyncResult {
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct SyncStats {
     pub assets_seen: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_total_at_start: Option<u64>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub api_total_at_start_partial: bool,
     pub downloaded: usize,
     pub failed: usize,
     pub skipped: SkipBreakdown,
@@ -242,6 +316,22 @@ pub struct SyncStats {
     /// True when the asset producer stopped before naturally exhausting the
     /// iCloud stream for a reason other than an external interrupt.
     pub enumeration_incomplete: bool,
+    /// Number of cross-cycle inventory-drop warnings observed.
+    pub inventory_drop_warnings: usize,
+    /// Largest cross-cycle API inventory drop observed.
+    pub inventory_drop_assets: u64,
+    /// Drop percentage for the largest cross-cycle inventory warning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_drop_percent: Option<f64>,
+    /// Previous API total for the largest cross-cycle inventory warning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_drop_previous_total: Option<u64>,
+    /// Current API total for the largest cross-cycle inventory warning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_drop_current_total: Option<u64>,
+    /// Library where the largest cross-cycle inventory warning occurred.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_drop_library: Option<String>,
     /// Whether sync-token advancement was blocked for safety despite no
     /// download failure.
     pub sync_token_blocked: bool,
@@ -330,6 +420,17 @@ impl SyncStats {
     /// syncs.
     pub fn accumulate(&mut self, other: &SyncStats) {
         self.assets_seen += other.assets_seen;
+        let had_api_total = self.api_total_at_start.is_some();
+        let other_has_api_total = other.api_total_at_start.is_some();
+        self.api_total_at_start = match (self.api_total_at_start, other.api_total_at_start) {
+            (Some(a), Some(b)) => Some(a.saturating_add(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        self.api_total_at_start_partial = self.api_total_at_start_partial
+            || other.api_total_at_start_partial
+            || (had_api_total != other_has_api_total && self.api_total_at_start.is_some());
         self.downloaded += other.downloaded;
         self.failed += other.failed;
         self.skipped.accumulate(&other.skipped);
@@ -343,6 +444,14 @@ impl SyncStats {
         self.pagination_shortfall_warnings += other.pagination_shortfall_warnings;
         self.pagination_shortfall_assets += other.pagination_shortfall_assets;
         self.enumeration_incomplete = self.enumeration_incomplete || other.enumeration_incomplete;
+        self.inventory_drop_warnings += other.inventory_drop_warnings;
+        if other.inventory_drop_assets > self.inventory_drop_assets {
+            self.inventory_drop_assets = other.inventory_drop_assets;
+            self.inventory_drop_percent = other.inventory_drop_percent;
+            self.inventory_drop_previous_total = other.inventory_drop_previous_total;
+            self.inventory_drop_current_total = other.inventory_drop_current_total;
+            self.inventory_drop_library = other.inventory_drop_library.clone();
+        }
         self.sync_token_blocked = self.sync_token_blocked || other.sync_token_blocked;
         if self.sync_token_blocked_reason.is_none() {
             self.sync_token_blocked_reason = other.sync_token_blocked_reason;
@@ -386,6 +495,10 @@ impl SyncStats {
     }
 }
 
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 const ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON: &str = "album_relation_hydration_incomplete";
 const DATE_BOUNDED_FULL_ENUMERATION_REASON: &str = "date_bounded_full_enumeration";
 const RECENT_LIMITED_FULL_ENUMERATION_REASON: &str = "recent_limited_full_enumeration";
@@ -399,6 +512,7 @@ const INCREMENTAL_HIDDEN_STATE_WRITE_FAILED_REASON: &str = "incremental_hidden_s
 const INCREMENTAL_HIDDEN_ZERO_ROWS_REASON: &str = "incremental_hidden_no_matching_state";
 const SMART_FOLDER_REFRESH_FAILED_REASON: &str = "smart_folder_refresh_failed";
 const TARGETED_ALBUM_BACKFILL_FAILED_REASON: &str = "targeted_album_backfill_failed";
+const PENDING_RETRY_UNMATCHED_REASON: &str = "pending_retry_unmatched";
 const ICLOUD_ALBUM_COUNT_ERROR_REASON: &str = "icloud_album_count_error";
 pub(super) const PRODUCER_ENUMERATION_INCOMPLETE_REASON: &str = "producer_enumeration_incomplete";
 
@@ -413,7 +527,8 @@ pub(crate) fn sync_token_blocked_source(reason: &str) -> &'static str {
         | PRODUCER_ENUMERATION_INCOMPLETE_REASON
         | RECENT_LIMITED_FULL_ENUMERATION_REASON
         | SMART_FOLDER_REFRESH_FAILED_REASON
-        | TARGETED_ALBUM_BACKFILL_FAILED_REASON => "kei",
+        | TARGETED_ALBUM_BACKFILL_FAILED_REASON
+        | PENDING_RETRY_UNMATCHED_REASON => "kei",
         INCREMENTAL_DELETE_ZERO_ROWS_REASON
         | INCREMENTAL_HIDDEN_ZERO_ROWS_REASON
         | ICLOUD_ALBUM_COUNT_ERROR_REASON
@@ -499,6 +614,9 @@ pub(crate) fn sync_token_blocked_explanation(reason: &str) -> &'static str {
         }
         TARGETED_ALBUM_BACKFILL_FAILED_REASON => {
             "a targeted album backfill did not complete safely"
+        }
+        PENDING_RETRY_UNMATCHED_REASON => {
+            "kei could not refresh every pending retry target, so token advancement stayed blocked"
         }
         "sync_token_unavailable" | "sync_token_missing" => {
             "no usable sync token was available at the end of the cycle"
@@ -702,6 +820,138 @@ fn hash_shared_fields(hasher: &mut sha2::Sha256, f: &SharedHashFields<'_>) {
     }
 }
 
+fn selector_set_fingerprint_json(set: &BTreeSet<String>) -> serde_json::Value {
+    let values: Vec<&str> = set.iter().map(String::as_str).collect();
+    serde_json::json!(values)
+}
+
+fn album_selector_fingerprint_json(
+    selector: &crate::selection::AlbumSelector,
+) -> serde_json::Value {
+    use crate::selection::AlbumSelector;
+    match selector {
+        AlbumSelector::None => serde_json::json!({"kind": "none"}),
+        AlbumSelector::All { excluded } => {
+            serde_json::json!({"kind": "all", "excluded": selector_set_fingerprint_json(excluded)})
+        }
+        AlbumSelector::Named { included, excluded } => serde_json::json!({
+            "kind": "named",
+            "included": selector_set_fingerprint_json(included),
+            "excluded": selector_set_fingerprint_json(excluded),
+        }),
+    }
+}
+
+fn smart_folder_selector_fingerprint_json(
+    selector: &crate::selection::SmartFolderSelector,
+) -> serde_json::Value {
+    use crate::selection::SmartFolderSelector;
+    match selector {
+        SmartFolderSelector::None => serde_json::json!({"kind": "none"}),
+        SmartFolderSelector::All {
+            include_sensitive,
+            excluded,
+        } => serde_json::json!({
+            "kind": "all",
+            "include_sensitive": include_sensitive,
+            "excluded": selector_set_fingerprint_json(excluded),
+        }),
+        SmartFolderSelector::Named { included, excluded } => serde_json::json!({
+            "kind": "named",
+            "included": selector_set_fingerprint_json(included),
+            "excluded": selector_set_fingerprint_json(excluded),
+        }),
+    }
+}
+
+fn library_selector_fingerprint_json(
+    selector: &crate::selection::LibrarySelector,
+) -> serde_json::Value {
+    serde_json::json!({
+        "primary": selector.primary,
+        "shared_all": selector.shared_all,
+        "named": selector_set_fingerprint_json(&selector.named),
+        "excluded": selector_set_fingerprint_json(&selector.excluded),
+    })
+}
+
+/// Build the canonical coverage fingerprint stored with scoped
+/// `/changes/database` precheck tokens.
+///
+/// Keep this next to the download and enumeration hash owners because it is
+/// the durable audit shape that combines selection, filter coverage, enum
+/// safety, and path/download eligibility proof.
+pub(crate) fn sync_coverage_fingerprint_json(
+    config: &crate::config::Config,
+    provider: &str,
+    shape_version: i64,
+    selected_zones: &[String],
+    enum_config_hash: &str,
+    download_config_hash: &str,
+) -> anyhow::Result<String> {
+    let skip_created_before = config
+        .filters
+        .skip_created_before
+        .map(|d| d.with_timezone(&chrono::Utc).to_rfc3339());
+    let skip_created_after = config
+        .filters
+        .skip_created_after
+        .map(|d| d.with_timezone(&chrono::Utc).to_rfc3339());
+    let mut filename_exclude: Vec<&str> = config
+        .download
+        .filename_exclude
+        .iter()
+        .map(glob::Pattern::as_str)
+        .collect();
+    filename_exclude.sort_unstable();
+    let coverage = if let Some(count) = config.filters.recent {
+        serde_json::json!({
+            "kind": "bounded-recent-count",
+            "count": count,
+            "recent_scope": config.filters.recent_scope,
+        })
+    } else if skip_created_before.is_some() || skip_created_after.is_some() {
+        serde_json::json!({
+            "kind": "bounded-date-window",
+            "skip_created_before": skip_created_before,
+            "skip_created_after": skip_created_after,
+        })
+    } else {
+        serde_json::json!({"kind": "complete"})
+    };
+
+    serde_json::to_string(&serde_json::json!({
+        "provider": provider,
+        "domain": config.auth.domain.as_str(),
+        "shape_version": shape_version,
+        "selected_zones": selected_zones,
+        "selection": {
+            "albums": album_selector_fingerprint_json(&config.filters.selection.albums),
+            "albums_explicit": config.filters.selection.albums_explicit,
+            "smart_folders": smart_folder_selector_fingerprint_json(&config.filters.selection.smart_folders),
+            "smart_folders_explicit": config.filters.selection.smart_folders_explicit,
+            "libraries": library_selector_fingerprint_json(&config.filters.selection.libraries),
+            "unfiled": config.filters.selection.unfiled,
+        },
+        "filters": {
+            "media": {
+                "photos": config.filters.media.photos,
+                "videos": config.filters.media.videos,
+                "live_photos": config.filters.media.live_photos,
+            },
+            "filename_exclude": filename_exclude,
+            "skip_created_before": skip_created_before,
+            "skip_created_after": skip_created_after,
+            "recent": config.filters.recent,
+            "recent_scope": config.filters.recent_scope,
+        },
+        "coverage": coverage,
+        "enum_config_hash": enum_config_hash,
+        "download_config_hash": download_config_hash,
+    }))
+    .context("serialize sync coverage fingerprint")
+}
+
 /// Compute a deterministic hash of the config fields that affect path resolution.
 ///
 /// When this hash changes between runs, we can't trust the state DB's download
@@ -867,7 +1117,7 @@ pub(crate) struct DownloadConfig {
     /// Temp file suffix for partial downloads (e.g. `.kei-tmp`).
     pub(crate) temp_suffix: Arc<str>,
     /// State database for tracking download progress.
-    pub(crate) state_db: Option<Arc<dyn StateDb>>,
+    pub(crate) state_db: Option<Arc<dyn DownloadStore>>,
     /// When true (retry-failed mode), only download assets already known to the
     /// state DB. Skip new assets discovered from iCloud that were never synced.
     pub(crate) retry_only: bool,
@@ -1301,7 +1551,7 @@ impl DownloadContext {
     /// Load the download context from the state database. All state queries
     /// are independent and run concurrently so sync start doesn't serialize
     /// on round-trip latency across them.
-    async fn load<D>(db: &D, retry_only: bool) -> Self
+    async fn load<D>(db: &D, retry_only: bool, metadata_writes_enabled: bool) -> Self
     where
         D: DownloadStateStore + MetadataRewriteStore + ?Sized,
     {
@@ -1343,10 +1593,14 @@ impl DownloadContext {
                     })
             },
             async {
-                db.get_metadata_retry_markers().await.unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "Failed to load metadata retry markers from state DB");
+                if metadata_writes_enabled {
+                    db.get_metadata_retry_markers().await.unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "Failed to load metadata retry markers from state DB");
+                        Default::default()
+                    })
+                } else {
                     Default::default()
-                })
+                }
             },
             async {
                 db.get_pending().await.unwrap_or_else(|e| {
@@ -1629,7 +1883,8 @@ fn count_value_map_entries(map: &LibraryAssetVersionValueMap) -> usize {
 async fn preload_download_context(config: &DownloadConfig) -> Arc<DownloadContext> {
     let download_ctx = if let Some(db) = &config.state_db {
         tracing::debug!("Pre-loading download state from database");
-        DownloadContext::load(db.as_ref(), config.retry_only).await
+        let metadata_writes_enabled = MetadataFlags::from(config).has_any_write();
+        DownloadContext::load(db.as_ref(), config.retry_only, metadata_writes_enabled).await
     } else {
         DownloadContext::default()
     };
@@ -2094,7 +2349,7 @@ struct FullPassStreamOptions {
 
 #[derive(Clone)]
 struct AlbumSnapshotRecorder {
-    db: Arc<dyn StateDb>,
+    db: Arc<dyn DownloadStore>,
     library: Arc<str>,
     container_id: Arc<str>,
     generation: i64,
@@ -2103,7 +2358,7 @@ struct AlbumSnapshotRecorder {
 
 impl AlbumSnapshotRecorder {
     async fn start_for_pass(
-        db: Option<Arc<dyn StateDb>>,
+        db: Option<Arc<dyn DownloadStore>>,
         pass: &crate::commands::AlbumPass,
         enum_config_hash: Option<&str>,
     ) -> Option<Self> {
@@ -2387,12 +2642,14 @@ where
     // user per-album awareness; the divider's done lines accumulate
     // in scrollback so completed albums don't disappear.
     let pass_start = Instant::now();
-    let (pass_pb, pass_bytes) = crate::download::pipeline::create_progress_bar_for_passes(
+    let progress = crate::personality::progress::for_passes(
         options.controls.reporting.no_progress_bar,
         options.controls.run_mode.only_print_filenames(),
         options.count,
         options.controls.reporting.personality_mode,
     );
+    let pass_pb = progress.bar;
+    let pass_bytes = progress.bytes;
 
     let snapshot = options.album_snapshot.clone();
     let stream: DownloadPhotoStream = match snapshot {
@@ -2459,12 +2716,55 @@ struct RetryTaskKey {
     download_path: std::path::PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PendingRetryTarget {
+    library: Arc<str>,
+    asset_id: Arc<str>,
+    version_size: VersionSizeKey,
+}
+
+impl PendingRetryTarget {
+    fn from_record(record: &crate::state::AssetRecord) -> Self {
+        Self {
+            library: Arc::clone(&record.library),
+            asset_id: Arc::from(record.id.as_ref()),
+            version_size: record.version_size,
+        }
+    }
+
+    fn from_task(task: &DownloadTask) -> Self {
+        Self {
+            library: Arc::clone(&task.library),
+            asset_id: Arc::clone(&task.asset_id),
+            version_size: task.version_size,
+        }
+    }
+}
+
 impl From<&DownloadTask> for RetryTaskKey {
     fn from(task: &DownloadTask) -> Self {
         Self {
             asset_id: Arc::clone(&task.asset_id),
             version_size: task.version_size,
             download_path: task.download_path.clone(),
+        }
+    }
+}
+
+fn take_matching_pending_retry_tasks<I>(
+    tasks: I,
+    pending_targets: &mut FxHashSet<PendingRetryTarget>,
+    out: &mut Vec<DownloadTask>,
+) where
+    I: IntoIterator<Item = DownloadTask>,
+{
+    for task in tasks {
+        let target = PendingRetryTarget::from_task(&task);
+        if pending_targets.remove(&target) {
+            out.push(task);
+            if pending_targets.is_empty() {
+                break;
+            }
         }
     }
 }
@@ -2485,6 +2785,79 @@ fn take_matching_retry_tasks<I>(
             }
         }
     }
+}
+
+#[derive(Debug, Default)]
+struct PendingRetryPlan {
+    tasks: Vec<DownloadTask>,
+    unmatched: usize,
+    requested: usize,
+}
+
+async fn build_pending_retry_download_tasks(
+    passes: &[crate::commands::AlbumPass],
+    config: &DownloadConfig,
+    shutdown_token: CancellationToken,
+) -> Result<PendingRetryPlan> {
+    let Some(db) = &config.state_db else {
+        return Ok(PendingRetryPlan::default());
+    };
+
+    let pending = db.get_pending().await?;
+    let mut pending_targets: FxHashSet<PendingRetryTarget> = pending
+        .iter()
+        .filter(|record| record.library.as_ref() == config.library.as_ref())
+        .map(PendingRetryTarget::from_record)
+        .collect();
+    if pending_targets.is_empty() {
+        return Ok(PendingRetryPlan::default());
+    }
+
+    let requested = pending_targets.len();
+    let pass_configs = build_pass_configs_resolving_deferred_excludes(passes, config).await?;
+    let mut tasks: Vec<DownloadTask> = Vec::with_capacity(requested);
+    let mut task_planner = planner::TaskPlanner::new();
+
+    for (pass_index, pass) in passes.iter().enumerate() {
+        if pending_targets.is_empty() || shutdown_token.is_cancelled() {
+            break;
+        }
+
+        let assets = pass.album.photos(config.recent).await?;
+        #[allow(
+            clippy::indexing_slicing,
+            reason = "pass_index comes from enumerate() over `passes`; pass_configs is \
+                      built 1:1 from the same slice"
+        )]
+        let pass_config = &pass_configs[pass_index];
+
+        for asset in &assets {
+            if pending_targets.is_empty() || shutdown_token.is_cancelled() {
+                break;
+            }
+            let plan = task_planner.plan_asset(asset, pass_config).await;
+            if plan.filter_reason.is_some() {
+                continue;
+            }
+            take_matching_pending_retry_tasks(plan.tasks, &mut pending_targets, &mut tasks);
+        }
+    }
+
+    if !pending_targets.is_empty() {
+        tracing::warn!(
+            requested,
+            refreshed = tasks.len(),
+            missing = pending_targets.len(),
+            diagnostic = PENDING_RETRY_UNMATCHED_REASON,
+            "Targeted retry could not refresh every pending asset; blocking sync token advancement"
+        );
+    }
+
+    Ok(PendingRetryPlan {
+        tasks,
+        unmatched: pending_targets.len(),
+        requested,
+    })
 }
 
 /// Eagerly enumerate all albums and build a complete task list.
@@ -2780,7 +3153,7 @@ fn block_sync_token_for_incremental_delta(stats: &mut SyncStats, reason: &'stati
     stats.sync_token_blocked = true;
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IncrementalStateTransition {
     SoftDelete,
     HardDelete,
@@ -2804,20 +3177,39 @@ impl IncrementalStateTransition {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SourceStateTransitionKey<'a> {
+    record_name: &'a str,
+    record_type: Option<&'a str>,
+    unresolved_identity: bool,
+}
+
 fn record_incremental_state_transition_result(
     result: Result<usize, crate::state::error::StateError>,
     transition: IncrementalStateTransition,
-    record_name: &str,
-    record_type: Option<&str>,
+    state_key: SourceStateTransitionKey<'_>,
     state_transition_failures: &mut usize,
     token_unsafe_reason: &mut Option<&'static str>,
 ) {
     match result {
         Ok(updated) if updated > 0 => {}
+        Ok(_)
+            if transition == IncrementalStateTransition::HardDelete
+                && state_key.unresolved_identity =>
+        {
+            *state_transition_failures += 1;
+            token_unsafe_reason.get_or_insert(INCREMENTAL_DELETE_ZERO_ROWS_REASON);
+            tracing::warn!(
+                record_name = state_key.record_name,
+                record_type = state_key.record_type,
+                transition = transition.label(),
+                "Unresolved hard-delete event did not match local state; blocking sync token advancement"
+            );
+        }
         Ok(_) => {
             tracing::debug!(
-                record_name,
-                record_type,
+                record_name = state_key.record_name,
+                record_type = state_key.record_type,
                 transition = transition.label(),
                 "Incremental source-state transition was already absent from state DB"
             );
@@ -2826,7 +3218,7 @@ fn record_incremental_state_transition_result(
             *state_transition_failures += 1;
             token_unsafe_reason.get_or_insert(transition.write_failed_reason());
             tracing::warn!(
-                record_name,
+                record_name = state_key.record_name,
                 error = %e,
                 transition = transition.label(),
                 "Failed to record incremental source-state transition in state DB"
@@ -2835,14 +3227,27 @@ fn record_incremental_state_transition_result(
     }
 }
 
-fn source_state_transition_key(event: &ChangeEvent) -> (&str, Option<&str>) {
+fn source_state_transition_key(event: &ChangeEvent) -> SourceStateTransitionKey<'_> {
     if matches!(event.record_type.as_deref(), Some("CPLAsset")) {
         if let Some(master_record_name) = event.master_record_name.as_deref() {
-            return (master_record_name, Some("CPLMaster"));
+            return SourceStateTransitionKey {
+                record_name: master_record_name,
+                record_type: Some("CPLMaster"),
+                unresolved_identity: false,
+            };
         }
+        return SourceStateTransitionKey {
+            record_name: &event.record_name,
+            record_type: event.record_type.as_deref(),
+            unresolved_identity: true,
+        };
     }
 
-    (&event.record_name, event.record_type.as_deref())
+    SourceStateTransitionKey {
+        record_name: &event.record_name,
+        record_type: event.record_type.as_deref(),
+        unresolved_identity: event.record_type.is_none(),
+    }
 }
 
 fn clear_zone_token_block_from_targeted_backfill_stats(stats: &mut SyncStats) {
@@ -3087,6 +3492,242 @@ async fn download_photos_incremental_with_smart_folder_refresh(
     })
 }
 
+async fn run_pending_retry_pass(
+    download_client: &Client,
+    passes: &[crate::commands::AlbumPass],
+    config: &Arc<DownloadConfig>,
+    controls: DownloadControls,
+    shutdown_token: CancellationToken,
+) -> Result<SyncResult> {
+    let started = Instant::now();
+    let plan = build_pending_retry_download_tasks(passes, config, shutdown_token.clone()).await?;
+    let PendingRetryPlan {
+        tasks,
+        unmatched,
+        requested,
+    } = plan;
+
+    if requested == 0 {
+        return Ok(pending_retry_no_download_result(
+            &started,
+            &shutdown_token,
+            0,
+            0,
+        ));
+    }
+
+    tracing::info!(
+        requested,
+        refreshed = tasks.len(),
+        unmatched,
+        "Retrying pending assets with targeted enumeration"
+    );
+
+    if controls.run_mode.only_print_filenames() {
+        #[allow(
+            clippy::print_stdout,
+            reason = "--only-print-filenames writes target paths to stdout so callers can pipe to xargs/etc"
+        )]
+        for task in &tasks {
+            println!("{}", task.download_path.display());
+        }
+        return Ok(pending_retry_no_download_result(
+            &started,
+            &shutdown_token,
+            unmatched,
+            0,
+        ));
+    }
+
+    if controls.run_mode.is_dry_run() {
+        return Ok(pending_retry_no_download_result(
+            &started,
+            &shutdown_token,
+            unmatched,
+            tasks.len(),
+        ));
+    }
+
+    if tasks.is_empty() {
+        return Ok(pending_retry_no_download_result(
+            &started,
+            &shutdown_token,
+            unmatched,
+            0,
+        ));
+    }
+
+    let task_count = tasks.len();
+    let pass_config = PassConfig {
+        client: download_client,
+        retry_config: &config.retry,
+        metadata: MetadataFlags::from(config.as_ref()),
+        concurrency: config.concurrent_downloads,
+        reporting: controls.reporting,
+        temp_suffix: Arc::clone(&config.temp_suffix),
+        shutdown_token: shutdown_token.clone(),
+        state_db: config.state_db.clone(),
+        rate_limit_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        bandwidth_limiter: config.bandwidth_limiter.clone(),
+        library: Arc::clone(&config.library),
+    };
+    let pass_result = run_download_pass(pass_config, tasks).await;
+    let failed = pass_result.failed.len();
+    if failed > 0 {
+        for task in &pass_result.failed {
+            tracing::error!(asset_id = %task.asset_id, path = %task.download_path.display(), "Targeted retry failed");
+        }
+    }
+
+    let mut stats = SyncStats {
+        downloaded: task_count - failed,
+        failed,
+        bytes_downloaded: pass_result.bytes_downloaded,
+        disk_bytes_written: pass_result.disk_bytes_written,
+        exif_failures: pass_result.exif_failures,
+        state_write_failures: pass_result.state_write_failures,
+        elapsed_secs: started.elapsed().as_secs_f64(),
+        interrupted: shutdown_token.is_cancelled()
+            || pass_result.auth_errors >= AUTH_ERROR_THRESHOLD
+            || pass_result.url_expired_abort,
+        rate_limited: pass_result.rate_limit_observations,
+        photos_downloaded: pass_result.photos_downloaded,
+        videos_downloaded: pass_result.videos_downloaded,
+        recap: pass_result.recap.clone(),
+        ..SyncStats::default()
+    };
+    if unmatched > 0 {
+        block_sync_token_for_incremental_delta(&mut stats, PENDING_RETRY_UNMATCHED_REASON);
+    }
+
+    if pass_result.auth_errors >= AUTH_ERROR_THRESHOLD {
+        return Ok(SyncResult {
+            outcome: DownloadOutcome::SessionExpired {
+                auth_error_count: pass_result.auth_errors,
+            },
+            sync_token: None,
+            stats,
+            full_enumeration_ran: false,
+        });
+    }
+
+    let failed_count =
+        failed + unmatched + pass_result.exif_failures + pass_result.state_write_failures;
+    Ok(SyncResult {
+        outcome: if failed_count > 0 {
+            DownloadOutcome::PartialFailure { failed_count }
+        } else {
+            DownloadOutcome::Success
+        },
+        sync_token: None,
+        stats,
+        full_enumeration_ran: false,
+    })
+}
+
+fn pending_retry_no_download_result(
+    started: &Instant,
+    shutdown_token: &CancellationToken,
+    unmatched: usize,
+    downloaded: usize,
+) -> SyncResult {
+    let mut stats = SyncStats {
+        downloaded,
+        elapsed_secs: started.elapsed().as_secs_f64(),
+        interrupted: shutdown_token.is_cancelled(),
+        ..SyncStats::default()
+    };
+    if unmatched > 0 {
+        block_sync_token_for_incremental_delta(&mut stats, PENDING_RETRY_UNMATCHED_REASON);
+    }
+    SyncResult {
+        outcome: if unmatched > 0 {
+            DownloadOutcome::PartialFailure {
+                failed_count: unmatched,
+            }
+        } else {
+            DownloadOutcome::Success
+        },
+        sync_token: None,
+        stats,
+        full_enumeration_ran: false,
+    }
+}
+
+async fn append_pending_retry_to_incremental_result(
+    download_client: &Client,
+    passes: &[crate::commands::AlbumPass],
+    config: &Arc<DownloadConfig>,
+    controls: DownloadControls,
+    shutdown_token: CancellationToken,
+    pending_at_start: u64,
+    incremental_result: SyncResult,
+) -> Result<SyncResult> {
+    if pending_at_start == 0
+        || !matches!(incremental_result.outcome, DownloadOutcome::Success)
+        || incremental_result.stats.interrupted
+        || shutdown_token.is_cancelled()
+    {
+        return Ok(incremental_result);
+    }
+
+    let retry_result = match run_pending_retry_pass(
+        download_client,
+        passes,
+        config,
+        controls,
+        shutdown_token.clone(),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            let mut stats = SyncStats {
+                elapsed_secs: 0.0,
+                ..SyncStats::default()
+            };
+            block_sync_token_for_incremental_delta(&mut stats, PENDING_RETRY_UNMATCHED_REASON);
+            tracing::warn!(
+                error = %e,
+                diagnostic = PENDING_RETRY_UNMATCHED_REASON,
+                "Targeted pending retry failed before downloads; blocking sync token advancement"
+            );
+            SyncResult {
+                outcome: DownloadOutcome::PartialFailure { failed_count: 1 },
+                sync_token: None,
+                stats,
+                full_enumeration_ran: false,
+            }
+        }
+    };
+
+    let SyncResult {
+        outcome: incremental_outcome,
+        sync_token: incremental_sync_token,
+        stats: mut combined_stats,
+        full_enumeration_ran: incremental_full_enumeration_ran,
+    } = incremental_result;
+    let outcome = merge_download_outcomes(&incremental_outcome, &retry_result.outcome);
+    combined_stats.accumulate(&retry_result.stats);
+    let sync_token = if matches!(outcome, DownloadOutcome::Success)
+        && !combined_stats.sync_token_blocked
+        && !combined_stats.interrupted
+        && !controls.run_mode.is_dry_run()
+        && !controls.run_mode.only_print_filenames()
+    {
+        incremental_sync_token
+    } else {
+        None
+    };
+
+    Ok(SyncResult {
+        outcome,
+        sync_token,
+        stats: combined_stats,
+        full_enumeration_ran: incremental_full_enumeration_ran || retry_result.full_enumeration_ran,
+    })
+}
+
 pub async fn download_photos_with_sync(
     download_client: &Client,
     passes: &[crate::commands::AlbumPass],
@@ -3100,7 +3741,7 @@ pub async fn download_photos_with_sync(
     // Give every non-downloaded asset a fresh start this sync:
     // failed -> pending (with attempts reset), and stale attempt counts on
     // pending assets cleared so the per-sync cap starts from zero.
-    let (retry_failed_count, total_pending) = if let Some(db) = &config.state_db {
+    let (_retry_failed_count, total_pending) = if let Some(db) = &config.state_db {
         match db.prepare_for_retry(Some(&config.library)).await {
             Ok((failed, stale, total_pending)) => {
                 if failed > 0 {
@@ -3131,31 +3772,6 @@ pub async fn download_photos_with_sync(
                 &config,
                 controls,
                 shutdown_token.clone(),
-            )
-            .await
-        }
-        // Incremental sync only returns new changes — it won't re-enumerate
-        // pending assets from previous syncs. Fall back to full so they get
-        // retried. Once everything is downloaded, incremental resumes.
-        SyncMode::Incremental { .. } if total_pending > 0 => {
-            let reason = if retry_failed_count > 0 {
-                FullEnumerationReason::RetryFailedRows
-            } else {
-                FullEnumerationReason::PendingRows
-            };
-            tracing::info!(
-                pending = total_pending,
-                failed_reset = retry_failed_count,
-                full_enumeration_reason = reason.as_str(),
-                "Retrying failed/pending assets requires full enumeration, skipping incremental sync"
-            );
-            download_photos_full_with_reason(
-                download_client,
-                passes,
-                &config,
-                controls,
-                shutdown_token.clone(),
-                reason,
             )
             .await
         }
@@ -3201,15 +3817,26 @@ pub async fn download_photos_with_sync(
                         backfill_passes = pass_indices.len(),
                         "Backfilling missing album snapshots before incremental routing"
                     );
-                    download_photos_incremental_with_targeted_album_backfill(
+                    let incremental_result =
+                        download_photos_incremental_with_targeted_album_backfill(
+                            download_client,
+                            passes,
+                            &config,
+                            zone_sync_token,
+                            controls,
+                            shutdown_token.clone(),
+                            &pass_indices,
+                            reason,
+                        )
+                        .await?;
+                    append_pending_retry_to_incremental_result(
                         download_client,
                         passes,
                         &config,
-                        zone_sync_token,
                         controls,
                         shutdown_token.clone(),
-                        &pass_indices,
-                        reason,
+                        total_pending,
+                        incremental_result,
                     )
                     .await
                 }
@@ -3240,27 +3867,21 @@ pub async fn download_photos_with_sync(
                         .await
                     };
                     match incremental_result {
-                        Ok(result) => Ok(result),
-                        Err(e) => {
-                            // Determine whether this error warrants a fallback to full
-                            // enumeration. Token-level errors (invalid, zone not found)
-                            // always trigger fallback. Transient errors (503, network
-                            // timeouts) should NOT — they'd fail again on full enum too.
-                            // Deserialization errors (e.g. Apple returning a different
-                            // JSON shape for an invalid token) are not transient, so
-                            // fall back for those too.
-                            let is_token_error = e
-                                .downcast_ref::<SyncTokenError>()
-                                .is_some_and(SyncTokenError::should_fallback_to_full);
-                            let is_transient =
-                                e.downcast_ref::<crate::auth::error::AuthError>().is_some()
-                                    || e.downcast_ref::<reqwest::Error>().is_some_and(|r| {
-                                        r.status().is_some_and(|s| s == 429 || s.as_u16() >= 500)
-                                            || r.is_timeout()
-                                            || r.is_connect()
-                                    });
-
-                            if is_token_error || !is_transient {
+                        Ok(result) => {
+                            append_pending_retry_to_incremental_result(
+                                download_client,
+                                passes,
+                                &config,
+                                controls,
+                                shutdown_token.clone(),
+                                total_pending,
+                                result,
+                            )
+                            .await
+                        }
+                        Err(e) => match classify_incremental_error(&e) {
+                            IncrementalErrorClass::TokenFallback
+                            | IncrementalErrorClass::StaticFallback => {
                                 let reason = FullEnumerationReason::OtherStaticReason;
                                 tracing::warn!(
                                     error = %e,
@@ -3276,10 +3897,9 @@ pub async fn download_photos_with_sync(
                                     reason,
                                 )
                                 .await
-                            } else {
-                                Err(e)
                             }
-                        }
+                            IncrementalErrorClass::TransientFailure => Err(e),
+                        },
                     }
                 }
             }
@@ -3845,6 +4465,16 @@ async fn download_photos_full_with_token(
     if exact_total.is_some() {
         exact_total = Some(capped_exact_total(&pagination_counts, config.recent));
     }
+    let api_total_at_start = if len_errors == 0
+        && config.recent.is_none()
+        && config.skip_created_before.is_none()
+        && !controls.run_mode.only_print_filenames()
+        && !controls.run_mode.is_dry_run()
+    {
+        exact_total
+    } else {
+        None
+    };
 
     // Check if enumeration saw significantly fewer assets than the API reported.
     // This catches silent pagination truncation, dropped pages, or API hiccups
@@ -4012,6 +4642,7 @@ async fn download_photos_full_with_token(
     stats.pagination_shortfall_warnings = pagination_shortfall_warnings;
     stats.pagination_shortfall_assets = pagination_shortfall_assets;
     stats.count_probe_failures = len_errors;
+    stats.api_total_at_start = api_total_at_start;
     if token_eligible {
         stats.sync_token_expected_receivers = token_expected_receivers;
         stats.sync_token_receivers_with_token = token_receivers_with_token;
@@ -4087,11 +4718,478 @@ async fn download_photos_full_with_token(
     })
 }
 
+#[derive(Debug, Default)]
+struct IncrementalDeltaSummary {
+    sync_token: Option<String>,
+    token_unsafe_reason: Option<&'static str>,
+    created_count: u64,
+    soft_deleted_count: u64,
+    hard_deleted_count: u64,
+    hidden_count: u64,
+    total_events: u64,
+    state_transition_failures: usize,
+}
+
+impl IncrementalDeltaSummary {
+    fn observe_event(&mut self, event: &ChangeEvent) {
+        self.total_events += 1;
+        if let Some(reason) = event.token_unsafe_reason {
+            self.token_unsafe_reason.get_or_insert(reason);
+        }
+    }
+
+    fn remember_asset_mapping(
+        event: &ChangeEvent,
+        asset_to_master: &mut FxHashMap<String, String>,
+    ) {
+        if let Some(asset) = &event.asset {
+            asset_to_master.insert(
+                asset.asset_record_name().to_string(),
+                asset.id().to_string(),
+            );
+        }
+    }
+
+    fn record_created(&mut self) {
+        self.created_count += 1;
+    }
+
+    async fn apply_source_state_event(&mut self, event: &ChangeEvent, config: &DownloadConfig) {
+        match event.reason {
+            ChangeReason::Created => {}
+            ChangeReason::SoftDeleted => {
+                self.soft_deleted_count += 1;
+                tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping soft-deleted record");
+                if let Some(db) = &config.state_db {
+                    let deleted_at = event.asset.as_ref().and_then(|a| a.metadata().deleted_at);
+                    let state_key = source_state_transition_key(event);
+                    let result = db
+                        .mark_soft_deleted_affected(
+                            &config.library,
+                            state_key.record_name,
+                            deleted_at,
+                        )
+                        .await;
+                    record_incremental_state_transition_result(
+                        result,
+                        IncrementalStateTransition::SoftDelete,
+                        state_key,
+                        &mut self.state_transition_failures,
+                        &mut self.token_unsafe_reason,
+                    );
+                }
+            }
+            ChangeReason::HardDeleted => {
+                self.hard_deleted_count += 1;
+                tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping hard-deleted record");
+                if let Some(db) = &config.state_db {
+                    let state_key = source_state_transition_key(event);
+                    let result = db
+                        .mark_soft_deleted_affected(&config.library, state_key.record_name, None)
+                        .await;
+                    record_incremental_state_transition_result(
+                        result,
+                        IncrementalStateTransition::HardDelete,
+                        state_key,
+                        &mut self.state_transition_failures,
+                        &mut self.token_unsafe_reason,
+                    );
+                }
+            }
+            ChangeReason::Hidden => {
+                self.hidden_count += 1;
+                tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping hidden record");
+                if let Some(db) = &config.state_db {
+                    let state_key = source_state_transition_key(event);
+                    let result = db
+                        .mark_hidden_at_source_affected(&config.library, state_key.record_name)
+                        .await;
+                    record_incremental_state_transition_result(
+                        result,
+                        IncrementalStateTransition::Hidden,
+                        state_key,
+                        &mut self.state_transition_failures,
+                        &mut self.token_unsafe_reason,
+                    );
+                }
+            }
+        }
+    }
+
+    fn log_debug(&self) {
+        tracing::debug!(
+            created = self.created_count,
+            soft_deleted = self.soft_deleted_count,
+            hard_deleted = self.hard_deleted_count,
+            hidden = self.hidden_count,
+            "Incremental sync: {} change events",
+            self.total_events,
+        );
+    }
+}
+
+fn single_unfiled_streaming_pass<'a>(
+    passes: &'a [crate::commands::AlbumPass],
+    config: &DownloadConfig,
+    routing: &IncrementalPassRouting,
+) -> Option<&'a crate::commands::AlbumPass> {
+    // Keep relation-sensitive cases on the collecting path: selected albums
+    // need all relation deltas applied before routing created assets, and
+    // `--recent` currently caps after the full delta is known. The unfiled-only
+    // path can stream created assets immediately because album relation deltas
+    // update state for future cycles but do not change this pass's routing.
+    if config.recent.is_some()
+        || routing.has_selected_albums()
+        || routing.unfiled_passes.len() != 1
+        || passes.len() != 1
+    {
+        return None;
+    }
+
+    let index = *routing.unfiled_passes.first()?;
+    passes
+        .get(index)
+        .filter(|pass| pass.kind == crate::commands::PassKind::Unfiled)
+}
+
+async fn apply_incremental_album_delta(
+    event: &ChangeEvent,
+    config: &DownloadConfig,
+    token_unsafe_reason: &mut Option<&'static str>,
+) {
+    let Some(album) = &event.album else {
+        return;
+    };
+    let Some(db) = &config.state_db else {
+        return;
+    };
+    let result = if album.is_deleted {
+        if let Err(e) = db
+            .mark_album_container_deleted(&config.library, &album.container_id)
+            .await
+        {
+            Err(e)
+        } else {
+            db.invalidate_album_membership_snapshot(&config.library, &album.container_id)
+                .await
+        }
+    } else {
+        db.upsert_album_container(
+            &config.library,
+            &album.container_id,
+            &album.album_name,
+            "album",
+        )
+        .await
+    };
+    if let Err(e) = result {
+        tracing::warn!(
+            container_id = %album.container_id,
+            error = %e,
+            "Failed to apply album container delta"
+        );
+        token_unsafe_reason.get_or_insert(ALBUM_DELTA_STATE_WRITE_FAILED_REASON);
+    }
+}
+
+async fn apply_incremental_relation_delta(
+    event: &ChangeEvent,
+    config: &DownloadConfig,
+    routing: &IncrementalPassRouting,
+    planned_album_containers: &FxHashMap<&str, &str>,
+    ensured_planned_containers: &mut FxHashSet<String>,
+    asset_to_master: &FxHashMap<String, String>,
+    token_unsafe_reason: &mut Option<&'static str>,
+) {
+    let Some(relation) = &event.relation else {
+        return;
+    };
+    let Some(db) = &config.state_db else {
+        return;
+    };
+
+    if let Some(album_name) = planned_album_containers.get(relation.container_id.as_ref()) {
+        let container_id = relation.container_id.as_ref();
+        if !ensured_planned_containers.contains(container_id) {
+            match db
+                .upsert_album_container(
+                    &config.library,
+                    &relation.container_id,
+                    album_name,
+                    "album",
+                )
+                .await
+            {
+                Ok(()) => {
+                    ensured_planned_containers.insert(container_id.to_string());
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        container_id = %relation.container_id,
+                        error = %e,
+                        "Failed to upsert planned album container for relation delta"
+                    );
+                    token_unsafe_reason.get_or_insert(ALBUM_DELTA_STATE_WRITE_FAILED_REASON);
+                }
+            }
+        }
+    }
+
+    let container_known = if relation.is_deleted {
+        db.mark_album_membership_deleted(
+            &config.library,
+            &relation.container_id,
+            &relation.asset_record_name,
+        )
+        .await
+    } else {
+        db.upsert_album_membership_delta(
+            &config.library,
+            &relation.container_id,
+            &relation.asset_record_name,
+            asset_to_master
+                .get(relation.asset_record_name.as_ref())
+                .map(String::as_str),
+            "icloud",
+        )
+        .await
+    };
+
+    match container_known {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                container_id = %relation.container_id,
+                asset_record_name = %relation.asset_record_name,
+                "Album relation delta referenced an unknown album container"
+            );
+            token_unsafe_reason.get_or_insert(UNKNOWN_ALBUM_RELATION_CONTAINER_REASON);
+        }
+        Err(e) => {
+            tracing::warn!(
+                container_id = %relation.container_id,
+                asset_record_name = %relation.asset_record_name,
+                error = %e,
+                "Failed to apply album relation delta"
+            );
+            token_unsafe_reason.get_or_insert(ALBUM_DELTA_STATE_WRITE_FAILED_REASON);
+        }
+    }
+
+    if !relation.is_deleted
+        && routing
+            .album_passes_for_container(&relation.container_id)
+            .is_some()
+        && !asset_to_master.contains_key(relation.asset_record_name.as_ref())
+    {
+        tracing::warn!(
+            container_id = %relation.container_id,
+            asset_record_name = %relation.asset_record_name,
+            "Selected album relation add referenced an asset not present in the delta page set"
+        );
+        token_unsafe_reason.get_or_insert(UNKNOWN_ALBUM_RELATION_ASSET_REASON);
+    }
+}
+
+fn stream_incremental_assets_for_single_unfiled_pass(
+    pass: crate::commands::AlbumPass,
+    config: Arc<DownloadConfig>,
+    zone_sync_token: String,
+    shutdown_token: CancellationToken,
+) -> (
+    ReceiverStream<Result<PhotoAsset>>,
+    tokio::task::JoinHandle<Result<IncrementalDeltaSummary>>,
+) {
+    let capacity = config.concurrent_downloads.saturating_mul(2).max(1);
+    let (asset_tx, asset_rx) = mpsc::channel::<Result<PhotoAsset>>(capacity);
+    let (mut change_stream, token_rx) = pass.album.changes_stream(&zone_sync_token);
+    let handle = tokio::spawn(async move {
+        let mut summary = IncrementalDeltaSummary::default();
+        let routing = IncrementalPassRouting::from_passes(&[pass]);
+        let planned_album_containers: FxHashMap<&str, &str> = FxHashMap::default();
+        let mut ensured_planned_containers: FxHashSet<String> = FxHashSet::default();
+        let mut asset_to_master: FxHashMap<String, String> = FxHashMap::default();
+        let mut album_events = Vec::new();
+        let mut relation_events = Vec::new();
+
+        while let Some(result) = change_stream.next().await {
+            if shutdown_token.is_cancelled() {
+                break;
+            }
+            let event = result?;
+            summary.observe_event(&event);
+            IncrementalDeltaSummary::remember_asset_mapping(&event, &mut asset_to_master);
+
+            if event.album.is_some() {
+                album_events.push(event);
+                continue;
+            }
+            if event.relation.is_some() {
+                relation_events.push(event);
+                continue;
+            }
+            if event.token_unsafe_reason.is_some() {
+                continue;
+            }
+
+            match event.reason {
+                ChangeReason::Created => {
+                    summary.record_created();
+                    if let Some(asset) = event.asset {
+                        if asset_tx.send(Ok(asset)).await.is_err() {
+                            return Ok(summary);
+                        }
+                    }
+                }
+                ChangeReason::SoftDeleted | ChangeReason::HardDeleted | ChangeReason::Hidden => {
+                    summary.apply_source_state_event(&event, &config).await;
+                }
+            }
+        }
+
+        for event in &album_events {
+            apply_incremental_album_delta(event, &config, &mut summary.token_unsafe_reason).await;
+        }
+        for event in &relation_events {
+            apply_incremental_relation_delta(
+                event,
+                &config,
+                &routing,
+                &planned_album_containers,
+                &mut ensured_planned_containers,
+                &asset_to_master,
+                &mut summary.token_unsafe_reason,
+            )
+            .await;
+        }
+
+        if let Ok(token) = token_rx.await {
+            summary.sync_token = Some(token);
+        }
+        Ok(summary)
+    });
+
+    (ReceiverStream::new(asset_rx), handle)
+}
+
+async fn download_photos_incremental_streaming(
+    download_client: &Client,
+    pass: &crate::commands::AlbumPass,
+    pass_config: Arc<DownloadConfig>,
+    zone_sync_token: &str,
+    controls: DownloadControls,
+    started: Instant,
+    shutdown_token: CancellationToken,
+) -> Result<SyncResult> {
+    let (asset_stream, delta_handle) = stream_incremental_assets_for_single_unfiled_pass(
+        pass.clone(),
+        Arc::clone(&pass_config),
+        zone_sync_token.to_string(),
+        shutdown_token.clone(),
+    );
+    let streaming_result = match stream_and_download_from_stream(
+        download_client,
+        asset_stream,
+        &pass_config,
+        controls,
+        0,
+        shutdown_token.clone(),
+        StreamRuntime::new(None, None),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            delta_handle.abort();
+            return Err(e);
+        }
+    };
+    let delta_summary = delta_handle
+        .await
+        .context("incremental changes producer task panicked")??;
+
+    delta_summary.log_debug();
+
+    let (mut outcome, mut stats) = build_download_outcome(
+        download_client,
+        std::slice::from_ref(pass),
+        &pass_config,
+        controls,
+        streaming_result,
+        started,
+        shutdown_token.clone(),
+    )
+    .await?;
+
+    stats.state_write_failures += delta_summary.state_transition_failures;
+    stats.interrupted = stats.interrupted || shutdown_token.is_cancelled();
+    if let Some(reason) = delta_summary.token_unsafe_reason {
+        block_sync_token_for_incremental_delta(&mut stats, reason);
+    }
+    if delta_summary.state_transition_failures > 0 {
+        outcome = merge_download_outcomes(
+            &outcome,
+            &DownloadOutcome::PartialFailure {
+                failed_count: delta_summary.state_transition_failures,
+            },
+        );
+    }
+
+    let sync_token = if controls.run_mode.only_print_filenames() || controls.run_mode.is_dry_run() {
+        None
+    } else {
+        (!stats.sync_token_blocked)
+            .then_some(delta_summary.sync_token)
+            .flatten()
+    };
+
+    Ok(SyncResult {
+        outcome,
+        sync_token,
+        stats,
+        full_enumeration_ran: false,
+    })
+}
+
 /// Incremental delta sync via `changes_stream`.
 ///
 /// Fetches `ChangeEvent`s since the given sync token, filters to
 /// downloadable assets, and feeds them through the download pipeline.
 async fn download_photos_incremental(
+    download_client: &Client,
+    passes: &[crate::commands::AlbumPass],
+    config: &Arc<DownloadConfig>,
+    zone_sync_token: &str,
+    controls: DownloadControls,
+    shutdown_token: CancellationToken,
+) -> Result<SyncResult> {
+    let routing = IncrementalPassRouting::from_passes(passes);
+    if let Some(pass) = single_unfiled_streaming_pass(passes, config, &routing) {
+        let pass_config = Arc::new(config.with_pass(pass));
+        return download_photos_incremental_streaming(
+            download_client,
+            pass,
+            pass_config,
+            zone_sync_token,
+            controls,
+            Instant::now(),
+            shutdown_token,
+        )
+        .await;
+    }
+
+    download_photos_incremental_collecting(
+        download_client,
+        passes,
+        config,
+        zone_sync_token,
+        controls,
+        shutdown_token,
+    )
+    .await
+}
+
+async fn download_photos_incremental_collecting(
     download_client: &Client,
     passes: &[crate::commands::AlbumPass],
     config: &Arc<DownloadConfig>,
@@ -4107,13 +5205,7 @@ async fn download_photos_incremental(
     // twice) can be applied downstream.
     let mut downloadable_assets: Vec<(PhotoAsset, usize)> = Vec::new();
     let mut change_events = Vec::new();
-    let mut sync_token: Option<String> = None;
-    let mut created_count = 0u64;
-    let mut soft_deleted_count = 0u64;
-    let mut hard_deleted_count = 0u64;
-    let mut hidden_count = 0u64;
-    let mut total_events = 0u64;
-    let mut state_transition_failures = 0usize;
+    let mut delta_summary = IncrementalDeltaSummary::default();
     let routing = IncrementalPassRouting::from_passes(passes);
     let selected_container_ids = routing.selected_container_refs();
 
@@ -4130,21 +5222,18 @@ async fn download_photos_incremental(
                 break;
             }
             let event = result?;
-            total_events += 1;
+            delta_summary.observe_event(&event);
             change_events.push(event);
         }
 
         if let Ok(token) = token_rx.await {
-            sync_token = Some(token);
+            delta_summary.sync_token = Some(token);
         }
     }
 
-    let mut token_unsafe_reason: Option<&'static str> = None;
-    let mut asset_to_master: FxHashMap<&str, &str> = FxHashMap::default();
+    let mut asset_to_master: FxHashMap<String, String> = FxHashMap::default();
     for event in &change_events {
-        if let Some(asset) = &event.asset {
-            asset_to_master.insert(asset.asset_record_name(), asset.id());
-        }
+        IncrementalDeltaSummary::remember_asset_mapping(event, &mut asset_to_master);
     }
     let planned_album_containers: FxHashMap<&str, &str> = passes
         .iter()
@@ -4155,142 +5244,33 @@ async fn download_photos_incremental(
                 .map(|container_id| (container_id, pass.album.name.as_ref()))
         })
         .collect();
-    let mut ensured_planned_containers: FxHashSet<&str> = FxHashSet::default();
+    let mut ensured_planned_containers: FxHashSet<String> = FxHashSet::default();
 
-    if let Some(db) = &config.state_db {
-        for event in &change_events {
-            let Some(album) = &event.album else {
-                continue;
-            };
-            let result = if album.is_deleted {
-                if let Err(e) = db
-                    .mark_album_container_deleted(&config.library, &album.container_id)
-                    .await
-                {
-                    Err(e)
-                } else {
-                    db.invalidate_album_membership_snapshot(&config.library, &album.container_id)
-                        .await
-                }
-            } else {
-                db.upsert_album_container(
-                    &config.library,
-                    &album.container_id,
-                    &album.album_name,
-                    "album",
-                )
-                .await
-            };
-            if let Err(e) = result {
-                tracing::warn!(
-                    container_id = %album.container_id,
-                    error = %e,
-                    "Failed to apply album container delta"
-                );
-                token_unsafe_reason.get_or_insert(ALBUM_DELTA_STATE_WRITE_FAILED_REASON);
-            }
-        }
-
-        for event in &change_events {
-            let Some(relation) = &event.relation else {
-                continue;
-            };
-            if let Some(album_name) = planned_album_containers.get(relation.container_id.as_ref()) {
-                let container_id = relation.container_id.as_ref();
-                if !ensured_planned_containers.contains(container_id) {
-                    match db
-                        .upsert_album_container(
-                            &config.library,
-                            &relation.container_id,
-                            album_name,
-                            "album",
-                        )
-                        .await
-                    {
-                        Ok(()) => {
-                            ensured_planned_containers.insert(container_id);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                container_id = %relation.container_id,
-                                error = %e,
-                                "Failed to upsert planned album container for relation delta"
-                            );
-                            token_unsafe_reason
-                                .get_or_insert(ALBUM_DELTA_STATE_WRITE_FAILED_REASON);
-                        }
-                    }
-                }
-            }
-
-            let container_known = if relation.is_deleted {
-                db.mark_album_membership_deleted(
-                    &config.library,
-                    &relation.container_id,
-                    &relation.asset_record_name,
-                )
-                .await
-            } else {
-                db.upsert_album_membership_delta(
-                    &config.library,
-                    &relation.container_id,
-                    &relation.asset_record_name,
-                    asset_to_master
-                        .get(relation.asset_record_name.as_ref())
-                        .copied(),
-                    "icloud",
-                )
-                .await
-            };
-
-            match container_known {
-                Ok(true) => {}
-                Ok(false) => {
-                    tracing::warn!(
-                        container_id = %relation.container_id,
-                        asset_record_name = %relation.asset_record_name,
-                        "Album relation delta referenced an unknown album container"
-                    );
-                    token_unsafe_reason.get_or_insert(UNKNOWN_ALBUM_RELATION_CONTAINER_REASON);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        container_id = %relation.container_id,
-                        asset_record_name = %relation.asset_record_name,
-                        error = %e,
-                        "Failed to apply album relation delta"
-                    );
-                    token_unsafe_reason.get_or_insert(ALBUM_DELTA_STATE_WRITE_FAILED_REASON);
-                }
-            }
-
-            if !relation.is_deleted
-                && routing
-                    .album_passes_for_container(&relation.container_id)
-                    .is_some()
-                && !asset_to_master.contains_key(relation.asset_record_name.as_ref())
-            {
-                tracing::warn!(
-                    container_id = %relation.container_id,
-                    asset_record_name = %relation.asset_record_name,
-                    "Selected album relation add referenced an asset not present in the delta page set"
-                );
-                token_unsafe_reason.get_or_insert(UNKNOWN_ALBUM_RELATION_ASSET_REASON);
-            }
-        }
+    for event in &change_events {
+        apply_incremental_album_delta(event, config, &mut delta_summary.token_unsafe_reason).await;
     }
 
     for event in &change_events {
-        if let Some(reason) = event.token_unsafe_reason {
-            token_unsafe_reason.get_or_insert(reason);
-        }
+        apply_incremental_relation_delta(
+            event,
+            config,
+            &routing,
+            &planned_album_containers,
+            &mut ensured_planned_containers,
+            &asset_to_master,
+            &mut delta_summary.token_unsafe_reason,
+        )
+        .await;
+    }
+
+    for event in &change_events {
         if event.album.is_some() || event.relation.is_some() || event.token_unsafe_reason.is_some()
         {
             continue;
         }
         match event.reason {
             ChangeReason::Created => {
-                created_count += 1;
+                delta_summary.record_created();
                 if let Some(asset) = &event.asset {
                     match route_incremental_asset_to_passes(
                         asset,
@@ -4312,90 +5292,29 @@ async fn download_photos_incremental(
                                 error = %e,
                                 "Failed to route incremental asset through album membership state"
                             );
-                            token_unsafe_reason
+                            delta_summary
+                                .token_unsafe_reason
                                 .get_or_insert(ALBUM_RELATION_HYDRATION_INCOMPLETE_REASON);
                         }
                     }
                 }
             }
-            ChangeReason::SoftDeleted => {
-                soft_deleted_count += 1;
-                tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping soft-deleted record");
-                if let Some(db) = &config.state_db {
-                    let deleted_at = event.asset.as_ref().and_then(|a| a.metadata().deleted_at);
-                    let (state_record_name, state_record_type) = source_state_transition_key(event);
-                    let result = db
-                        .mark_soft_deleted_affected(&config.library, state_record_name, deleted_at)
-                        .await;
-                    record_incremental_state_transition_result(
-                        result,
-                        IncrementalStateTransition::SoftDelete,
-                        state_record_name,
-                        state_record_type,
-                        &mut state_transition_failures,
-                        &mut token_unsafe_reason,
-                    );
-                }
-            }
-            ChangeReason::HardDeleted => {
-                hard_deleted_count += 1;
-                tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping hard-deleted record");
-                // CloudKit returns no fields for hard-deleted photo records, so we
-                // can't tell master from asset. Treat as soft-delete in DB
-                // (sets is_deleted=1) - the row stays put so history and
-                // local_path remain queryable.
-                if let Some(db) = &config.state_db {
-                    let (state_record_name, state_record_type) = source_state_transition_key(event);
-                    let result = db
-                        .mark_soft_deleted_affected(&config.library, state_record_name, None)
-                        .await;
-                    record_incremental_state_transition_result(
-                        result,
-                        IncrementalStateTransition::HardDelete,
-                        state_record_name,
-                        state_record_type,
-                        &mut state_transition_failures,
-                        &mut token_unsafe_reason,
-                    );
-                }
-            }
-            ChangeReason::Hidden => {
-                hidden_count += 1;
-                tracing::debug!(record_name = %event.record_name, record_type = ?event.record_type, "Skipping hidden record");
-                if let Some(db) = &config.state_db {
-                    let (state_record_name, state_record_type) = source_state_transition_key(event);
-                    let result = db
-                        .mark_hidden_at_source_affected(&config.library, state_record_name)
-                        .await;
-                    record_incremental_state_transition_result(
-                        result,
-                        IncrementalStateTransition::Hidden,
-                        state_record_name,
-                        state_record_type,
-                        &mut state_transition_failures,
-                        &mut token_unsafe_reason,
-                    );
-                }
+            ChangeReason::SoftDeleted | ChangeReason::HardDeleted | ChangeReason::Hidden => {
+                delta_summary.apply_source_state_event(event, config).await;
             }
         }
     }
 
-    tracing::debug!(
-        created = created_count,
-        soft_deleted = soft_deleted_count,
-        hard_deleted = hard_deleted_count,
-        hidden = hidden_count,
-        "Incremental sync: {total_events} change events",
-    );
+    delta_summary.log_debug();
 
     if downloadable_assets.is_empty() {
         let mut stats = SyncStats {
             elapsed_secs: started.elapsed().as_secs_f64(),
-            state_write_failures: state_transition_failures,
+            state_write_failures: delta_summary.state_transition_failures,
             interrupted: shutdown_token.is_cancelled(),
             ..SyncStats::default()
         };
-        if let Some(reason) = token_unsafe_reason {
+        if let Some(reason) = delta_summary.token_unsafe_reason {
             block_sync_token_for_incremental_delta(&mut stats, reason);
         }
         tracing::info!("No new photos to download from incremental sync");
@@ -4403,12 +5322,14 @@ async fn download_photos_incremental(
         let sync_token = if controls.run_mode.only_print_filenames() {
             None
         } else {
-            (!stats.sync_token_blocked).then_some(sync_token).flatten()
+            (!stats.sync_token_blocked)
+                .then_some(delta_summary.sync_token)
+                .flatten()
         };
         return Ok(SyncResult {
-            outcome: if state_transition_failures > 0 {
+            outcome: if delta_summary.state_transition_failures > 0 {
                 DownloadOutcome::PartialFailure {
-                    failed_count: state_transition_failures,
+                    failed_count: delta_summary.state_transition_failures,
                 }
             } else {
                 DownloadOutcome::Success
@@ -4523,19 +5444,19 @@ async fn download_photos_incremental(
         let mut stats = SyncStats {
             skipped: skip_breakdown,
             enumeration_errors,
-            state_write_failures: state_transition_failures,
+            state_write_failures: delta_summary.state_transition_failures,
             elapsed_secs: started.elapsed().as_secs_f64(),
             interrupted: shutdown_token.is_cancelled(),
             ..SyncStats::default()
         };
-        if let Some(reason) = token_unsafe_reason {
+        if let Some(reason) = delta_summary.token_unsafe_reason {
             block_sync_token_for_incremental_delta(&mut stats, reason);
         }
         tracing::info!("All incremental assets already downloaded or filtered");
         tracing::info!(elapsed = %format_duration(started.elapsed()), "  completed");
-        let outcome = if enumeration_errors > 0 || state_transition_failures > 0 {
+        let outcome = if enumeration_errors > 0 || delta_summary.state_transition_failures > 0 {
             DownloadOutcome::PartialFailure {
-                failed_count: enumeration_errors + state_transition_failures,
+                failed_count: enumeration_errors + delta_summary.state_transition_failures,
             }
         } else {
             DownloadOutcome::Success
@@ -4544,7 +5465,7 @@ async fn download_photos_incremental(
             None
         } else {
             (enumeration_errors == 0 && !stats.sync_token_blocked)
-                .then_some(sync_token)
+                .then_some(delta_summary.sync_token)
                 .flatten()
         };
         return Ok(SyncResult {
@@ -4566,18 +5487,18 @@ async fn download_photos_incremental(
         let mut stats = SyncStats {
             skipped: skip_breakdown,
             enumeration_errors,
-            state_write_failures: state_transition_failures,
+            state_write_failures: delta_summary.state_transition_failures,
             elapsed_secs: started.elapsed().as_secs_f64(),
             ..SyncStats::default()
         };
-        if let Some(reason) = token_unsafe_reason {
+        if let Some(reason) = delta_summary.token_unsafe_reason {
             block_sync_token_for_incremental_delta(&mut stats, reason);
         }
         // Don't advance the sync token — this is a read-only operation.
         return Ok(SyncResult {
-            outcome: if enumeration_errors > 0 || state_transition_failures > 0 {
+            outcome: if enumeration_errors > 0 || delta_summary.state_transition_failures > 0 {
                 DownloadOutcome::PartialFailure {
-                    failed_count: enumeration_errors + state_transition_failures,
+                    failed_count: enumeration_errors + delta_summary.state_transition_failures,
                 }
             } else {
                 DownloadOutcome::Success
@@ -4628,7 +5549,8 @@ async fn download_photos_incremental(
         bytes_downloaded: pass_result.bytes_downloaded,
         disk_bytes_written: pass_result.disk_bytes_written,
         exif_failures: pass_result.exif_failures,
-        state_write_failures: pass_result.state_write_failures + state_transition_failures,
+        state_write_failures: pass_result.state_write_failures
+            + delta_summary.state_transition_failures,
         enumeration_errors,
         pagination_shortfall_warnings: 0,
         pagination_shortfall_assets: 0,
@@ -4644,7 +5566,7 @@ async fn download_photos_incremental(
         recap: pass_result.recap.clone(),
         ..SyncStats::default()
     };
-    if let Some(reason) = token_unsafe_reason {
+    if let Some(reason) = delta_summary.token_unsafe_reason {
         block_sync_token_for_incremental_delta(&mut stats, reason);
     }
     log_sync_summary(
@@ -4657,7 +5579,9 @@ async fn download_photos_incremental(
             outcome: DownloadOutcome::SessionExpired {
                 auth_error_count: pass_result.auth_errors,
             },
-            sync_token: (!stats.sync_token_blocked).then_some(sync_token).flatten(),
+            sync_token: (!stats.sync_token_blocked)
+                .then_some(delta_summary.sync_token)
+                .flatten(),
             stats,
             full_enumeration_ran: false,
         });
@@ -4666,14 +5590,14 @@ async fn download_photos_incremental(
     let outcome = if failed > 0
         || pass_result.exif_failures > 0
         || pass_result.state_write_failures > 0
-        || state_transition_failures > 0
+        || delta_summary.state_transition_failures > 0
         || enumeration_errors > 0
     {
         DownloadOutcome::PartialFailure {
             failed_count: failed
                 + pass_result.exif_failures
                 + pass_result.state_write_failures
-                + state_transition_failures
+                + delta_summary.state_transition_failures
                 + enumeration_errors,
         }
     } else {
@@ -4683,7 +5607,7 @@ async fn download_photos_incremental(
     Ok(SyncResult {
         outcome,
         sync_token: (enumeration_errors == 0 && !stats.sync_token_blocked)
-            .then_some(sync_token)
+            .then_some(delta_summary.sync_token)
             .flatten(),
         stats,
         full_enumeration_ran: false,
@@ -4706,6 +5630,104 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tempfile::TempDir;
     use tokio::time::Duration;
+
+    fn reqwest_status_error(status: u16) -> anyhow::Error {
+        let response = http::Response::builder()
+            .status(status)
+            .body(Vec::<u8>::new())
+            .expect("response");
+        reqwest::Response::from(response)
+            .error_for_status()
+            .expect_err("status should be an error")
+            .into()
+    }
+
+    fn classify_incremental_error_for(error: SyncTokenError) -> IncrementalErrorClass {
+        let error = anyhow::Error::new(error);
+        classify_incremental_error(&error)
+    }
+
+    #[test]
+    fn classify_incremental_error_detects_token_fallback_errors() {
+        assert_eq!(
+            classify_incremental_error_for(SyncTokenError::InvalidToken {
+                reason: "expired".into(),
+            }),
+            IncrementalErrorClass::TokenFallback
+        );
+        assert_eq!(
+            classify_incremental_error_for(SyncTokenError::ZoneNotFound {
+                zone_name: "PrimarySync".into(),
+            }),
+            IncrementalErrorClass::TokenFallback
+        );
+    }
+
+    #[test]
+    fn classify_incremental_error_detects_transient_errors() {
+        let auth_error: anyhow::Error = crate::auth::error::AuthError::ApiError {
+            code: 503,
+            message: "unavailable".into(),
+        }
+        .into();
+        assert_eq!(
+            classify_incremental_error(&auth_error),
+            IncrementalErrorClass::TransientFailure
+        );
+
+        let reqwest_429 = reqwest_status_error(429);
+        assert_eq!(
+            classify_incremental_error(&reqwest_429),
+            IncrementalErrorClass::TransientFailure
+        );
+
+        let reqwest_503 = reqwest_status_error(503);
+        assert_eq!(
+            classify_incremental_error(&reqwest_503),
+            IncrementalErrorClass::TransientFailure
+        );
+    }
+
+    #[test]
+    fn classify_incremental_error_treats_static_and_generic_errors_as_fallback() {
+        assert_eq!(
+            classify_incremental_error_for(SyncTokenError::UnexpectedZoneError {
+                zone_name: "PrimarySync".into(),
+                error_code: "TRY_AGAIN_LATER".into(),
+            }),
+            IncrementalErrorClass::StaticFallback
+        );
+
+        let reqwest_400 = reqwest_status_error(400);
+        assert_eq!(
+            classify_incremental_error(&reqwest_400),
+            IncrementalErrorClass::StaticFallback
+        );
+
+        let generic = anyhow::anyhow!("decode failed");
+        assert_eq!(
+            classify_incremental_error(&generic),
+            IncrementalErrorClass::StaticFallback
+        );
+    }
+
+    #[test]
+    fn classify_incremental_error_detects_context_wrapped_errors() {
+        let token = anyhow::Error::new(SyncTokenError::InvalidToken {
+            reason: "expired".into(),
+        })
+        .context("changes/zone");
+        assert_eq!(
+            classify_incremental_error(&token),
+            IncrementalErrorClass::TokenFallback
+        );
+
+        let transient = reqwest_status_error(503).context("changes/zone");
+        assert_eq!(
+            classify_incremental_error(&transient),
+            IncrementalErrorClass::TransientFailure
+        );
+    }
 
     fn test_config() -> DownloadConfig {
         DownloadConfig::test_default()
@@ -4760,6 +5782,35 @@ mod tests {
             out[0].url.as_ref(),
             "https://p01.icloud-content.com/fresh-a"
         );
+    }
+
+    #[test]
+    fn pending_retry_filter_matches_asset_version_without_path() {
+        let original = retry_test_task("ASSET_A", VersionSizeKey::Original, "old/a.jpg");
+        let refreshed_elsewhere =
+            retry_test_task("ASSET_A", VersionSizeKey::Original, "new/location/a.jpg");
+        let wrong_version = retry_test_task("ASSET_A", VersionSizeKey::Medium, "new/a.jpg");
+        let unrelated = retry_test_task("ASSET_B", VersionSizeKey::Original, "new/b.jpg");
+        let mut pending_targets: FxHashSet<PendingRetryTarget> =
+            std::iter::once(PendingRetryTarget {
+                library: Arc::from("PrimarySync"),
+                asset_id: Arc::clone(&original.asset_id),
+                version_size: original.version_size,
+            })
+            .collect();
+        let mut out = Vec::new();
+
+        take_matching_pending_retry_tasks(
+            vec![wrong_version, unrelated, refreshed_elsewhere.clone()],
+            &mut pending_targets,
+            &mut out,
+        );
+
+        assert!(pending_targets.is_empty());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].asset_id.as_ref(), "ASSET_A");
+        assert_eq!(out[0].version_size, VersionSizeKey::Original);
+        assert_eq!(out[0].download_path, refreshed_elsewhere.download_path);
     }
 
     fn changes_album(name: &str, session: impl PhotosSession + 'static) -> PhotoAlbum {
@@ -5013,9 +6064,13 @@ mod tests {
                             "fileChecksum": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
                         }
                     },
+                    "resOriginalWidth": {"value": 100, "type": "INT64"},
+                    "resOriginalHeight": {"value": 100, "type": "INT64"},
                     "resOriginalFileType": {"value": "public.jpeg"},
-                    "itemType": {"value": "public.jpeg"}
-                }
+                    "itemType": {"value": "public.jpeg"},
+                    "adjustmentRenderType": {"value": 0, "type": "INT64"}
+                },
+                "recordChangeTag": "ct1"
             }),
             json!({
                 "recordName": format!("asset-{record_name}"),
@@ -5030,9 +6085,79 @@ mod tests {
                     },
                     "assetDate": {"value": 1700000000000i64, "type": "TIMESTAMP"},
                     "addedDate": {"value": 1700000000000i64, "type": "TIMESTAMP"}
-                }
+                },
+                "recordChangeTag": "ct2"
             }),
         ]
+    }
+
+    fn incremental_photo_records_with_url(
+        record_name: &str,
+        filename: &str,
+        download_url: &str,
+        size: u64,
+    ) -> Vec<Value> {
+        let mut records =
+            mock_photo_records_for_zone_with_filename(record_name, "PrimarySync", filename);
+        records[0]["fields"]["resOriginalRes"]["value"]["downloadURL"] = json!(download_url);
+        records[0]["fields"]["resOriginalRes"]["value"]["size"] = json!(size);
+        records
+    }
+
+    #[tokio::test]
+    async fn incremental_multi_page_unfiled_streams_through_bounded_pipeline() {
+        let session = MockPhotosFlow::new()
+            .changes_zone_page(
+                incremental_photo_records_with_url(
+                    "PAGE_ONE",
+                    "page1.jpg",
+                    "https://p01.icloud-content.com/page1.jpg",
+                    1024,
+                ),
+                "zone-token-page-1",
+                true,
+            )
+            .changes_zone_page(
+                incremental_photo_records_with_url(
+                    "PAGE_TWO",
+                    "page2.jpg",
+                    "https://p01.icloud-content.com/page2.jpg",
+                    1024,
+                ),
+                "zone-token-after",
+                false,
+            )
+            .build();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: mock_album("Library", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let dir = TempDir::new().expect("temp dir");
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        let mut config = test_config();
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db);
+        config.concurrent_downloads = 1;
+
+        let result = download_photos_incremental(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            "zone-token-before",
+            DownloadControls::dry_run_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("multi-page incremental sync should succeed");
+
+        assert!(
+            matches!(result.outcome, DownloadOutcome::Success),
+            "result: {result:?}"
+        );
+        assert_eq!(result.sync_token, None);
+        assert_eq!(result.stats.downloaded, 2);
     }
 
     fn album_delta_record(container_id: &str, album_name: &str) -> Value {
@@ -5042,6 +6167,15 @@ mod tests {
             "fields": {
                 "albumName": {"value": album_name}
             }
+        })
+    }
+
+    fn deleted_album_delta_record(container_id: &str) -> Value {
+        json!({
+            "recordName": container_id,
+            "recordType": "CPLAlbum",
+            "fields": {},
+            "deleted": true,
         })
     }
 
@@ -5471,7 +6605,7 @@ mod tests {
         let db = match &base_config.state_db {
             Some(db) => Arc::clone(db),
             None => {
-                let db: Arc<dyn StateDb> =
+                let db: Arc<dyn DownloadStore> =
                     Arc::new(SqliteStateDb::open_in_memory().expect("open state db"));
                 base_config.state_db = Some(Arc::clone(&db));
                 db
@@ -5795,6 +6929,11 @@ mod tests {
             "deferred unfiled exclusions are intentional and must not be counted as pagination undercount"
         );
         assert_eq!(
+            result.stats.api_total_at_start,
+            Some(1),
+            "reliable full-enumeration count should be persisted for cross-cycle inventory checks"
+        );
+        assert_eq!(
             result.sync_token.as_deref(),
             Some("zone-token"),
             "clean write-mode enumeration should still advance the agreed sync token"
@@ -6023,7 +7162,7 @@ mod tests {
         let mut config = test_config();
         let dir = TempDir::new().expect("temp dir");
         config.directory = Arc::from(dir.path());
-        config.state_db = Some(Arc::clone(&db) as Arc<dyn StateDb>);
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
         config.enum_config_hash = Some(Arc::from("hash-pr3"));
         config.skip_created_after =
             Some(DateTime::from_timestamp_millis(1_699_999_999_000).expect("valid timestamp"));
@@ -6107,7 +7246,7 @@ mod tests {
         let mut config = test_config();
         let dir = TempDir::new().expect("temp dir");
         config.directory = Arc::from(dir.path());
-        config.state_db = Some(Arc::clone(&db) as Arc<dyn StateDb>);
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
         config.enum_config_hash = Some(Arc::from("hash-new"));
 
         let result = download_photos_full_with_token(
@@ -6161,7 +7300,7 @@ mod tests {
         let mut config = test_config();
         let dir = TempDir::new().expect("temp dir");
         config.directory = Arc::from(dir.path());
-        config.state_db = Some(Arc::clone(&db) as Arc<dyn StateDb>);
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
         config.enum_config_hash = Some(Arc::from("hash-interrupted"));
         let shutdown = CancellationToken::new();
         shutdown.cancel();
@@ -7058,7 +8197,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incremental_unresolved_hard_delete_zero_rows_advances_sync_token() {
+    async fn incremental_unresolved_hard_delete_zero_rows_blocks_sync_token() {
         let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().unwrap());
         db.upsert_seen(&TestAssetRecord::new("TRACKED_MASTER").build())
             .await
@@ -7069,10 +8208,17 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(result.outcome, DownloadOutcome::Success));
-        assert_eq!(result.sync_token.as_deref(), Some("zone-token-after"));
-        assert_eq!(result.stats.state_write_failures, 0);
-        assert!(!result.stats.sync_token_blocked);
+        assert!(matches!(
+            result.outcome,
+            DownloadOutcome::PartialFailure { failed_count: 1 }
+        ));
+        assert_eq!(result.sync_token, None);
+        assert_eq!(result.stats.state_write_failures, 1);
+        assert!(result.stats.sync_token_blocked);
+        assert_eq!(
+            result.stats.sync_token_blocked_reason,
+            Some(INCREMENTAL_DELETE_ZERO_ROWS_REASON)
+        );
         let pending = db.get_pending().await.unwrap();
         assert_source_flags(&pending, "TRACKED_MASTER", false, false);
     }
@@ -7584,7 +8730,7 @@ mod tests {
         let mut config = test_config();
         let dir = TempDir::new().expect("temp dir");
         config.directory = Arc::from(dir.path());
-        config.state_db = Some(Arc::clone(&db) as Arc<dyn StateDb>);
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
         config.sync_mode = SyncMode::Incremental {
             zone_sync_token: "zone-token-prev".to_string(),
         };
@@ -7640,7 +8786,7 @@ mod tests {
         let mut config = test_config();
         let dir = TempDir::new().expect("temp dir");
         config.directory = Arc::from(dir.path());
-        config.state_db = Some(Arc::clone(&db) as Arc<dyn StateDb>);
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
         config.sync_mode = SyncMode::Incremental {
             zone_sync_token: "zone-token-prev".to_string(),
         };
@@ -7720,7 +8866,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incremental_with_failed_rows_falls_back_to_full_enumeration() {
+    async fn incremental_with_failed_rows_uses_targeted_retry_not_full_enumeration() {
         let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
         let record = crate::test_helpers::TestAssetRecord::new("FAILED_BEFORE_SYNC")
             .filename("failed-before-sync.jpg")
@@ -7738,8 +8884,15 @@ mod tests {
         .expect("mark failed");
 
         let session = MockPhotosFlow::new()
-            .album_count(0)
-            .empty_query_page(Some("zone-token-next"))
+            .changes_zone_page(Vec::new(), "zone-token-next", false)
+            .query_page(
+                mock_photo_records_for_zone_with_filename(
+                    "FAILED_BEFORE_SYNC",
+                    "PrimarySync",
+                    "failed-before-sync.jpg",
+                ),
+                Some("ignored-query-token"),
+            )
             .build();
         let passes = vec![AlbumPass {
             kind: PassKind::Unfiled,
@@ -7763,21 +8916,174 @@ mod tests {
             CancellationToken::new(),
         )
         .await
-        .expect("failed rows should fall back to full enumeration");
+        .expect("failed rows should use targeted retry");
 
         assert!(
-            result.full_enumeration_ran,
-            "normal sync with failed rows must not stay incremental"
+            !result.full_enumeration_ran,
+            "normal sync with failed rows should not force full enumeration"
         );
-        assert_eq!(
-            result.stats.full_enumeration_reason,
-            Some(FullEnumerationReason::RetryFailedRows)
-        );
+        assert_eq!(result.stats.full_enumeration_reason, None);
         assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(
+            result.sync_token, None,
+            "print-only targeted retry must not advance the zone token"
+        );
     }
 
     #[tokio::test]
-    async fn incremental_with_pending_rows_records_pending_full_enumeration_reason() {
+    async fn incremental_pending_retry_dry_run_counts_planned_retry_without_token() {
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
+        let record = crate::test_helpers::TestAssetRecord::new("DRY_RUN_PENDING")
+            .filename("dry-run-pending.jpg")
+            .checksum("ck_dry_run_pending")
+            .size(1024)
+            .build();
+        db.upsert_seen(&record).await.expect("seed pending row");
+
+        let session = MockPhotosFlow::new()
+            .changes_zone_page(Vec::new(), "zone-token-next", false)
+            .query_page(
+                mock_photo_records_for_zone_with_filename(
+                    "DRY_RUN_PENDING",
+                    "PrimarySync",
+                    "dry-run-pending.jpg",
+                ),
+                Some("ignored-query-token"),
+            )
+            .build();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: mock_album("", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db);
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "zone-token-prev".to_string(),
+        };
+
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config),
+            DownloadControls::new(DownloadRunMode::DryRun, DownloadReporting::hidden()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("dry-run pending retry should report planned work");
+
+        assert!(
+            !result.full_enumeration_ran,
+            "dry-run pending retry should not force full enumeration"
+        );
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.stats.downloaded, 1);
+        assert_eq!(result.sync_token, None);
+        assert!(!result.stats.sync_token_blocked);
+    }
+
+    #[tokio::test]
+    async fn incremental_with_failed_rows_retries_real_download_after_zone_delta() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = crate::start_wiremock_or_skip!();
+        let body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body));
+        Mock::given(method("GET"))
+            .and(path("/failed-before-sync.jpg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body)
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .mount(&server)
+            .await;
+
+        let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
+        let record = crate::test_helpers::TestAssetRecord::new("FAILED_BEFORE_SYNC")
+            .filename("failed-before-sync.jpg")
+            .checksum("ck_failed_before_sync")
+            .size(1024)
+            .build();
+        db.upsert_seen(&record).await.expect("seed pending row");
+        db.mark_failed(
+            "PrimarySync",
+            "FAILED_BEFORE_SYNC",
+            "original",
+            "prior download failure",
+        )
+        .await
+        .expect("mark failed");
+
+        let download_url = format!("{}/failed-before-sync.jpg", server.uri());
+        let mut records = incremental_photo_records_with_url(
+            "FAILED_BEFORE_SYNC",
+            "failed-before-sync.jpg",
+            &download_url,
+            8,
+        );
+        records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum);
+        let session = MockPhotosFlow::new()
+            .changes_zone_page(Vec::new(), "zone-token-next", false)
+            .query_page(records, Some("ignored-query-token"))
+            .build();
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: mock_album("", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "zone-token-prev".to_string(),
+        };
+
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("failed rows should retry through the real download path");
+
+        assert!(
+            !result.full_enumeration_ran,
+            "normal sync with failed rows should not force full enumeration"
+        );
+        assert_eq!(result.stats.full_enumeration_reason, None);
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+        let summary = db.get_summary().await.expect("summary");
+        assert_eq!(summary.downloaded, 1);
+        assert_eq!(summary.pending, 0);
+        assert_eq!(summary.failed, 0);
+        let downloaded = db
+            .get_downloaded_page(0, 10)
+            .await
+            .expect("downloaded page");
+        let local_path = downloaded[0]
+            .local_path
+            .as_ref()
+            .expect("downloaded row has a local path");
+        assert!(
+            tokio::fs::metadata(local_path).await.is_ok(),
+            "targeted retry should finalize the downloaded file"
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_with_unmatched_pending_rows_blocks_token_without_full_enumeration() {
         let db = Arc::new(crate::state::SqliteStateDb::open_in_memory().expect("state db"));
         let record = crate::test_helpers::TestAssetRecord::new("PENDING_BEFORE_SYNC")
             .filename("pending-before-sync.jpg")
@@ -7787,8 +9093,8 @@ mod tests {
         db.upsert_seen(&record).await.expect("seed pending row");
 
         let session = MockPhotosFlow::new()
-            .album_count(0)
-            .empty_query_page(Some("zone-token-next"))
+            .changes_zone_page(Vec::new(), "zone-token-next", false)
+            .empty_query_page(Some("ignored-query-token"))
             .build();
         let passes = vec![AlbumPass {
             kind: PassKind::Unfiled,
@@ -7812,12 +9118,22 @@ mod tests {
             CancellationToken::new(),
         )
         .await
-        .expect("pending rows should fall back to full enumeration");
+        .expect("pending rows should return a token-blocked result");
 
-        assert!(result.full_enumeration_ran);
+        assert!(
+            !result.full_enumeration_ran,
+            "unmatched pending rows should not force full enumeration"
+        );
+        assert!(matches!(
+            result.outcome,
+            DownloadOutcome::PartialFailure { failed_count: 1 }
+        ));
+        assert_eq!(result.sync_token, None);
+        assert_eq!(result.stats.downloaded, 0);
+        assert!(result.stats.sync_token_blocked);
         assert_eq!(
-            result.stats.full_enumeration_reason,
-            Some(FullEnumerationReason::PendingRows)
+            result.stats.sync_token_blocked_reason,
+            Some(PENDING_RETRY_UNMATCHED_REASON)
         );
     }
 
@@ -8009,7 +9325,7 @@ mod tests {
         config.directory = Arc::from(dir.path());
         config.folder_structure = "Unfiled".to_string();
         config.folder_structure_albums = Arc::from("{album}");
-        config.state_db = Some(Arc::clone(&db) as Arc<dyn StateDb>);
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
         let result = download_photos_incremental(
             &Client::new(),
             &passes,
@@ -8057,7 +9373,7 @@ mod tests {
         config.directory = Arc::from(dir.path());
         config.folder_structure = "Unfiled".to_string();
         config.folder_structure_albums = Arc::from("{album}");
-        config.state_db = Some(Arc::clone(&db) as Arc<dyn StateDb>);
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
         let result = download_photos_incremental(
             &Client::new(),
             &passes,
@@ -8106,7 +9422,7 @@ mod tests {
         config.directory = Arc::from(dir.path());
         config.folder_structure = "Unfiled".to_string();
         config.folder_structure_albums = Arc::from("{album}");
-        config.state_db = Some(Arc::clone(&db) as Arc<dyn StateDb>);
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
         let result = download_photos_incremental(
             &Client::new(),
             &passes,
@@ -8162,7 +9478,7 @@ mod tests {
         config.directory = Arc::from(dir.path());
         config.folder_structure = "Unfiled".to_string();
         config.folder_structure_albums = Arc::from("{album}");
-        config.state_db = Some(Arc::clone(&db) as Arc<dyn StateDb>);
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
         let result = download_photos_incremental(
             &Client::new(),
             &passes,
@@ -8201,7 +9517,7 @@ mod tests {
         }];
 
         let mut config = test_config();
-        config.state_db = Some(Arc::clone(&db) as Arc<dyn StateDb>);
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
         let result = download_photos_incremental(
             &Client::new(),
             &passes,
@@ -8219,6 +9535,92 @@ mod tests {
         assert_eq!(
             result.stats.sync_token_blocked_reason,
             Some(UNKNOWN_ALBUM_RELATION_ASSET_REASON)
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_relation_add_unknown_container_blocks_sync_token() {
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let session = changes_zone_session(
+            Arc::clone(&calls),
+            vec![relation_delta_record(
+                "container-missing",
+                "asset-MASTER_UNKNOWN",
+            )],
+        );
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: changes_album("", session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        config.state_db = Some(db);
+        let result = download_photos_incremental(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            "zone-token-prev",
+            DownloadControls::new(DownloadRunMode::Download, DownloadReporting::hidden()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("unknown relation container should not fall back to full here");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.sync_token, None);
+        assert!(result.stats.sync_token_blocked);
+        assert_eq!(
+            result.stats.sync_token_blocked_reason,
+            Some(UNKNOWN_ALBUM_RELATION_CONTAINER_REASON)
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_album_delta_delete_invalidates_snapshot_through_download_flow() {
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        seed_complete_album_snapshot(
+            &db,
+            "container-vacation",
+            "Vacation",
+            &[("asset-MASTER_OLD", "MASTER_OLD")],
+        )
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let session = changes_zone_session(
+            Arc::clone(&calls),
+            vec![deleted_album_delta_record("container-vacation")],
+        );
+        let passes = vec![AlbumPass {
+            kind: PassKind::Album,
+            album: changes_album_with_container("Vacation", Some("container-vacation"), session),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let mut config = test_config();
+        config.state_db = Some(Arc::clone(&db) as Arc<dyn DownloadStore>);
+        let result = download_photos_incremental(
+            &Client::new(),
+            &passes,
+            &Arc::new(config),
+            "zone-token-prev",
+            DownloadControls::new(DownloadRunMode::Download, DownloadReporting::hidden()),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("album delete delta should be applied through incremental flow");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+        assert!(
+            !db.selected_album_containers_have_complete_snapshots(
+                "PrimarySync",
+                &["container-vacation"]
+            )
+            .await
+            .unwrap(),
+            "deleted album delta must invalidate trusted membership snapshots"
         );
     }
 
@@ -9556,6 +10958,8 @@ mod tests {
     fn sync_loop_run_cycle_aggregates_stats_across_libraries() {
         let lib_a = SyncStats {
             assets_seen: 10,
+            api_total_at_start: Some(12),
+            api_total_at_start_partial: false,
             downloaded: 4,
             failed: 1,
             skipped: SkipBreakdown {
@@ -9581,6 +10985,12 @@ mod tests {
             pagination_shortfall_warnings: 1,
             pagination_shortfall_assets: 9,
             enumeration_incomplete: false,
+            inventory_drop_warnings: 1,
+            inventory_drop_assets: 5,
+            inventory_drop_percent: Some(5.0),
+            inventory_drop_previous_total: Some(100),
+            inventory_drop_current_total: Some(95),
+            inventory_drop_library: Some("PrimarySync".to_string()),
             sync_token_blocked: true,
             sync_token_blocked_reason: Some("pagination_shortfall"),
             sync_token_blocked_source: Some("icloud"),
@@ -9605,6 +11015,8 @@ mod tests {
 
         let lib_b = SyncStats {
             assets_seen: 20,
+            api_total_at_start: Some(22),
+            api_total_at_start_partial: true,
             downloaded: 11,
             failed: 2,
             skipped: SkipBreakdown {
@@ -9630,6 +11042,12 @@ mod tests {
             pagination_shortfall_warnings: 2,
             pagination_shortfall_assets: 11,
             enumeration_incomplete: true,
+            inventory_drop_warnings: 2,
+            inventory_drop_assets: 11,
+            inventory_drop_percent: Some(10.0),
+            inventory_drop_previous_total: Some(110),
+            inventory_drop_current_total: Some(99),
+            inventory_drop_library: Some("SharedSync-abc".to_string()),
             sync_token_blocked: false,
             sync_token_blocked_reason: None,
             sync_token_blocked_source: Some("kei"),
@@ -9655,6 +11073,15 @@ mod tests {
         acc.accumulate(&lib_b);
 
         assert_eq!(acc.assets_seen, 30, "assets_seen must sum");
+        assert_eq!(
+            acc.api_total_at_start,
+            Some(34),
+            "api_total_at_start must sum known library totals"
+        );
+        assert!(
+            acc.api_total_at_start_partial,
+            "api_total_at_start_partial must OR"
+        );
         assert_eq!(acc.downloaded, 15, "downloaded must sum");
         assert_eq!(acc.failed, 3, "failed must sum");
         assert_eq!(acc.bytes_downloaded, 3_500, "bytes_downloaded must sum");
@@ -9679,6 +11106,21 @@ mod tests {
             "pagination shortfall assets must sum"
         );
         assert!(acc.enumeration_incomplete, "enumeration_incomplete must OR");
+        assert_eq!(
+            acc.inventory_drop_warnings, 3,
+            "inventory drop warnings must sum"
+        );
+        assert_eq!(
+            acc.inventory_drop_assets, 11,
+            "largest inventory drop must win"
+        );
+        assert_eq!(acc.inventory_drop_percent, Some(10.0));
+        assert_eq!(acc.inventory_drop_previous_total, Some(110));
+        assert_eq!(acc.inventory_drop_current_total, Some(99));
+        assert_eq!(
+            acc.inventory_drop_library,
+            Some("SharedSync-abc".to_string())
+        );
         assert!(acc.sync_token_blocked, "sync_token_blocked must OR");
         assert_eq!(acc.sync_token_blocked_reason, Some("pagination_shortfall"));
         assert_eq!(acc.sync_token_blocked_source, Some("icloud"));
@@ -10286,6 +11728,10 @@ mod tests {
         assert_eq!(
             result.stats.enumeration_errors, 0,
             "recent-limited count shortfalls are not exact enumeration errors"
+        );
+        assert_eq!(
+            result.stats.api_total_at_start, None,
+            "recent-limited runs must not seed comparable inventory totals"
         );
         assert_eq!(
             result.sync_token, None,

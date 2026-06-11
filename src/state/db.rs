@@ -80,6 +80,22 @@ pub struct AlbumMembershipRecord {
     pub source: String,
 }
 
+/// Scoped database-level `/changes/database` pre-check token.
+///
+/// This is not a per-zone coverage token. The canonical JSON fields are
+/// stored alongside the hash so a hash match alone never proves that a
+/// watch-mode no-change skip is safe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScopedDbSyncToken {
+    pub(crate) provider: String,
+    pub(crate) account: String,
+    pub(crate) shape_version: i64,
+    pub(crate) scope_hash: String,
+    pub(crate) selected_zones_json: String,
+    pub(crate) scope_json: String,
+    pub(crate) token: String,
+}
+
 /// State operations used by the download producer and finalizer.
 #[allow(
     dead_code,
@@ -98,6 +114,12 @@ pub trait DownloadStateStore: Send + Sync {
     ) -> Result<bool, StateError>;
 
     async fn upsert_seen(&self, record: &AssetRecord) -> Result<(), StateError>;
+    /// Persist the result of a landed local file.
+    ///
+    /// `mark_downloaded` and `mark_soft_deleted` may target the same
+    /// `(library, id, version_size)` row during incremental sync. Keep this
+    /// method limited to download-result columns so provider tombstones
+    /// (`is_deleted`, `deleted_at`) survive regardless of writer ordering.
     async fn mark_downloaded(
         &self,
         library: &str,
@@ -142,6 +164,12 @@ pub trait DownloadStateStore: Send + Sync {
         library: &str,
         asset_ids: &[&str],
     ) -> Result<(), StateError>;
+    /// Persist a provider tombstone without changing local download state.
+    ///
+    /// A row can legitimately be both `status = 'downloaded'` and
+    /// `is_deleted = 1`: the local file landed, and the provider later reported
+    /// the source asset deleted. Do not clear download status, local paths,
+    /// checksums, or error state here.
     async fn mark_soft_deleted(
         &self,
         library: &str,
@@ -212,6 +240,7 @@ pub trait ReportStateStore: Send + Sync {
         offset: u64,
         limit: u32,
     ) -> Result<Vec<AssetRecord>, StateError>;
+    async fn start_sync_run_at(&self, started_at: DateTime<Utc>) -> Result<i64, StateError>;
     async fn start_sync_run(&self) -> Result<i64, StateError>;
     async fn complete_sync_run(&self, run_id: i64, stats: &SyncRunStats) -> Result<(), StateError>;
     async fn promote_orphaned_sync_runs(&self) -> Result<u64, StateError>;
@@ -227,6 +256,27 @@ pub trait SyncTokenStore: Send + Sync {
     async fn get_metadata(&self, key: &str) -> Result<Option<String>, StateError>;
     async fn set_metadata(&self, key: &str, value: &str) -> Result<(), StateError>;
     async fn delete_metadata_by_prefix(&self, prefix: &str) -> Result<u64, StateError>;
+    async fn get_scoped_db_sync_token(
+        &self,
+        _provider: &str,
+        _account: &str,
+        _shape_version: i64,
+        _scope_hash: &str,
+    ) -> Result<Option<ScopedDbSyncToken>, StateError> {
+        Ok(None)
+    }
+    async fn upsert_scoped_db_sync_token(
+        &self,
+        _token: ScopedDbSyncToken,
+    ) -> Result<(), StateError> {
+        Err(StateError::Invariant {
+            operation: "upsert_scoped_db_sync_token",
+            detail: "scoped db sync tokens are not implemented by this state store".into(),
+        })
+    }
+    async fn delete_scoped_db_sync_tokens(&self) -> Result<u64, StateError> {
+        Ok(0)
+    }
     async fn begin_enum_progress(&self, zone: &str) -> Result<(), StateError>;
     async fn end_enum_progress(&self, zone: &str) -> Result<(), StateError>;
     async fn list_interrupted_enumerations(&self) -> Result<Vec<String>, StateError>;
@@ -354,6 +404,10 @@ pub trait MembershipStore: Send + Sync {
             "selected_album_containers_have_complete_snapshots",
         ))
     }
+    #[allow(
+        dead_code,
+        reason = "live membership lookup is exercised by focused tests and reserved for future album-routing reads"
+    )]
     async fn get_live_album_memberships_for_asset(
         &self,
         _library: &str,
@@ -412,1513 +466,6 @@ pub trait MetadataRewriteStore: Send + Sync {
     async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError>;
 }
 
-/// Trait for state database operations.
-///
-/// This trait is object-safe and can be used with `Arc<dyn StateDb>` for
-/// shared access across async tasks.
-#[allow(
-    dead_code,
-    reason = "transitional composite trait remains for outer wiring and legacy tests while callers migrate to role traits"
-)]
-#[async_trait]
-pub trait StateDb: Send + Sync {
-    /// Check if an asset should be downloaded.
-    ///
-    /// Returns true if:
-    /// - The asset is not in the database
-    /// - The asset's checksum has changed
-    /// - The asset was downloaded but the local file no longer exists
-    /// - The asset is in pending or failed status
-    ///
-    /// Note: In the optimized flow, the caller pre-loads downloaded IDs and
-    /// checksums using `get_downloaded_ids()` and `get_downloaded_checksums()`
-    /// for O(1) skip decisions, falling back to filesystem checks for edge cases.
-    #[cfg(test)]
-    async fn should_download(
-        &self,
-        library: &str,
-        id: &str,
-        version_size: &str,
-        checksum: &str,
-        local_path: &Path,
-    ) -> Result<bool, StateError>;
-
-    /// Insert or update an asset record after the producer commits it for
-    /// download.
-    ///
-    /// Updates `last_seen_at` and preserves existing download status.
-    ///
-    /// **Invariant (see issue #211):** Call only from the producer dispatch
-    /// path, after an asset has passed every filter and skip check and a
-    /// download task has been created. `promote_pending_to_failed` treats
-    /// `last_seen_at >= sync_started_at` as "the producer handed this off to
-    /// the consumer this sync", so any call that bumps `last_seen_at` without
-    /// a matching consumer finalization (`mark_downloaded` / `mark_failed`)
-    /// will cause the asset to be promoted to `failed`. If you need to touch
-    /// `last_seen_at` for an asset the consumer will not finalize (trust-state
-    /// fast-skip, on-disk dedup, filtered-out, etc.), use `touch_last_seen`
-    /// on rows that already have a terminal status, not `upsert_seen`.
-    async fn upsert_seen(&self, record: &AssetRecord) -> Result<(), StateError>;
-
-    /// Mark an asset as successfully downloaded.
-    async fn mark_downloaded(
-        &self,
-        library: &str,
-        id: &str,
-        version_size: &str,
-        local_path: &Path,
-        local_checksum: &str,
-        download_checksum: Option<&str>,
-    ) -> Result<(), StateError>;
-
-    /// Atomically upsert `record` and mark it downloaded in one transaction.
-    ///
-    /// Used by `import-existing` so an interrupted scan never leaves a
-    /// `pending` row with `local_path = NULL` for the next sync to redownload.
-    ///
-    /// `imported_size` and `imported_mtime` snapshot the on-disk file's size
-    /// (bytes) and modification time (epoch seconds) at adopt time. Subsequent
-    /// `import-existing` runs bulk-read these via
-    /// `get_all_imported_records` and skip the SHA-256 re-read when the file
-    /// is unchanged. `imported_mtime` is `None` only when the host filesystem
-    /// doesn't expose a usable mtime.
-    async fn import_adopt(
-        &self,
-        record: &AssetRecord,
-        local_path: &Path,
-        local_checksum: &str,
-        imported_size: u64,
-        imported_mtime: Option<i64>,
-    ) -> Result<(), StateError>;
-
-    /// Bulk-load every import-time snapshot for `library`, keyed by
-    /// `(asset_id, version_size)`.
-    ///
-    /// Used by `import-existing` to short-circuit the SHA-256 re-read on
-    /// subsequent runs when the on-disk file is unchanged. Bulk-loaded once
-    /// at scan start (mirroring `get_downloaded_ids` /
-    /// `get_downloaded_checksums`) so the scan loop's per-asset path is an
-    /// O(1) HashMap probe rather than a DB round-trip per file. The default
-    /// impl returns an empty map so test stubs that don't exercise the
-    /// optimization don't have to reimplement it.
-    async fn get_all_imported_records(
-        &self,
-        _library: &str,
-    ) -> Result<HashMap<(String, String), ImportedRecord>, StateError> {
-        Ok(HashMap::new())
-    }
-
-    /// Mark an asset as failed with an error message.
-    async fn mark_failed(
-        &self,
-        library: &str,
-        id: &str,
-        version_size: &str,
-        error: &str,
-    ) -> Result<(), StateError>;
-
-    /// Get all failed assets.
-    async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError>;
-
-    /// Most-recently-seen failed rows up to `limit`, alongside the total
-    /// failed count. Used by the sync-report writer to avoid loading every
-    /// failed row into memory on an account with thousands of failures.
-    async fn get_failed_sample(&self, limit: u32) -> Result<(Vec<AssetRecord>, u64), StateError>;
-
-    /// Get all pending assets.
-    async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError>;
-
-    /// Get a page of failed assets, ordered by `last_seen_at` DESC.
-    ///
-    /// Returns up to `limit` records starting from `offset`.
-    /// Returns an empty `Vec` when no more records remain.
-    /// Default impl falls back to `get_failed` + slice for non-SQLite mocks;
-    /// production `SqliteStateDb` overrides with a real LIMIT/OFFSET query.
-    async fn get_failed_page(
-        &self,
-        offset: u64,
-        limit: u32,
-    ) -> Result<Vec<AssetRecord>, StateError> {
-        page_from_full(self.get_failed().await?, offset, limit)
-    }
-
-    /// Get a page of pending assets, ordered by `last_seen_at` DESC.
-    ///
-    /// Returns up to `limit` records starting from `offset`.
-    /// Returns an empty `Vec` when no more records remain.
-    /// Default impl falls back to `get_pending` + slice for non-SQLite mocks;
-    /// production `SqliteStateDb` overrides with a real LIMIT/OFFSET query.
-    async fn get_pending_page(
-        &self,
-        offset: u64,
-        limit: u32,
-    ) -> Result<Vec<AssetRecord>, StateError> {
-        page_from_full(self.get_pending().await?, offset, limit)
-    }
-
-    /// Get a summary of the database state.
-    async fn get_summary(&self) -> Result<SyncSummary, StateError>;
-
-    /// Get a page of downloaded assets, ordered by rowid.
-    ///
-    /// Returns up to `limit` records starting from `offset`.
-    /// Returns an empty `Vec` when no more records remain.
-    async fn get_downloaded_page(
-        &self,
-        offset: u64,
-        limit: u32,
-    ) -> Result<Vec<AssetRecord>, StateError>;
-
-    /// Start a new sync run and return its ID.
-    async fn start_sync_run(&self) -> Result<i64, StateError>;
-
-    /// Complete a sync run with statistics.
-    async fn complete_sync_run(&self, run_id: i64, stats: &SyncRunStats) -> Result<(), StateError>;
-
-    /// Promote any `sync_runs` rows left in `status='running'` to
-    /// `status='interrupted'` (with `interrupted=1`). These are rows from a
-    /// prior process that was SIGKILL'd or crashed without calling
-    /// `complete_sync_run`. Called once at process startup, immediately
-    /// after migrations. Returns the number of rows promoted.
-    async fn promote_orphaned_sync_runs(&self) -> Result<u64, StateError>;
-
-    /// Mark the start of a full enumeration for `zone`. Pairs with
-    /// `end_enum_progress` on successful completion; a remaining marker at
-    /// next startup means the enumeration was interrupted. Stores the start
-    /// timestamp so the operator can age the marker.
-    async fn begin_enum_progress(&self, zone: &str) -> Result<(), StateError>;
-
-    /// Clear the in-progress enumeration marker for `zone`. Idempotent.
-    async fn end_enum_progress(&self, zone: &str) -> Result<(), StateError>;
-
-    /// Return the zone names of any enumerations that started but never
-    /// ended. Read once at process startup so the operator is warned that
-    /// the next full sync will re-enumerate from scratch until resume
-    /// support lands.
-    async fn list_interrupted_enumerations(&self) -> Result<Vec<String>, StateError>;
-
-    /// Reset all failed assets to pending status.
-    ///
-    /// Returns the number of assets reset.
-    async fn reset_failed(&self) -> Result<u64, StateError>;
-
-    /// Reset non-downloaded assets for a fresh sync attempt.
-    ///
-    /// Moves failed -> pending and clears stale attempt counts on pending
-    /// assets, all in one lock acquisition. When `library` is provided, only
-    /// rows for that library are considered so retry work in one CloudKit zone
-    /// does not force unrelated zones back to full enumeration. Returns
-    /// (failed_reset, pending_reset, total_pending).
-    async fn prepare_for_retry(&self, library: Option<&str>)
-        -> Result<(u64, u64, u64), StateError>;
-
-    /// Promote stuck pending assets to failed.
-    ///
-    /// Called at the end of a non-interrupted sync run. Promotes pending
-    /// assets that the producer dispatched this sync (`last_seen_at >=
-    /// seen_since`) but that the consumer never finalized via
-    /// `mark_downloaded` or `mark_failed`. These are stuck-pipeline cases,
-    /// not filter or album-scope exclusions.
-    ///
-    /// Assets whose `last_seen_at` predates this sync (filtered out, album
-    /// scope changed, remotely deleted, or otherwise not re-enumerated) are
-    /// left alone - they are not failures, and promoting them causes the
-    /// pending -> failed -> pending ghost loop documented in issue #211.
-    ///
-    /// Returns the number of assets promoted.
-    async fn promote_pending_to_failed(&self, seen_since: i64) -> Result<u64, StateError>;
-    async fn prune_stale_pending_not_seen_since(
-        &self,
-        _library: &str,
-        _seen_since: i64,
-    ) -> Result<u64, StateError> {
-        Ok(0)
-    }
-
-    // ── Bulk read operations ──
-
-    /// Get all downloaded asset IDs as (`library`, id, `version_size`) triples.
-    ///
-    /// Used at sync start to pre-load downloaded state for O(1) skip decisions.
-    async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String, String)>, StateError>;
-
-    /// Get all known asset IDs (any status: downloaded, pending, failed).
-    ///
-    /// Used in retry-only mode to distinguish assets that were previously
-    /// synced from new assets discovered on iCloud.
-    async fn get_all_known_ids(&self) -> Result<HashSet<String>, StateError>;
-
-    /// Get downloaded asset IDs with their checksums.
-    ///
-    /// Returns a map of (library, id, `version_size`) -> checksum for
-    /// downloaded assets. Used to detect checksum changes without querying
-    /// the DB per asset.
-    async fn get_downloaded_checksums(
-        &self,
-    ) -> Result<HashMap<(String, String, String), String>, StateError>;
-
-    /// Get downloaded asset IDs with their recorded local paths.
-    ///
-    /// Returns a map of (library, id, `version_size`) -> `local_path` for
-    /// downloaded assets. Used to confirm that a state-backed skip still points
-    /// at the current configured destination before skipping size-mismatched
-    /// files that may have been changed by metadata embedding.
-    async fn get_downloaded_local_paths(
-        &self,
-    ) -> Result<HashMap<(String, String, String), PathBuf>, StateError> {
-        Ok(HashMap::new())
-    }
-
-    /// Get per-asset maximum download attempt counts for failed assets.
-    ///
-    /// Returns a map of asset_id -> max(download_attempts).
-    async fn get_attempt_counts(&self) -> Result<HashMap<String, u32>, StateError>;
-
-    /// Get a metadata value by key.
-    async fn get_metadata(&self, key: &str) -> Result<Option<String>, StateError>;
-
-    /// Set a metadata key-value pair (insert or update).
-    async fn set_metadata(&self, key: &str, value: &str) -> Result<(), StateError>;
-
-    /// Delete all metadata entries whose key starts with `prefix`.
-    /// Returns the number of rows deleted.
-    async fn delete_metadata_by_prefix(&self, prefix: &str) -> Result<u64, StateError>;
-
-    /// Bump `last_seen_at` on every row in `asset_ids` to the same
-    /// timestamp inside a single transaction. Used by the early skip path
-    /// to avoid path resolution on mostly-synced libraries.
-    ///
-    /// Caller must ensure every ID already has a terminal status
-    /// (`downloaded` or `failed`); touching a `pending` row will cause
-    /// `promote_pending_to_failed` to promote it to `failed` at sync end —
-    /// see `upsert_seen` docs and issue #211.
-    ///
-    /// `library` scopes the touch so that asset IDs shared across zones
-    /// don't get their last_seen_at bumped in a library that wasn't actually
-    /// re-enumerated this pass.
-    async fn touch_last_seen_many(
-        &self,
-        library: &str,
-        asset_ids: &[&str],
-    ) -> Result<(), StateError>;
-
-    // ── v5 metadata operations ──
-
-    /// Record an album membership entry. Idempotent via `INSERT OR IGNORE`.
-    ///
-    /// Called during album enumeration when an asset is seen in an album. The
-    /// `(library, asset_id, album_name, source)` composite key namespaces
-    /// memberships per library and source so multi-library accounts don't
-    /// cross-attribute album rows.
-    async fn add_asset_album(
-        &self,
-        library: &str,
-        asset_id: &str,
-        album_name: &str,
-        source: &str,
-    ) -> Result<(), StateError>;
-
-    /// Bulk-load `(asset_id, album_name)` rows for a single library. Used at
-    /// per-library sync start to populate the in-memory groupings index —
-    /// downstream writers look up album memberships without a per-asset DB
-    /// hit, and the load stays bounded by one library's row count.
-    #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
-    async fn get_all_asset_albums(
-        &self,
-        library: &str,
-    ) -> Result<Vec<(String, String)>, StateError>;
-
-    /// Bulk-load `(asset_id, person_name)` rows for a single library.
-    #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
-    async fn get_all_asset_people(
-        &self,
-        library: &str,
-    ) -> Result<Vec<(String, String)>, StateError>;
-
-    /// Upsert a selected album container by CloudKit container ID.
-    async fn upsert_album_container(
-        &self,
-        _library: &str,
-        _container_id: &str,
-        _album_name: &str,
-        _pass_kind: &str,
-    ) -> Result<(), StateError> {
-        Err(unsupported_album_membership_api("upsert_album_container"))
-    }
-
-    /// Mark a previously known album container deleted without removing its history.
-    async fn mark_album_container_deleted(
-        &self,
-        _library: &str,
-        _container_id: &str,
-    ) -> Result<(), StateError> {
-        Err(unsupported_album_membership_api(
-            "mark_album_container_deleted",
-        ))
-    }
-
-    /// Start a durable album membership snapshot and return its generation.
-    async fn start_album_membership_snapshot(
-        &self,
-        _library: &str,
-        _container_id: &str,
-        _enum_config_hash: Option<&str>,
-    ) -> Result<i64, StateError> {
-        Err(unsupported_album_membership_api(
-            "start_album_membership_snapshot",
-        ))
-    }
-
-    /// Add or refresh an asset relation in a running membership snapshot.
-    async fn add_album_membership_to_snapshot(
-        &self,
-        _library: &str,
-        _container_id: &str,
-        _generation: i64,
-        _asset_record_name: &str,
-        _master_record_name: Option<&str>,
-        _source: &str,
-    ) -> Result<(), StateError> {
-        Err(unsupported_album_membership_api(
-            "add_album_membership_to_snapshot",
-        ))
-    }
-
-    /// Add or refresh an album relation learned from `/changes/zone`.
-    ///
-    /// Returns whether the relation's album container was already known when
-    /// the row was applied.
-    async fn upsert_album_membership_delta(
-        &self,
-        _library: &str,
-        _container_id: &str,
-        _asset_record_name: &str,
-        _master_record_name: Option<&str>,
-        _source: &str,
-    ) -> Result<bool, StateError> {
-        Err(unsupported_album_membership_api(
-            "upsert_album_membership_delta",
-        ))
-    }
-
-    /// Mark an album relation deleted from `/changes/zone`.
-    ///
-    /// Returns whether the relation's album container was already known when
-    /// the tombstone was applied.
-    async fn mark_album_membership_deleted(
-        &self,
-        _library: &str,
-        _container_id: &str,
-        _asset_record_name: &str,
-    ) -> Result<bool, StateError> {
-        Err(unsupported_album_membership_api(
-            "mark_album_membership_deleted",
-        ))
-    }
-
-    /// Complete a membership snapshot and mark rows absent from it deleted.
-    async fn complete_album_membership_snapshot(
-        &self,
-        _library: &str,
-        _container_id: &str,
-        _generation: i64,
-    ) -> Result<(), StateError> {
-        Err(unsupported_album_membership_api(
-            "complete_album_membership_snapshot",
-        ))
-    }
-
-    /// Invalidate trusted snapshots for a container.
-    async fn invalidate_album_membership_snapshot(
-        &self,
-        _library: &str,
-        _container_id: &str,
-    ) -> Result<(), StateError> {
-        Err(unsupported_album_membership_api(
-            "invalidate_album_membership_snapshot",
-        ))
-    }
-
-    /// Return true when every selected container has a complete snapshot.
-    async fn selected_album_containers_have_complete_snapshots(
-        &self,
-        _library: &str,
-        _container_ids: &[&str],
-    ) -> Result<bool, StateError> {
-        Err(unsupported_album_membership_api(
-            "selected_album_containers_have_complete_snapshots",
-        ))
-    }
-
-    /// Lookup live album memberships for one CloudKit asset record name.
-    async fn get_live_album_memberships_for_asset(
-        &self,
-        _library: &str,
-        _asset_record_name: &str,
-    ) -> Result<Vec<AlbumMembershipRecord>, StateError> {
-        Err(unsupported_album_membership_api(
-            "get_live_album_memberships_for_asset",
-        ))
-    }
-
-    /// Lookup live memberships that also belong to the selected album set.
-    async fn get_live_selected_album_memberships_for_asset(
-        &self,
-        _library: &str,
-        _asset_record_name: &str,
-        _selected_container_ids: &[&str],
-    ) -> Result<Vec<AlbumMembershipRecord>, StateError> {
-        Err(unsupported_album_membership_api(
-            "get_live_selected_album_memberships_for_asset",
-        ))
-    }
-
-    /// Mark an asset as soft-deleted (all versions under `asset_id` in
-    /// `library`).
-    ///
-    /// Updates `is_deleted` and optional `deleted_at` timestamp. Does not
-    /// remove the row so that history survives and consumers can still reach
-    /// the local file. `library` scopes the update so a shared-library
-    /// deletion doesn't soft-delete the same asset ID in PrimarySync.
-    async fn mark_soft_deleted(
-        &self,
-        library: &str,
-        asset_id: &str,
-        deleted_at: Option<DateTime<Utc>>,
-    ) -> Result<(), StateError>;
-    async fn mark_soft_deleted_affected(
-        &self,
-        library: &str,
-        asset_id: &str,
-        deleted_at: Option<DateTime<Utc>>,
-    ) -> Result<usize, StateError> {
-        self.mark_soft_deleted(library, asset_id, deleted_at)
-            .await?;
-        Ok(1)
-    }
-
-    /// Mark an asset as hidden at source within `library`.
-    async fn mark_hidden_at_source(&self, library: &str, asset_id: &str) -> Result<(), StateError>;
-    async fn mark_hidden_at_source_affected(
-        &self,
-        library: &str,
-        asset_id: &str,
-    ) -> Result<usize, StateError> {
-        self.mark_hidden_at_source(library, asset_id).await?;
-        Ok(1)
-    }
-
-    /// Record that a metadata write (EXIF embed or sidecar) failed for this
-    /// asset-version pair after the bytes landed on disk. Sets
-    /// `metadata_write_failed_at` to the current timestamp. The metadata-only
-    /// rewrite path consumes this to retry on subsequent syncs even when the
-    /// file checksum matches.
-    async fn record_metadata_write_failure(
-        &self,
-        library: &str,
-        asset_id: &str,
-        version_size: &str,
-    ) -> Result<(), StateError>;
-
-    /// Pre-load every `(library, asset_id, version_size) -> metadata_hash`
-    /// for downloaded assets. Used at sync start to detect metadata-only
-    /// changes (file checksum matches but e.g. keywords / favorite / GPS
-    /// drifted) without a per-asset DB hit in the producer hot path.
-    async fn get_downloaded_metadata_hashes(
-        &self,
-    ) -> Result<HashMap<(String, String, String), String>, StateError>;
-
-    /// Pre-load the set of `(library, asset_id, version_size)` triples that
-    /// have a non-null `metadata_write_failed_at`. These need a metadata
-    /// rewrite on the next sync regardless of whether CloudKit reports a hash
-    /// change.
-    async fn get_metadata_retry_markers(
-        &self,
-    ) -> Result<HashSet<(String, String, String)>, StateError>;
-
-    /// Fetch up to `limit` downloaded asset rows that carry a metadata
-    /// rewrite marker AND have a local_path pointing at an on-disk file.
-    /// Used by the metadata-rewrite worker to re-apply EXIF/XMP without
-    /// re-downloading bytes.
-    #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
-    async fn get_pending_metadata_rewrites(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<AssetRecord>, StateError>;
-
-    /// Update just the `metadata_hash` column for an asset-version pair
-    /// after a successful metadata rewrite. Leaves every other column alone.
-    #[cfg_attr(not(feature = "xmp"), allow(dead_code))]
-    async fn update_metadata_hash(
-        &self,
-        library: &str,
-        asset_id: &str,
-        version_size: &str,
-        metadata_hash: &str,
-    ) -> Result<(), StateError>;
-
-    /// Clear the metadata-write-failed marker for an asset-version pair
-    /// after a successful rewrite.
-    async fn clear_metadata_write_failure(
-        &self,
-        library: &str,
-        asset_id: &str,
-        version_size: &str,
-    ) -> Result<(), StateError>;
-
-    /// Whether any downloaded asset still has `metadata_hash IS NULL`.
-    ///
-    /// Used at sync start to log a one-time backfill notice after the v5
-    /// upgrade. Returns false on a fresh DB or once the backfill sync
-    /// completes. Early-exits on the first matching row via `EXISTS`, avoiding
-    /// a full COUNT scan.
-    async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError>;
-}
-
-#[async_trait]
-impl<T> StateDb for T
-where
-    T: DownloadStateStore
-        + ImportStateStore
-        + ReportStateStore
-        + SyncTokenStore
-        + MembershipStore
-        + MetadataRewriteStore,
-{
-    #[cfg(test)]
-    async fn should_download(
-        &self,
-        library: &str,
-        id: &str,
-        version_size: &str,
-        checksum: &str,
-        local_path: &Path,
-    ) -> Result<bool, StateError> {
-        DownloadStateStore::should_download(self, library, id, version_size, checksum, local_path)
-            .await
-    }
-
-    async fn upsert_seen(&self, record: &AssetRecord) -> Result<(), StateError> {
-        DownloadStateStore::upsert_seen(self, record).await
-    }
-
-    async fn mark_downloaded(
-        &self,
-        library: &str,
-        id: &str,
-        version_size: &str,
-        local_path: &Path,
-        local_checksum: &str,
-        download_checksum: Option<&str>,
-    ) -> Result<(), StateError> {
-        DownloadStateStore::mark_downloaded(
-            self,
-            library,
-            id,
-            version_size,
-            local_path,
-            local_checksum,
-            download_checksum,
-        )
-        .await
-    }
-
-    async fn import_adopt(
-        &self,
-        record: &AssetRecord,
-        local_path: &Path,
-        local_checksum: &str,
-        imported_size: u64,
-        imported_mtime: Option<i64>,
-    ) -> Result<(), StateError> {
-        ImportStateStore::import_adopt(
-            self,
-            record,
-            local_path,
-            local_checksum,
-            imported_size,
-            imported_mtime,
-        )
-        .await
-    }
-
-    async fn get_all_imported_records(
-        &self,
-        library: &str,
-    ) -> Result<HashMap<(String, String), ImportedRecord>, StateError> {
-        ImportStateStore::get_all_imported_records(self, library).await
-    }
-
-    async fn mark_failed(
-        &self,
-        library: &str,
-        id: &str,
-        version_size: &str,
-        error: &str,
-    ) -> Result<(), StateError> {
-        DownloadStateStore::mark_failed(self, library, id, version_size, error).await
-    }
-
-    async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError> {
-        <T as ReportStateStore>::get_failed(self).await
-    }
-
-    async fn get_failed_sample(&self, limit: u32) -> Result<(Vec<AssetRecord>, u64), StateError> {
-        ReportStateStore::get_failed_sample(self, limit).await
-    }
-
-    async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError> {
-        <T as DownloadStateStore>::get_pending(self).await
-    }
-
-    async fn get_failed_page(
-        &self,
-        offset: u64,
-        limit: u32,
-    ) -> Result<Vec<AssetRecord>, StateError> {
-        ReportStateStore::get_failed_page(self, offset, limit).await
-    }
-
-    async fn get_pending_page(
-        &self,
-        offset: u64,
-        limit: u32,
-    ) -> Result<Vec<AssetRecord>, StateError> {
-        ReportStateStore::get_pending_page(self, offset, limit).await
-    }
-
-    async fn get_summary(&self) -> Result<SyncSummary, StateError> {
-        ReportStateStore::get_summary(self).await
-    }
-
-    async fn get_downloaded_page(
-        &self,
-        offset: u64,
-        limit: u32,
-    ) -> Result<Vec<AssetRecord>, StateError> {
-        ReportStateStore::get_downloaded_page(self, offset, limit).await
-    }
-
-    async fn start_sync_run(&self) -> Result<i64, StateError> {
-        ReportStateStore::start_sync_run(self).await
-    }
-
-    async fn complete_sync_run(&self, run_id: i64, stats: &SyncRunStats) -> Result<(), StateError> {
-        ReportStateStore::complete_sync_run(self, run_id, stats).await
-    }
-
-    async fn promote_orphaned_sync_runs(&self) -> Result<u64, StateError> {
-        ReportStateStore::promote_orphaned_sync_runs(self).await
-    }
-
-    async fn begin_enum_progress(&self, zone: &str) -> Result<(), StateError> {
-        SyncTokenStore::begin_enum_progress(self, zone).await
-    }
-
-    async fn end_enum_progress(&self, zone: &str) -> Result<(), StateError> {
-        SyncTokenStore::end_enum_progress(self, zone).await
-    }
-
-    async fn list_interrupted_enumerations(&self) -> Result<Vec<String>, StateError> {
-        SyncTokenStore::list_interrupted_enumerations(self).await
-    }
-
-    async fn reset_failed(&self) -> Result<u64, StateError> {
-        DownloadStateStore::reset_failed(self).await
-    }
-
-    async fn prepare_for_retry(
-        &self,
-        library: Option<&str>,
-    ) -> Result<(u64, u64, u64), StateError> {
-        DownloadStateStore::prepare_for_retry(self, library).await
-    }
-
-    async fn promote_pending_to_failed(&self, seen_since: i64) -> Result<u64, StateError> {
-        DownloadStateStore::promote_pending_to_failed(self, seen_since).await
-    }
-
-    async fn prune_stale_pending_not_seen_since(
-        &self,
-        library: &str,
-        seen_since: i64,
-    ) -> Result<u64, StateError> {
-        DownloadStateStore::prune_stale_pending_not_seen_since(self, library, seen_since).await
-    }
-
-    async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String, String)>, StateError> {
-        DownloadStateStore::get_downloaded_ids(self).await
-    }
-
-    async fn get_all_known_ids(&self) -> Result<HashSet<String>, StateError> {
-        DownloadStateStore::get_all_known_ids(self).await
-    }
-
-    async fn get_downloaded_checksums(
-        &self,
-    ) -> Result<HashMap<(String, String, String), String>, StateError> {
-        DownloadStateStore::get_downloaded_checksums(self).await
-    }
-
-    async fn get_downloaded_local_paths(
-        &self,
-    ) -> Result<HashMap<(String, String, String), PathBuf>, StateError> {
-        DownloadStateStore::get_downloaded_local_paths(self).await
-    }
-
-    async fn get_attempt_counts(&self) -> Result<HashMap<String, u32>, StateError> {
-        DownloadStateStore::get_attempt_counts(self).await
-    }
-
-    async fn get_metadata(&self, key: &str) -> Result<Option<String>, StateError> {
-        SyncTokenStore::get_metadata(self, key).await
-    }
-
-    async fn set_metadata(&self, key: &str, value: &str) -> Result<(), StateError> {
-        SyncTokenStore::set_metadata(self, key, value).await
-    }
-
-    async fn delete_metadata_by_prefix(&self, prefix: &str) -> Result<u64, StateError> {
-        SyncTokenStore::delete_metadata_by_prefix(self, prefix).await
-    }
-
-    async fn touch_last_seen_many(
-        &self,
-        library: &str,
-        asset_ids: &[&str],
-    ) -> Result<(), StateError> {
-        DownloadStateStore::touch_last_seen_many(self, library, asset_ids).await
-    }
-
-    async fn add_asset_album(
-        &self,
-        library: &str,
-        asset_id: &str,
-        album_name: &str,
-        source: &str,
-    ) -> Result<(), StateError> {
-        MembershipStore::add_asset_album(self, library, asset_id, album_name, source).await
-    }
-
-    async fn get_all_asset_albums(
-        &self,
-        library: &str,
-    ) -> Result<Vec<(String, String)>, StateError> {
-        MembershipStore::get_all_asset_albums(self, library).await
-    }
-
-    async fn get_all_asset_people(
-        &self,
-        library: &str,
-    ) -> Result<Vec<(String, String)>, StateError> {
-        MembershipStore::get_all_asset_people(self, library).await
-    }
-
-    async fn upsert_album_container(
-        &self,
-        library: &str,
-        container_id: &str,
-        album_name: &str,
-        pass_kind: &str,
-    ) -> Result<(), StateError> {
-        MembershipStore::upsert_album_container(self, library, container_id, album_name, pass_kind)
-            .await
-    }
-
-    async fn mark_album_container_deleted(
-        &self,
-        library: &str,
-        container_id: &str,
-    ) -> Result<(), StateError> {
-        MembershipStore::mark_album_container_deleted(self, library, container_id).await
-    }
-
-    async fn start_album_membership_snapshot(
-        &self,
-        library: &str,
-        container_id: &str,
-        enum_config_hash: Option<&str>,
-    ) -> Result<i64, StateError> {
-        MembershipStore::start_album_membership_snapshot(
-            self,
-            library,
-            container_id,
-            enum_config_hash,
-        )
-        .await
-    }
-
-    async fn add_album_membership_to_snapshot(
-        &self,
-        library: &str,
-        container_id: &str,
-        generation: i64,
-        asset_record_name: &str,
-        master_record_name: Option<&str>,
-        source: &str,
-    ) -> Result<(), StateError> {
-        MembershipStore::add_album_membership_to_snapshot(
-            self,
-            library,
-            container_id,
-            generation,
-            asset_record_name,
-            master_record_name,
-            source,
-        )
-        .await
-    }
-
-    async fn upsert_album_membership_delta(
-        &self,
-        library: &str,
-        container_id: &str,
-        asset_record_name: &str,
-        master_record_name: Option<&str>,
-        source: &str,
-    ) -> Result<bool, StateError> {
-        MembershipStore::upsert_album_membership_delta(
-            self,
-            library,
-            container_id,
-            asset_record_name,
-            master_record_name,
-            source,
-        )
-        .await
-    }
-
-    async fn mark_album_membership_deleted(
-        &self,
-        library: &str,
-        container_id: &str,
-        asset_record_name: &str,
-    ) -> Result<bool, StateError> {
-        MembershipStore::mark_album_membership_deleted(
-            self,
-            library,
-            container_id,
-            asset_record_name,
-        )
-        .await
-    }
-
-    async fn complete_album_membership_snapshot(
-        &self,
-        library: &str,
-        container_id: &str,
-        generation: i64,
-    ) -> Result<(), StateError> {
-        MembershipStore::complete_album_membership_snapshot(self, library, container_id, generation)
-            .await
-    }
-
-    async fn invalidate_album_membership_snapshot(
-        &self,
-        library: &str,
-        container_id: &str,
-    ) -> Result<(), StateError> {
-        MembershipStore::invalidate_album_membership_snapshot(self, library, container_id).await
-    }
-
-    async fn selected_album_containers_have_complete_snapshots(
-        &self,
-        library: &str,
-        container_ids: &[&str],
-    ) -> Result<bool, StateError> {
-        MembershipStore::selected_album_containers_have_complete_snapshots(
-            self,
-            library,
-            container_ids,
-        )
-        .await
-    }
-
-    async fn get_live_album_memberships_for_asset(
-        &self,
-        library: &str,
-        asset_record_name: &str,
-    ) -> Result<Vec<AlbumMembershipRecord>, StateError> {
-        MembershipStore::get_live_album_memberships_for_asset(self, library, asset_record_name)
-            .await
-    }
-
-    async fn get_live_selected_album_memberships_for_asset(
-        &self,
-        library: &str,
-        asset_record_name: &str,
-        selected_container_ids: &[&str],
-    ) -> Result<Vec<AlbumMembershipRecord>, StateError> {
-        MembershipStore::get_live_selected_album_memberships_for_asset(
-            self,
-            library,
-            asset_record_name,
-            selected_container_ids,
-        )
-        .await
-    }
-
-    async fn mark_soft_deleted(
-        &self,
-        library: &str,
-        asset_id: &str,
-        deleted_at: Option<DateTime<Utc>>,
-    ) -> Result<(), StateError> {
-        DownloadStateStore::mark_soft_deleted(self, library, asset_id, deleted_at).await
-    }
-
-    async fn mark_soft_deleted_affected(
-        &self,
-        library: &str,
-        asset_id: &str,
-        deleted_at: Option<DateTime<Utc>>,
-    ) -> Result<usize, StateError> {
-        DownloadStateStore::mark_soft_deleted_affected(self, library, asset_id, deleted_at).await
-    }
-
-    async fn mark_hidden_at_source(&self, library: &str, asset_id: &str) -> Result<(), StateError> {
-        DownloadStateStore::mark_hidden_at_source(self, library, asset_id).await
-    }
-
-    async fn mark_hidden_at_source_affected(
-        &self,
-        library: &str,
-        asset_id: &str,
-    ) -> Result<usize, StateError> {
-        DownloadStateStore::mark_hidden_at_source_affected(self, library, asset_id).await
-    }
-
-    async fn record_metadata_write_failure(
-        &self,
-        library: &str,
-        asset_id: &str,
-        version_size: &str,
-    ) -> Result<(), StateError> {
-        MetadataRewriteStore::record_metadata_write_failure(self, library, asset_id, version_size)
-            .await
-    }
-
-    async fn get_downloaded_metadata_hashes(
-        &self,
-    ) -> Result<HashMap<(String, String, String), String>, StateError> {
-        MetadataRewriteStore::get_downloaded_metadata_hashes(self).await
-    }
-
-    async fn get_metadata_retry_markers(
-        &self,
-    ) -> Result<HashSet<(String, String, String)>, StateError> {
-        MetadataRewriteStore::get_metadata_retry_markers(self).await
-    }
-
-    async fn get_pending_metadata_rewrites(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<AssetRecord>, StateError> {
-        MetadataRewriteStore::get_pending_metadata_rewrites(self, limit).await
-    }
-
-    async fn update_metadata_hash(
-        &self,
-        library: &str,
-        asset_id: &str,
-        version_size: &str,
-        metadata_hash: &str,
-    ) -> Result<(), StateError> {
-        MetadataRewriteStore::update_metadata_hash(
-            self,
-            library,
-            asset_id,
-            version_size,
-            metadata_hash,
-        )
-        .await
-    }
-
-    async fn clear_metadata_write_failure(
-        &self,
-        library: &str,
-        asset_id: &str,
-        version_size: &str,
-    ) -> Result<(), StateError> {
-        MetadataRewriteStore::clear_metadata_write_failure(self, library, asset_id, version_size)
-            .await
-    }
-
-    async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError> {
-        MetadataRewriteStore::has_downloaded_without_metadata_hash(self).await
-    }
-}
-
-#[allow(
-    dead_code,
-    reason = "default StateDb pagination methods use this for non-SQLite test stubs"
-)]
-fn page_from_full(
-    full: Vec<AssetRecord>,
-    offset: u64,
-    limit: u32,
-) -> Result<Vec<AssetRecord>, StateError> {
-    let start = usize::try_from(offset)
-        .unwrap_or(usize::MAX)
-        .min(full.len());
-    let take = usize::try_from(limit).unwrap_or(usize::MAX);
-    Ok(full.into_iter().skip(start).take(take).collect())
-}
-
-#[async_trait]
-impl DownloadStateStore for dyn StateDb + '_ {
-    #[cfg(test)]
-    async fn should_download(
-        &self,
-        library: &str,
-        id: &str,
-        version_size: &str,
-        checksum: &str,
-        local_path: &Path,
-    ) -> Result<bool, StateError> {
-        StateDb::should_download(self, library, id, version_size, checksum, local_path).await
-    }
-
-    async fn upsert_seen(&self, record: &AssetRecord) -> Result<(), StateError> {
-        StateDb::upsert_seen(self, record).await
-    }
-
-    async fn mark_downloaded(
-        &self,
-        library: &str,
-        id: &str,
-        version_size: &str,
-        local_path: &Path,
-        local_checksum: &str,
-        download_checksum: Option<&str>,
-    ) -> Result<(), StateError> {
-        StateDb::mark_downloaded(
-            self,
-            library,
-            id,
-            version_size,
-            local_path,
-            local_checksum,
-            download_checksum,
-        )
-        .await
-    }
-
-    async fn mark_failed(
-        &self,
-        library: &str,
-        id: &str,
-        version_size: &str,
-        error: &str,
-    ) -> Result<(), StateError> {
-        StateDb::mark_failed(self, library, id, version_size, error).await
-    }
-
-    async fn get_pending(&self) -> Result<Vec<AssetRecord>, StateError> {
-        StateDb::get_pending(self).await
-    }
-
-    async fn reset_failed(&self) -> Result<u64, StateError> {
-        StateDb::reset_failed(self).await
-    }
-
-    async fn prepare_for_retry(
-        &self,
-        library: Option<&str>,
-    ) -> Result<(u64, u64, u64), StateError> {
-        StateDb::prepare_for_retry(self, library).await
-    }
-
-    async fn promote_pending_to_failed(&self, seen_since: i64) -> Result<u64, StateError> {
-        StateDb::promote_pending_to_failed(self, seen_since).await
-    }
-
-    async fn prune_stale_pending_not_seen_since(
-        &self,
-        library: &str,
-        seen_since: i64,
-    ) -> Result<u64, StateError> {
-        StateDb::prune_stale_pending_not_seen_since(self, library, seen_since).await
-    }
-
-    async fn get_downloaded_ids(&self) -> Result<HashSet<(String, String, String)>, StateError> {
-        StateDb::get_downloaded_ids(self).await
-    }
-
-    async fn get_all_known_ids(&self) -> Result<HashSet<String>, StateError> {
-        StateDb::get_all_known_ids(self).await
-    }
-
-    async fn get_downloaded_checksums(
-        &self,
-    ) -> Result<HashMap<(String, String, String), String>, StateError> {
-        StateDb::get_downloaded_checksums(self).await
-    }
-
-    async fn get_downloaded_local_paths(
-        &self,
-    ) -> Result<HashMap<(String, String, String), PathBuf>, StateError> {
-        StateDb::get_downloaded_local_paths(self).await
-    }
-
-    async fn get_attempt_counts(&self) -> Result<HashMap<String, u32>, StateError> {
-        StateDb::get_attempt_counts(self).await
-    }
-
-    async fn touch_last_seen_many(
-        &self,
-        library: &str,
-        asset_ids: &[&str],
-    ) -> Result<(), StateError> {
-        StateDb::touch_last_seen_many(self, library, asset_ids).await
-    }
-
-    async fn mark_soft_deleted(
-        &self,
-        library: &str,
-        asset_id: &str,
-        deleted_at: Option<DateTime<Utc>>,
-    ) -> Result<(), StateError> {
-        StateDb::mark_soft_deleted(self, library, asset_id, deleted_at).await
-    }
-
-    async fn mark_soft_deleted_affected(
-        &self,
-        library: &str,
-        asset_id: &str,
-        deleted_at: Option<DateTime<Utc>>,
-    ) -> Result<usize, StateError> {
-        StateDb::mark_soft_deleted_affected(self, library, asset_id, deleted_at).await
-    }
-
-    async fn mark_hidden_at_source(&self, library: &str, asset_id: &str) -> Result<(), StateError> {
-        StateDb::mark_hidden_at_source(self, library, asset_id).await
-    }
-
-    async fn mark_hidden_at_source_affected(
-        &self,
-        library: &str,
-        asset_id: &str,
-    ) -> Result<usize, StateError> {
-        StateDb::mark_hidden_at_source_affected(self, library, asset_id).await
-    }
-}
-
-#[async_trait]
-impl ImportStateStore for dyn StateDb + '_ {
-    async fn import_adopt(
-        &self,
-        record: &AssetRecord,
-        local_path: &Path,
-        local_checksum: &str,
-        imported_size: u64,
-        imported_mtime: Option<i64>,
-    ) -> Result<(), StateError> {
-        StateDb::import_adopt(
-            self,
-            record,
-            local_path,
-            local_checksum,
-            imported_size,
-            imported_mtime,
-        )
-        .await
-    }
-
-    async fn get_all_imported_records(
-        &self,
-        library: &str,
-    ) -> Result<HashMap<(String, String), ImportedRecord>, StateError> {
-        StateDb::get_all_imported_records(self, library).await
-    }
-}
-
-#[async_trait]
-impl ReportStateStore for dyn StateDb + '_ {
-    async fn get_failed(&self) -> Result<Vec<AssetRecord>, StateError> {
-        StateDb::get_failed(self).await
-    }
-
-    async fn get_failed_sample(&self, limit: u32) -> Result<(Vec<AssetRecord>, u64), StateError> {
-        StateDb::get_failed_sample(self, limit).await
-    }
-
-    async fn get_failed_page(
-        &self,
-        offset: u64,
-        limit: u32,
-    ) -> Result<Vec<AssetRecord>, StateError> {
-        StateDb::get_failed_page(self, offset, limit).await
-    }
-
-    async fn get_pending_page(
-        &self,
-        offset: u64,
-        limit: u32,
-    ) -> Result<Vec<AssetRecord>, StateError> {
-        StateDb::get_pending_page(self, offset, limit).await
-    }
-
-    async fn get_summary(&self) -> Result<SyncSummary, StateError> {
-        StateDb::get_summary(self).await
-    }
-
-    async fn get_downloaded_page(
-        &self,
-        offset: u64,
-        limit: u32,
-    ) -> Result<Vec<AssetRecord>, StateError> {
-        StateDb::get_downloaded_page(self, offset, limit).await
-    }
-
-    async fn start_sync_run(&self) -> Result<i64, StateError> {
-        StateDb::start_sync_run(self).await
-    }
-
-    async fn complete_sync_run(&self, run_id: i64, stats: &SyncRunStats) -> Result<(), StateError> {
-        StateDb::complete_sync_run(self, run_id, stats).await
-    }
-
-    async fn promote_orphaned_sync_runs(&self) -> Result<u64, StateError> {
-        StateDb::promote_orphaned_sync_runs(self).await
-    }
-}
-
-#[async_trait]
-impl SyncTokenStore for dyn StateDb + '_ {
-    async fn get_metadata(&self, key: &str) -> Result<Option<String>, StateError> {
-        StateDb::get_metadata(self, key).await
-    }
-
-    async fn set_metadata(&self, key: &str, value: &str) -> Result<(), StateError> {
-        StateDb::set_metadata(self, key, value).await
-    }
-
-    async fn delete_metadata_by_prefix(&self, prefix: &str) -> Result<u64, StateError> {
-        StateDb::delete_metadata_by_prefix(self, prefix).await
-    }
-
-    async fn begin_enum_progress(&self, zone: &str) -> Result<(), StateError> {
-        StateDb::begin_enum_progress(self, zone).await
-    }
-
-    async fn end_enum_progress(&self, zone: &str) -> Result<(), StateError> {
-        StateDb::end_enum_progress(self, zone).await
-    }
-
-    async fn list_interrupted_enumerations(&self) -> Result<Vec<String>, StateError> {
-        StateDb::list_interrupted_enumerations(self).await
-    }
-}
-
-#[async_trait]
-impl MembershipStore for dyn StateDb + '_ {
-    async fn add_asset_album(
-        &self,
-        library: &str,
-        asset_id: &str,
-        album_name: &str,
-        source: &str,
-    ) -> Result<(), StateError> {
-        StateDb::add_asset_album(self, library, asset_id, album_name, source).await
-    }
-
-    async fn get_all_asset_albums(
-        &self,
-        library: &str,
-    ) -> Result<Vec<(String, String)>, StateError> {
-        StateDb::get_all_asset_albums(self, library).await
-    }
-
-    async fn get_all_asset_people(
-        &self,
-        library: &str,
-    ) -> Result<Vec<(String, String)>, StateError> {
-        StateDb::get_all_asset_people(self, library).await
-    }
-
-    async fn upsert_album_container(
-        &self,
-        library: &str,
-        container_id: &str,
-        album_name: &str,
-        pass_kind: &str,
-    ) -> Result<(), StateError> {
-        StateDb::upsert_album_container(self, library, container_id, album_name, pass_kind).await
-    }
-
-    async fn mark_album_container_deleted(
-        &self,
-        library: &str,
-        container_id: &str,
-    ) -> Result<(), StateError> {
-        StateDb::mark_album_container_deleted(self, library, container_id).await
-    }
-
-    async fn start_album_membership_snapshot(
-        &self,
-        library: &str,
-        container_id: &str,
-        enum_config_hash: Option<&str>,
-    ) -> Result<i64, StateError> {
-        StateDb::start_album_membership_snapshot(self, library, container_id, enum_config_hash)
-            .await
-    }
-
-    async fn add_album_membership_to_snapshot(
-        &self,
-        library: &str,
-        container_id: &str,
-        generation: i64,
-        asset_record_name: &str,
-        master_record_name: Option<&str>,
-        source: &str,
-    ) -> Result<(), StateError> {
-        StateDb::add_album_membership_to_snapshot(
-            self,
-            library,
-            container_id,
-            generation,
-            asset_record_name,
-            master_record_name,
-            source,
-        )
-        .await
-    }
-
-    async fn upsert_album_membership_delta(
-        &self,
-        library: &str,
-        container_id: &str,
-        asset_record_name: &str,
-        master_record_name: Option<&str>,
-        source: &str,
-    ) -> Result<bool, StateError> {
-        StateDb::upsert_album_membership_delta(
-            self,
-            library,
-            container_id,
-            asset_record_name,
-            master_record_name,
-            source,
-        )
-        .await
-    }
-
-    async fn mark_album_membership_deleted(
-        &self,
-        library: &str,
-        container_id: &str,
-        asset_record_name: &str,
-    ) -> Result<bool, StateError> {
-        StateDb::mark_album_membership_deleted(self, library, container_id, asset_record_name).await
-    }
-
-    async fn complete_album_membership_snapshot(
-        &self,
-        library: &str,
-        container_id: &str,
-        generation: i64,
-    ) -> Result<(), StateError> {
-        StateDb::complete_album_membership_snapshot(self, library, container_id, generation).await
-    }
-
-    async fn invalidate_album_membership_snapshot(
-        &self,
-        library: &str,
-        container_id: &str,
-    ) -> Result<(), StateError> {
-        StateDb::invalidate_album_membership_snapshot(self, library, container_id).await
-    }
-
-    async fn selected_album_containers_have_complete_snapshots(
-        &self,
-        library: &str,
-        container_ids: &[&str],
-    ) -> Result<bool, StateError> {
-        StateDb::selected_album_containers_have_complete_snapshots(self, library, container_ids)
-            .await
-    }
-
-    async fn get_live_album_memberships_for_asset(
-        &self,
-        library: &str,
-        asset_record_name: &str,
-    ) -> Result<Vec<AlbumMembershipRecord>, StateError> {
-        StateDb::get_live_album_memberships_for_asset(self, library, asset_record_name).await
-    }
-
-    async fn get_live_selected_album_memberships_for_asset(
-        &self,
-        library: &str,
-        asset_record_name: &str,
-        selected_container_ids: &[&str],
-    ) -> Result<Vec<AlbumMembershipRecord>, StateError> {
-        StateDb::get_live_selected_album_memberships_for_asset(
-            self,
-            library,
-            asset_record_name,
-            selected_container_ids,
-        )
-        .await
-    }
-}
-
-#[async_trait]
-impl MetadataRewriteStore for dyn StateDb + '_ {
-    async fn record_metadata_write_failure(
-        &self,
-        library: &str,
-        asset_id: &str,
-        version_size: &str,
-    ) -> Result<(), StateError> {
-        StateDb::record_metadata_write_failure(self, library, asset_id, version_size).await
-    }
-
-    async fn get_downloaded_metadata_hashes(
-        &self,
-    ) -> Result<HashMap<(String, String, String), String>, StateError> {
-        StateDb::get_downloaded_metadata_hashes(self).await
-    }
-
-    async fn get_metadata_retry_markers(
-        &self,
-    ) -> Result<HashSet<(String, String, String)>, StateError> {
-        StateDb::get_metadata_retry_markers(self).await
-    }
-
-    async fn get_pending_metadata_rewrites(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<AssetRecord>, StateError> {
-        StateDb::get_pending_metadata_rewrites(self, limit).await
-    }
-
-    async fn update_metadata_hash(
-        &self,
-        library: &str,
-        asset_id: &str,
-        version_size: &str,
-        metadata_hash: &str,
-    ) -> Result<(), StateError> {
-        StateDb::update_metadata_hash(self, library, asset_id, version_size, metadata_hash).await
-    }
-
-    async fn clear_metadata_write_failure(
-        &self,
-        library: &str,
-        asset_id: &str,
-        version_size: &str,
-    ) -> Result<(), StateError> {
-        StateDb::clear_metadata_write_failure(self, library, asset_id, version_size).await
-    }
-
-    async fn has_downloaded_without_metadata_hash(&self) -> Result<bool, StateError> {
-        StateDb::has_downloaded_without_metadata_hash(self).await
-    }
-}
-
-/// `SQLite` implementation of the state database.
 pub struct SqliteStateDb {
     /// Wrapped in `Arc<Mutex<...>>` because `rusqlite::Connection` is
     /// not `Sync` and every async method runs its body on the blocking
@@ -2029,7 +576,7 @@ impl SqliteStateDb {
 
     /// Run a synchronous rusqlite closure on the blocking pool with
     /// `&Connection` access. This is the correct entry point for every
-    /// read-path StateDb method.
+    /// read-path state role method.
     async fn with_conn<F, T>(&self, operation: &'static str, f: F) -> Result<T, StateError>
     where
         F: FnOnce(&Connection) -> Result<T, StateError> + Send + 'static,
@@ -2714,22 +1261,120 @@ impl SqliteStateDb {
                 })
                 .map_err(|e| StateError::query("get_summary", e))?;
 
-            let last_sync: Option<(Option<i64>, Option<i64>)> = conn
+            type LastSyncRow = (
+                Option<i64>,
+                Option<i64>,
+                Option<String>,
+                i64,
+                i64,
+                i32,
+                Option<i64>,
+                i32,
+                i32,
+                Option<i64>,
+                Option<i64>,
+                Option<String>,
+            );
+            let last_sync: Option<LastSyncRow> = conn
                 .query_row(
-                    "SELECT started_at, completed_at FROM sync_runs ORDER BY id DESC LIMIT 1",
+                    "SELECT started_at, completed_at, \
+                            status, assets_failed, enumeration_errors, interrupted, \
+                            api_total_at_start, api_total_at_start_partial, inventory_drop_detected, \
+                            inventory_drop_previous_total, inventory_drop_current_total, \
+                            inventory_drop_library \
+                     FROM sync_runs ORDER BY id DESC LIMIT 1",
                     [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                            row.get(8)?,
+                            row.get(9)?,
+                            row.get(10)?,
+                            row.get(11)?,
+                        ))
+                    },
                 )
                 .optional()
                 .map_err(|e| StateError::query("get_summary", e))?;
 
-            let (last_sync_started, last_sync_completed) = match last_sync {
-                Some((started, completed)) => (
+            let (
+                last_sync_started,
+                last_sync_completed,
+                last_sync_status,
+                last_sync_assets_failed,
+                last_sync_enumeration_errors,
+                last_sync_interrupted,
+                last_api_total_at_start,
+                last_api_total_at_start_partial,
+                last_inventory_drop_detected,
+                last_inventory_drop_previous_total,
+                last_inventory_drop_current_total,
+                last_inventory_drop_library,
+            ) = match last_sync {
+                Some((
+                    started,
+                    completed,
+                    status,
+                    assets_failed,
+                    enumeration_errors,
+                    interrupted,
+                    api_total,
+                    api_total_partial,
+                    drop_detected,
+                    drop_previous,
+                    drop_current,
+                    drop_library,
+                )) => (
                     started.and_then(|ts| Utc.timestamp_opt(ts, 0).single()),
                     completed.and_then(|ts| Utc.timestamp_opt(ts, 0).single()),
+                    status,
+                    u64::try_from(assets_failed).unwrap_or(0),
+                    u64::try_from(enumeration_errors).unwrap_or(0),
+                    interrupted != 0,
+                    api_total.and_then(|n| u64::try_from(n).ok()),
+                    api_total_partial != 0,
+                    drop_detected != 0,
+                    drop_previous.and_then(|n| u64::try_from(n).ok()),
+                    drop_current.and_then(|n| u64::try_from(n).ok()),
+                    drop_library,
                 ),
-                None => (None, None),
+                None => (None, None, None, 0, 0, false, None, false, false, None, None, None),
             };
+
+            let active_sync_started: Option<DateTime<Utc>> = conn
+                .query_row(
+                    "SELECT started_at FROM sync_runs \
+                     WHERE status = 'running' ORDER BY id DESC LIMIT 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(|e| StateError::query("get_summary", e))?
+                .and_then(|ts| Utc.timestamp_opt(ts, 0).single());
+
+            let mut enum_stmt = conn
+                .prepare(
+                    "SELECT key FROM metadata \
+                     WHERE key LIKE 'enum_in_progress:%' ORDER BY key",
+                )
+                .map_err(|e| StateError::query("get_summary", e))?;
+            let enum_rows = enum_stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| StateError::query("get_summary", e))?;
+            let mut active_enumeration_zones = Vec::new();
+            for row in enum_rows {
+                let key = row.map_err(|e| StateError::query("get_summary", e))?;
+                if let Some(zone) = key.strip_prefix("enum_in_progress:") {
+                    active_enumeration_zones.push(zone.to_string());
+                }
+            }
 
             Ok(SyncSummary {
                 total_assets,
@@ -2737,8 +1382,20 @@ impl SqliteStateDb {
                 pending,
                 failed,
                 downloaded_bytes,
+                active_sync_started,
+                active_enumeration_zones,
                 last_sync_completed,
                 last_sync_started,
+                last_sync_status,
+                last_sync_assets_failed,
+                last_sync_enumeration_errors,
+                last_sync_interrupted,
+                last_api_total_at_start,
+                last_api_total_at_start_partial,
+                last_inventory_drop_detected,
+                last_inventory_drop_previous_total,
+                last_inventory_drop_current_total,
+                last_inventory_drop_library,
             })
         })
         .await
@@ -2773,7 +1430,14 @@ impl SqliteStateDb {
     }
 
     pub(crate) async fn start_sync_run(&self) -> Result<i64, StateError> {
-        let started_at = Utc::now().timestamp();
+        self.start_sync_run_at(Utc::now()).await
+    }
+
+    pub(crate) async fn start_sync_run_at(
+        &self,
+        started_at: DateTime<Utc>,
+    ) -> Result<i64, StateError> {
+        let started_at = started_at.timestamp();
         self.with_conn("start_sync_run", move |conn| {
             conn.execute(
                 "INSERT INTO sync_runs (started_at, status) VALUES (?1, 'running')",
@@ -2796,6 +1460,18 @@ impl SqliteStateDb {
         let assets_downloaded = i64::try_from(stats.assets_downloaded).unwrap_or(i64::MAX);
         let assets_failed = i64::try_from(stats.assets_failed).unwrap_or(i64::MAX);
         let enumeration_errors = i64::try_from(stats.enumeration_errors).unwrap_or(i64::MAX);
+        let api_total_at_start = stats
+            .api_total_at_start
+            .map(|n| i64::try_from(n).unwrap_or(i64::MAX));
+        let api_total_at_start_partial = i32::from(stats.api_total_at_start_partial);
+        let inventory_drop_detected = i32::from(stats.inventory_drop_warnings > 0);
+        let inventory_drop_previous_total = stats
+            .inventory_drop_previous_total
+            .map(|n| i64::try_from(n).unwrap_or(i64::MAX));
+        let inventory_drop_current_total = stats
+            .inventory_drop_current_total
+            .map(|n| i64::try_from(n).unwrap_or(i64::MAX));
+        let inventory_drop_library = stats.inventory_drop_library.clone();
         let interrupted_i32 = i32::from(stats.interrupted);
         let status = if stats.interrupted {
             "interrupted"
@@ -2806,8 +1482,11 @@ impl SqliteStateDb {
         self.with_conn("complete_sync_run", move |conn| {
             let rows = conn.execute(
                 "UPDATE sync_runs SET completed_at = ?1, assets_seen = ?2, assets_downloaded = ?3, \
-                 assets_failed = ?4, interrupted = ?5, status = ?6, enumeration_errors = ?7 \
-                 WHERE id = ?8",
+                 assets_failed = ?4, interrupted = ?5, status = ?6, enumeration_errors = ?7, \
+                 api_total_at_start = ?8, api_total_at_start_partial = ?9, \
+                 inventory_drop_detected = ?10, inventory_drop_previous_total = ?11, \
+                 inventory_drop_current_total = ?12, inventory_drop_library = ?13 \
+                 WHERE id = ?14",
                 rusqlite::params![
                     completed_at,
                     assets_seen,
@@ -2816,6 +1495,12 @@ impl SqliteStateDb {
                     interrupted_i32,
                     status,
                     enumeration_errors,
+                    api_total_at_start,
+                    api_total_at_start_partial,
+                    inventory_drop_detected,
+                    inventory_drop_previous_total,
+                    inventory_drop_current_total,
+                    inventory_drop_library,
                     run_id
                 ],
             )
@@ -3233,6 +1918,82 @@ impl SqliteStateDb {
                 .execute([format!("{prefix}%")])
                 .map_err(|e| StateError::query("delete_metadata_by_prefix", e))?;
 
+            Ok(deleted as u64)
+        })
+        .await
+    }
+
+    pub(crate) async fn get_scoped_db_sync_token(
+        &self,
+        provider: &str,
+        account: &str,
+        shape_version: i64,
+        scope_hash: &str,
+    ) -> Result<Option<ScopedDbSyncToken>, StateError> {
+        let provider = provider.to_owned();
+        let account = account.to_owned();
+        let scope_hash = scope_hash.to_owned();
+        self.with_conn("get_scoped_db_sync_token", move |conn| {
+            conn.query_row(
+                "SELECT selected_zones_json, scope_json, token \
+                 FROM scoped_db_sync_tokens \
+                 WHERE provider = ?1 AND account = ?2 AND shape_version = ?3 AND scope_hash = ?4",
+                rusqlite::params![provider, account, shape_version, scope_hash],
+                |row| {
+                    Ok(ScopedDbSyncToken {
+                        provider: provider.clone(),
+                        account: account.clone(),
+                        shape_version,
+                        scope_hash: scope_hash.clone(),
+                        selected_zones_json: row.get(0)?,
+                        scope_json: row.get(1)?,
+                        token: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| StateError::query("get_scoped_db_sync_token", e))
+        })
+        .await
+    }
+
+    pub(crate) async fn upsert_scoped_db_sync_token(
+        &self,
+        token: ScopedDbSyncToken,
+    ) -> Result<(), StateError> {
+        self.with_conn("upsert_scoped_db_sync_token", move |conn| {
+            let now = Utc::now().timestamp();
+            conn.execute(
+                "INSERT INTO scoped_db_sync_tokens \
+                    (provider, account, shape_version, scope_hash, selected_zones_json, scope_json, token, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8) \
+                 ON CONFLICT(provider, account, shape_version, scope_hash) DO UPDATE SET \
+                    selected_zones_json = excluded.selected_zones_json, \
+                    scope_json = excluded.scope_json, \
+                    token = excluded.token, \
+                    updated_at = excluded.updated_at",
+                rusqlite::params![
+                    token.provider,
+                    token.account,
+                    token.shape_version,
+                    token.scope_hash,
+                    token.selected_zones_json,
+                    token.scope_json,
+                    token.token,
+                    now,
+                ],
+            )
+            .map_err(|e| StateError::query("upsert_scoped_db_sync_token", e))?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn delete_scoped_db_sync_tokens(&self) -> Result<u64, StateError> {
+        self.with_conn("delete_scoped_db_sync_tokens", move |conn| {
+            let deleted = conn
+                .execute("DELETE FROM scoped_db_sync_tokens", [])
+                .map_err(|e| StateError::query("delete_scoped_db_sync_tokens", e))?;
             Ok(deleted as u64)
         })
         .await
@@ -3691,6 +2452,10 @@ impl SqliteStateDb {
         .await
     }
 
+    #[allow(
+        dead_code,
+        reason = "live membership lookup is exercised by focused tests and reserved for future album-routing reads"
+    )]
     pub(crate) async fn get_live_album_memberships_for_asset(
         &self,
         library: &str,
@@ -4193,6 +2958,10 @@ impl ReportStateStore for SqliteStateDb {
         SqliteStateDb::get_downloaded_page(self, offset, limit).await
     }
 
+    async fn start_sync_run_at(&self, started_at: DateTime<Utc>) -> Result<i64, StateError> {
+        SqliteStateDb::start_sync_run_at(self, started_at).await
+    }
+
     async fn start_sync_run(&self) -> Result<i64, StateError> {
         SqliteStateDb::start_sync_run(self).await
     }
@@ -4218,6 +2987,28 @@ impl SyncTokenStore for SqliteStateDb {
 
     async fn delete_metadata_by_prefix(&self, prefix: &str) -> Result<u64, StateError> {
         SqliteStateDb::delete_metadata_by_prefix(self, prefix).await
+    }
+
+    async fn get_scoped_db_sync_token(
+        &self,
+        provider: &str,
+        account: &str,
+        shape_version: i64,
+        scope_hash: &str,
+    ) -> Result<Option<ScopedDbSyncToken>, StateError> {
+        SqliteStateDb::get_scoped_db_sync_token(self, provider, account, shape_version, scope_hash)
+            .await
+    }
+
+    async fn upsert_scoped_db_sync_token(
+        &self,
+        token: ScopedDbSyncToken,
+    ) -> Result<(), StateError> {
+        SqliteStateDb::upsert_scoped_db_sync_token(self, token).await
+    }
+
+    async fn delete_scoped_db_sync_tokens(&self) -> Result<u64, StateError> {
+        SqliteStateDb::delete_scoped_db_sync_tokens(self).await
     }
 
     async fn begin_enum_progress(&self, zone: &str) -> Result<(), StateError> {
@@ -4614,6 +3405,65 @@ mod tests {
 
     fn test_dir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    #[derive(Debug)]
+    struct AssetWriterContractRow {
+        status: String,
+        downloaded_at: Option<i64>,
+        local_path: Option<String>,
+        local_checksum: Option<String>,
+        download_checksum: Option<String>,
+        last_error: Option<String>,
+        is_deleted: bool,
+        deleted_at: Option<i64>,
+    }
+
+    fn read_asset_writer_contract_row(
+        db: &SqliteStateDb,
+        asset_id: &str,
+    ) -> AssetWriterContractRow {
+        let conn = db.acquire_lock("read_asset_writer_contract_row").unwrap();
+        conn.query_row(
+            "SELECT status, downloaded_at, local_path, local_checksum, download_checksum, \
+             last_error, is_deleted, deleted_at FROM assets \
+             WHERE library = 'PrimarySync' AND id = ?1 AND version_size = 'original'",
+            [asset_id],
+            |row| {
+                let is_deleted: i64 = row.get(6)?;
+                Ok(AssetWriterContractRow {
+                    status: row.get(0)?,
+                    downloaded_at: row.get(1)?,
+                    local_path: row.get(2)?,
+                    local_checksum: row.get(3)?,
+                    download_checksum: row.get(4)?,
+                    last_error: row.get(5)?,
+                    is_deleted: is_deleted != 0,
+                    deleted_at: row.get(7)?,
+                })
+            },
+        )
+        .unwrap()
+    }
+
+    fn assert_downloaded_tombstone_row(
+        db: &SqliteStateDb,
+        asset_id: &str,
+        path: &Path,
+        deleted_at: DateTime<Utc>,
+    ) {
+        let row = read_asset_writer_contract_row(db, asset_id);
+        assert_eq!(row.status, "downloaded");
+        assert!(
+            row.downloaded_at.is_some(),
+            "download writer state must preserve downloaded_at"
+        );
+        assert_eq!(row.local_path, Some(path.to_string_lossy().into_owned()));
+        assert_eq!(row.local_checksum.as_deref(), Some("local_hash"));
+        assert_eq!(row.download_checksum.as_deref(), Some("download_hash"));
+        assert_eq!(row.last_error, None);
+        assert!(row.is_deleted);
+        assert_eq!(row.deleted_at, Some(deleted_at.timestamp()));
     }
 
     #[tokio::test]
@@ -5166,6 +4016,7 @@ mod tests {
             assets_failed: 5,
             enumeration_errors: 0,
             interrupted: false,
+            ..Default::default()
         };
 
         db.complete_sync_run(run_id, &stats).await.unwrap();
@@ -5173,6 +4024,55 @@ mod tests {
         let summary = db.get_summary().await.unwrap();
         assert!(summary.last_sync_started.is_some());
         assert!(summary.last_sync_completed.is_some());
+    }
+
+    #[tokio::test]
+    async fn summary_tracks_running_sync_even_when_latest_row_completed() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        let active_start = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let active_run_id = db.start_sync_run_at(active_start).await.unwrap();
+        let completed_run_id = db
+            .start_sync_run_at(Utc.timestamp_opt(1_700_000_030, 0).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            completed_run_id > active_run_id,
+            "completed row must be newest by id for this regression"
+        );
+
+        let stats = SyncRunStats {
+            assets_seen: 1,
+            assets_downloaded: 1,
+            assets_failed: 0,
+            enumeration_errors: 0,
+            interrupted: false,
+            ..Default::default()
+        };
+        db.complete_sync_run(completed_run_id, &stats)
+            .await
+            .unwrap();
+
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(summary.active_sync_started, Some(active_start));
+        assert!(
+            summary.last_sync_completed.is_some(),
+            "latest completed row should still be available for non-active status"
+        );
+    }
+
+    #[tokio::test]
+    async fn summary_lists_full_enumeration_progress_markers() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        db.begin_enum_progress("SharedSync-Z").await.unwrap();
+        db.begin_enum_progress("PrimarySync").await.unwrap();
+
+        let summary = db.get_summary().await.unwrap();
+        assert_eq!(
+            summary.active_enumeration_zones,
+            vec!["PrimarySync", "SharedSync-Z"]
+        );
     }
 
     // ── sync_runs status lifecycle ─────────────────────────────────────────
@@ -5198,6 +4098,7 @@ mod tests {
             assets_failed: 0,
             enumeration_errors: 0,
             interrupted: false,
+            ..Default::default()
         };
         db.complete_sync_run(run_id, &stats).await.unwrap();
         assert_eq!(status_of(&db, run_id), "complete");
@@ -5215,6 +4116,7 @@ mod tests {
             assets_failed: 0,
             enumeration_errors: 17,
             interrupted: false,
+            ..Default::default()
         };
         db.complete_sync_run(run_id, &stats).await.unwrap();
 
@@ -5233,6 +4135,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn complete_sync_run_persists_inventory_columns() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let run_id = db.start_sync_run().await.unwrap();
+        let stats = SyncRunStats {
+            api_total_at_start: Some(95),
+            api_total_at_start_partial: true,
+            inventory_drop_warnings: 1,
+            inventory_drop_previous_total: Some(100),
+            inventory_drop_current_total: Some(95),
+            inventory_drop_library: Some("PrimarySync".to_string()),
+            ..Default::default()
+        };
+        db.complete_sync_run(run_id, &stats).await.unwrap();
+
+        let conn = db.acquire_lock("test_inventory_columns").unwrap();
+        let stored: (
+            Option<i64>,
+            i64,
+            i64,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT api_total_at_start, api_total_at_start_partial, \
+                        inventory_drop_detected, inventory_drop_previous_total, \
+                        inventory_drop_current_total, inventory_drop_library \
+                 FROM sync_runs WHERE id = ?1",
+                [run_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            stored,
+            (
+                Some(95),
+                1,
+                1,
+                Some(100),
+                Some(95),
+                Some("PrimarySync".to_string())
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn complete_sync_run_unknown_id_returns_error() {
         let db = SqliteStateDb::open_in_memory().unwrap();
         let stats = SyncRunStats {
@@ -5241,6 +4198,7 @@ mod tests {
             assets_failed: 1,
             enumeration_errors: 0,
             interrupted: false,
+            ..Default::default()
         };
 
         let err = db
@@ -5275,6 +4233,7 @@ mod tests {
             assets_failed: 0,
             enumeration_errors: 0,
             interrupted: true,
+            ..Default::default()
         };
         db.complete_sync_run(run_id, &stats).await.unwrap();
         assert_eq!(status_of(&db, run_id), "interrupted");
@@ -5293,6 +4252,7 @@ mod tests {
             assets_failed: 0,
             enumeration_errors: 0,
             interrupted: false,
+            ..Default::default()
         };
         db.complete_sync_run(c, &clean).await.unwrap();
 
@@ -5314,6 +4274,7 @@ mod tests {
             assets_failed: 0,
             enumeration_errors: 0,
             interrupted: false,
+            ..Default::default()
         };
         db.complete_sync_run(run_id, &stats).await.unwrap();
 
@@ -5396,6 +4357,7 @@ mod tests {
             assets_failed: 0,
             enumeration_errors: 0,
             interrupted: false,
+            ..Default::default()
         };
         db.complete_sync_run(r1, &stats).await.unwrap();
 
@@ -6048,6 +5010,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scoped_db_sync_token_roundtrips_by_exact_scope_key() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let row = ScopedDbSyncToken {
+            provider: "icloud".to_string(),
+            account: "test@example.com".to_string(),
+            shape_version: 1,
+            scope_hash: "scope-a".to_string(),
+            selected_zones_json: r#"["PrimarySync"]"#.to_string(),
+            scope_json: r#"{"coverage":{"kind":"bounded-recent-count","count":1000}}"#.to_string(),
+            token: "db-token-a".to_string(),
+        };
+
+        db.upsert_scoped_db_sync_token(row.clone()).await.unwrap();
+
+        let loaded = db
+            .get_scoped_db_sync_token("icloud", "test@example.com", 1, "scope-a")
+            .await
+            .unwrap()
+            .expect("scoped token should exist");
+        assert_eq!(loaded, row);
+        assert!(
+            db.get_scoped_db_sync_token("icloud", "test@example.com", 1, "scope-b")
+                .await
+                .unwrap()
+                .is_none(),
+            "different scope hash must not reuse the token"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_db_sync_token_upsert_preserves_created_at_and_updates_token() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let mut row = ScopedDbSyncToken {
+            provider: "icloud".to_string(),
+            account: "test@example.com".to_string(),
+            shape_version: 1,
+            scope_hash: "scope-a".to_string(),
+            selected_zones_json: r#"["PrimarySync"]"#.to_string(),
+            scope_json: r#"{"coverage":{"kind":"complete"}}"#.to_string(),
+            token: "db-token-a".to_string(),
+        };
+        db.upsert_scoped_db_sync_token(row.clone()).await.unwrap();
+        row.token = "db-token-b".to_string();
+        db.upsert_scoped_db_sync_token(row.clone()).await.unwrap();
+
+        let loaded = db
+            .get_scoped_db_sync_token("icloud", "test@example.com", 1, "scope-a")
+            .await
+            .unwrap()
+            .expect("scoped token should exist");
+        assert_eq!(loaded.token, "db-token-b");
+
+        let conn = db.conn.lock().unwrap();
+        let (created_at, updated_at): (i64, i64) = conn
+            .query_row(
+                "SELECT created_at, updated_at FROM scoped_db_sync_tokens \
+                 WHERE provider = 'icloud' AND account = 'test@example.com' \
+                    AND shape_version = 1 AND scope_hash = 'scope-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            updated_at >= created_at,
+            "updated_at must not move backwards"
+        );
+    }
+
+    #[tokio::test]
     async fn test_touch_last_seen() {
         let db = SqliteStateDb::open_in_memory().unwrap();
 
@@ -6439,6 +5470,7 @@ mod tests {
             assets_failed: 0,
             enumeration_errors: 0,
             interrupted: false,
+            ..Default::default()
         };
         db.complete_sync_run(run_id, &stats).await.unwrap();
 
@@ -8098,6 +7130,68 @@ mod tests {
             );
             assert_eq!(rec.metadata.deleted_at, Some(when));
         }
+    }
+
+    #[tokio::test]
+    async fn mark_soft_deleted_then_mark_downloaded_preserves_tombstone() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let rec = TestAssetRecord::new("DEL_DL_1")
+            .checksum("remote_hash")
+            .build();
+        db.upsert_seen(&rec).await.unwrap();
+        db.mark_failed("PrimarySync", "DEL_DL_1", "original", "prior failure")
+            .await
+            .unwrap();
+        let deleted_at = Utc.timestamp_opt(1_700_000_001, 0).unwrap();
+        db.mark_soft_deleted("PrimarySync", "DEL_DL_1", Some(deleted_at))
+            .await
+            .unwrap();
+
+        let dir = test_dir();
+        let path = dir.path().join("photo.jpg");
+        std::fs::write(&path, b"x").unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "DEL_DL_1",
+            "original",
+            &path,
+            "local_hash",
+            Some("download_hash"),
+        )
+        .await
+        .unwrap();
+
+        assert_downloaded_tombstone_row(&db, "DEL_DL_1", &path, deleted_at);
+    }
+
+    #[tokio::test]
+    async fn mark_downloaded_then_mark_soft_deleted_preserves_download_state() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let rec = TestAssetRecord::new("DL_DEL_1")
+            .checksum("remote_hash")
+            .build();
+        db.upsert_seen(&rec).await.unwrap();
+
+        let dir = test_dir();
+        let path = dir.path().join("photo.jpg");
+        std::fs::write(&path, b"x").unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "DL_DEL_1",
+            "original",
+            &path,
+            "local_hash",
+            Some("download_hash"),
+        )
+        .await
+        .unwrap();
+
+        let deleted_at = Utc.timestamp_opt(1_700_000_002, 0).unwrap();
+        db.mark_soft_deleted("PrimarySync", "DL_DEL_1", Some(deleted_at))
+            .await
+            .unwrap();
+
+        assert_downloaded_tombstone_row(&db, "DL_DEL_1", &path, deleted_at);
     }
 
     #[tokio::test]

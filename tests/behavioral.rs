@@ -81,7 +81,7 @@ fn sanitize_username(username: &str) -> String {
 /// any schema bump in `src/state/schema.rs` fails the suite until this
 /// helper is updated to match, preventing silent drift between the
 /// helper's "fresh DB" shape and what the binary expects.
-const HELPER_SCHEMA_VERSION: i32 = 12;
+const HELPER_SCHEMA_VERSION: i32 = 14;
 
 /// Create a state DB at the expected path for the given username inside
 /// `data_dir`. Mirrors the current schema from `src/state/schema.rs`
@@ -157,7 +157,13 @@ fn create_state_db(data_dir: &std::path::Path, username: &str) -> rusqlite::Conn
             assets_failed INTEGER DEFAULT 0,
             interrupted INTEGER DEFAULT 0,
             status TEXT NOT NULL DEFAULT 'running',
-            enumeration_errors INTEGER NOT NULL DEFAULT 0
+            enumeration_errors INTEGER NOT NULL DEFAULT 0,
+            api_total_at_start INTEGER,
+            api_total_at_start_partial INTEGER NOT NULL DEFAULT 0,
+            inventory_drop_detected INTEGER NOT NULL DEFAULT 0,
+            inventory_drop_previous_total INTEGER,
+            inventory_drop_current_total INTEGER,
+            inventory_drop_library TEXT
         );
 
         CREATE TABLE IF NOT EXISTS metadata (
@@ -225,6 +231,19 @@ fn create_state_db(data_dir: &std::path::Path, username: &str) -> rusqlite::Conn
             ON asset_album_memberships (library, asset_record_name, is_deleted);
         CREATE INDEX IF NOT EXISTS idx_asset_album_memberships_container
             ON asset_album_memberships (library, container_id, is_deleted);
+
+        CREATE TABLE IF NOT EXISTS scoped_db_sync_tokens (
+            provider TEXT NOT NULL,
+            account TEXT NOT NULL,
+            shape_version INTEGER NOT NULL,
+            scope_hash TEXT NOT NULL,
+            selected_zones_json TEXT NOT NULL,
+            scope_json TEXT NOT NULL,
+            token TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (provider, account, shape_version, scope_hash)
+        );
         ",
     )
     .unwrap();
@@ -258,7 +277,7 @@ fn insert_asset(
 
 /// Pin the helper schema version against the binary's
 /// production constant. The binary writes a fresh DB at
-/// `state::schema::SCHEMA_VERSION` (currently 12). The helper above
+/// `state::schema::SCHEMA_VERSION` (currently 14). The helper above
 /// claims to "Mirror the latest schema" and must therefore land on the
 /// same version. Otherwise existing tests rely on the binary's
 /// migrate() loop to fill in columns and we lose end-to-end coverage of
@@ -276,7 +295,7 @@ fn behavioral_helper_schema_matches_production() {
     // update the DDL in `create_state_db` above to match the new
     // shape. The fresh-DB DDL emitted by a real binary run can be
     // dumped via `sqlite3 <db> '.schema'` for reference.
-    const PRODUCTION_SCHEMA_VERSION: i32 = 12;
+    const PRODUCTION_SCHEMA_VERSION: i32 = 14;
     assert_eq!(
         HELPER_SCHEMA_VERSION, PRODUCTION_SCHEMA_VERSION,
         "behavioral.rs::create_state_db schema is out of sync with \
@@ -1428,6 +1447,242 @@ fn status_shows_counts() {
     assert!(stdout.contains("Failed:     1"), "stdout: {stdout}");
     assert!(stdout.contains("Pending:    1"), "stdout: {stdout}");
 }
+
+#[test]
+fn status_shows_safe_backup_summary_after_clean_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+    insert_asset(
+        &conn,
+        "a1",
+        "downloaded",
+        "photo1.jpg",
+        Some("/p/photo1.jpg"),
+        None,
+        None,
+    );
+    conn.execute(
+        "INSERT INTO sync_runs (
+            started_at, completed_at, status, assets_seen, assets_downloaded,
+            assets_failed, interrupted, enumeration_errors
+         ) VALUES (?1, ?2, 'complete', 1, 1, 0, 0, 0)",
+        rusqlite::params![1_700_000_000_i64, 1_700_000_010_i64],
+    )
+    .unwrap();
+    drop(conn);
+
+    let out = clean_cmd()
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["status"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(
+            "Backup status: safe - last sync completed and no pending or failed assets are recorded"
+        ),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn status_shows_unsafe_backup_summary_with_last_run_reasons() {
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+    insert_asset(
+        &conn,
+        "a1",
+        "failed",
+        "photo1.jpg",
+        None,
+        Some("timeout"),
+        None,
+    );
+    insert_asset(&conn, "a2", "pending", "photo2.jpg", None, None, None);
+    conn.execute(
+        "INSERT INTO sync_runs (
+            started_at, completed_at, status, assets_seen, assets_downloaded,
+            assets_failed, interrupted, enumeration_errors
+         ) VALUES (?1, ?2, 'complete', 2, 0, 1, 0, 2)",
+        rusqlite::params![1_700_000_000_i64, 1_700_000_010_i64],
+    )
+    .unwrap();
+    drop(conn);
+
+    let out = clean_cmd()
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["status"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(
+            "Backup status: unsafe - 1 asset failed in the last sync; 2 enumeration errors occurred in the last sync; 1 failed asset remains; 1 pending asset remains"
+        ),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn status_shows_api_total_and_inventory_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+    insert_asset(
+        &conn,
+        "a1",
+        "downloaded",
+        "photo1.jpg",
+        Some("/p/photo1.jpg"),
+        None,
+        None,
+    );
+    conn.execute(
+        "INSERT INTO sync_runs (
+            started_at, completed_at, status, api_total_at_start,
+            inventory_drop_detected, inventory_drop_previous_total,
+            inventory_drop_current_total, inventory_drop_library
+         ) VALUES (?1, ?2, 'complete', ?3, 1, ?4, ?5, ?6)",
+        rusqlite::params![
+            1_700_000_000_i64,
+            1_700_000_010_i64,
+            95_i64,
+            100_i64,
+            95_i64,
+            "PrimarySync"
+        ],
+    )
+    .unwrap();
+    drop(conn);
+
+    let out = clean_cmd()
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["status"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Last API total at start: 95"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "Inventory warning: PrimarySync dropped 5 assets since the previous comparable full run (100 -> 95)"
+        ),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn status_shows_partial_api_total() {
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+    insert_asset(&conn, "a1", "pending", "photo1.jpg", None, None, None);
+    conn.execute(
+        "INSERT INTO sync_runs (
+            started_at, completed_at, status, api_total_at_start,
+            api_total_at_start_partial
+         ) VALUES (?1, ?2, 'complete', ?3, 1)",
+        rusqlite::params![1_700_000_000_i64, 1_700_000_010_i64, 95_i64],
+    )
+    .unwrap();
+    drop(conn);
+
+    let out = clean_cmd()
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["status"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Last API total at start: partial, 95"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn status_prefers_running_sync_over_newer_completed_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+    insert_asset(&conn, "a1", "pending", "photo1.jpg", None, None, None);
+    conn.execute(
+        "INSERT INTO sync_runs (started_at, status) VALUES (?1, 'running')",
+        rusqlite::params![1_700_000_000_i64],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sync_runs (started_at, completed_at, status) \
+         VALUES (?1, ?2, 'complete')",
+        rusqlite::params![1_700_000_030_i64, 1_700_000_040_i64],
+    )
+    .unwrap();
+    drop(conn);
+
+    let out = clean_cmd()
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["status"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Sync in progress:   started 2023-11-14 22:13:20 UTC"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Last sync completed:"),
+        "active status must not imply the whole sync completed: {stdout}"
+    );
+    assert!(stdout.contains("Pending:    1"), "stdout: {stdout}");
+}
+
+#[test]
+fn status_shows_full_enumeration_progress_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(dir.path(), username);
+    insert_asset(&conn, "a1", "pending", "photo1.jpg", None, None, None);
+    conn.execute(
+        "INSERT INTO metadata (key, value) VALUES (?1, ?2)",
+        rusqlite::params!["enum_in_progress:PrimarySync", "1700000000"],
+    )
+    .unwrap();
+    drop(conn);
+
+    let out = clean_cmd()
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", dir.path())
+        .args(["status"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Full enumeration in progress: PrimarySync"),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("Pending:    1"), "stdout: {stdout}");
+}
+
 #[test]
 fn status_failed_shows_error_messages() {
     let dir = tempfile::tempdir().unwrap();
@@ -1705,6 +1960,13 @@ fn reset_sync_token_clears_tokens() {
         [],
     )
     .unwrap();
+    conn.execute(
+        "INSERT INTO scoped_db_sync_tokens \
+            (provider, account, shape_version, scope_hash, selected_zones_json, scope_json, token, created_at, updated_at) \
+         VALUES ('icloud', 'test@example.com', 1, 'scope-a', '[\"PrimarySync\"]', '{\"scope\":\"a\"}', 'scoped-tok-123', 1, 1)",
+        [],
+    )
+    .unwrap();
     drop(conn);
 
     let out = clean_cmd()
@@ -1742,6 +2004,12 @@ fn reset_sync_token_clears_tokens() {
         .unwrap();
     // db_sync_token is set to empty string, not deleted
     assert_eq!(db_token, "", "db_sync_token should be cleared to empty");
+    let scoped_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM scoped_db_sync_tokens", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(scoped_count, 0, "scoped db tokens should be deleted");
 }
 #[test]
 fn reset_state_without_yes_on_non_tty() {
@@ -2946,7 +3214,7 @@ fn reconcile_subcommand_marks_missing_and_preserves_present() {
     let conn = create_state_db(data_dir.path(), username);
 
     let present_path = photos_dir.path().join("present.jpg");
-    std::fs::write(&present_path, b"x").unwrap();
+    std::fs::write(&present_path, vec![0u8; 1000]).unwrap();
     let missing_path = photos_dir.path().join("gone.jpg");
 
     insert_asset(
@@ -3019,6 +3287,56 @@ fn reconcile_subcommand_marks_missing_and_preserves_present() {
         .unwrap();
     assert_eq!(present_status, "downloaded");
 }
+
+#[test]
+fn reconcile_marks_truncated_file_failed() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let photos_dir = tempfile::tempdir().unwrap();
+    let username = "test@example.com";
+    let conn = create_state_db(data_dir.path(), username);
+
+    let truncated_path = photos_dir.path().join("truncated.jpg");
+    std::fs::write(&truncated_path, b"short").unwrap();
+    insert_asset(
+        &conn,
+        "TRUNCATED",
+        "downloaded",
+        "truncated.jpg",
+        Some(truncated_path.to_str().unwrap()),
+        None,
+        None,
+    );
+    drop(conn);
+
+    let out = clean_cmd()
+        .env("ICLOUD_USERNAME", username)
+        .env("KEI_DATA_DIR", data_dir.path())
+        .args(["reconcile"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("TRUNCATED:"), "stdout: {stdout}");
+    assert!(stdout.contains("Damaged:  1"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("Marked failed: 1"),
+        "one drifted row must be re-queued: {stdout}"
+    );
+
+    let db_name = format!("{}.db", sanitize_username(username));
+    let conn = rusqlite::Connection::open(data_dir.path().join(db_name)).unwrap();
+    let (status, error): (String, String) = conn
+        .query_row(
+            "SELECT status, last_error FROM assets WHERE id = 'TRUNCATED'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "failed");
+    assert_eq!(error, "FILE_TRUNCATED_AT_STARTUP");
+}
+
 #[test]
 fn reconcile_dry_run_reports_but_does_not_mutate() {
     let data_dir = tempfile::tempdir().unwrap();
@@ -3139,6 +3457,14 @@ fn behavioral_helper_carries_every_migrated_column() {
     assert!(
         has_column(&conn, "assets", "imported_mtime"),
         "v11 column assets.imported_mtime must exist in the behavioral helper's DDL"
+    );
+    assert!(
+        has_column(&conn, "sync_runs", "api_total_at_start"),
+        "v13 column sync_runs.api_total_at_start must exist in the behavioral helper's DDL"
+    );
+    assert!(
+        has_column(&conn, "sync_runs", "inventory_drop_detected"),
+        "v13 column sync_runs.inventory_drop_detected must exist in the behavioral helper's DDL"
     );
 
     let has_asset_albums: bool = conn

@@ -56,6 +56,31 @@ enum WatchPrecheck {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncAuthErrorClass {
+    TwoFactorRequired,
+    LockContention,
+    Other,
+}
+
+/// Classify auth errors at the sync-loop orchestration boundary.
+///
+/// The sync loop uses these classes for distinct behaviors: initial-auth 2FA
+/// wait, mid-cycle reauth 2FA wait vs one-shot return, and lock-reacquire
+/// shutdown messaging. Callers still return the original `anyhow::Error`.
+fn classify_sync_auth_error(err: &anyhow::Error) -> SyncAuthErrorClass {
+    let Some(auth_err) = err.downcast_ref::<auth::error::AuthError>() else {
+        return SyncAuthErrorClass::Other;
+    };
+    if auth_err.is_two_factor_required() {
+        SyncAuthErrorClass::TwoFactorRequired
+    } else if auth_err.is_lock_contention() {
+        SyncAuthErrorClass::LockContention
+    } else {
+        SyncAuthErrorClass::Other
+    }
+}
+
 impl WatchPrecheck {
     fn proceed_all() -> Self {
         Self::Proceed {
@@ -103,8 +128,98 @@ const SHARED_LIBRARY_NOTICE_KEY: &str = "shared_library_notice_shown_v1";
 const SHARED_LIBRARY_NOTICE_CHECKED_KEY: &str = "shared_library_notice_checked_at_v1";
 const SHARED_LIBRARY_NOTICE_CHECK_TTL_SECS: i64 = 24 * 60 * 60;
 
-/// Metadata key for the database-level token used by `/changes/database`.
+/// Legacy metadata key for the unscoped database-level token used by
+/// `/changes/database` before scoped provenance rows.
+#[cfg(test)]
 const DB_SYNC_TOKEN_KEY: &str = "db_sync_token";
+const SCOPED_DB_SYNC_TOKEN_PROVIDER: &str = "icloud";
+const SCOPED_DB_SYNC_TOKEN_SHAPE_VERSION: i64 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DbPrecheckScope {
+    provider: String,
+    account: String,
+    shape_version: i64,
+    scope_hash: String,
+    selected_zones_json: String,
+    scope_json: String,
+}
+
+impl DbPrecheckScope {
+    fn from_config(
+        config: &config::Config,
+        library_states: &[LibraryState],
+        build_download_config: &crate::sync_cycle::BuildDownloadConfigFn<'_>,
+        enum_config_hash: &str,
+    ) -> anyhow::Result<Self> {
+        let mut selected_zones: Vec<String> =
+            library_states.iter().map(|s| s.zone_name.clone()).collect();
+        selected_zones.sort();
+
+        let download_config_hash = build_download_config(
+            download::SyncMode::Full,
+            Arc::new(rustc_hash::FxHashSet::default()),
+            Arc::new(download::AssetGroupings::default()),
+            Arc::from(
+                selected_zones
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or(crate::icloud::photos::PRIMARY_ZONE_NAME),
+            ),
+        );
+        let download_config_hash = download::hash_download_config(&download_config_hash);
+
+        let selected_zones_json = serde_json::to_string(&selected_zones)
+            .context("serialize scoped database token selected zones")?;
+        let scope_json = download::sync_coverage_fingerprint_json(
+            config,
+            SCOPED_DB_SYNC_TOKEN_PROVIDER,
+            SCOPED_DB_SYNC_TOKEN_SHAPE_VERSION,
+            &selected_zones,
+            enum_config_hash,
+            &download_config_hash,
+        )?;
+        let scope_hash =
+            hash_scoped_db_precheck_scope(SCOPED_DB_SYNC_TOKEN_SHAPE_VERSION, &scope_json);
+
+        Ok(Self {
+            provider: SCOPED_DB_SYNC_TOKEN_PROVIDER.to_string(),
+            account: config.auth.username.clone(),
+            shape_version: SCOPED_DB_SYNC_TOKEN_SHAPE_VERSION,
+            scope_hash,
+            selected_zones_json,
+            scope_json,
+        })
+    }
+
+    fn to_state_row(&self, token: &str) -> state::ScopedDbSyncToken {
+        state::ScopedDbSyncToken {
+            provider: self.provider.clone(),
+            account: self.account.clone(),
+            shape_version: self.shape_version,
+            scope_hash: self.scope_hash.clone(),
+            selected_zones_json: self.selected_zones_json.clone(),
+            scope_json: self.scope_json.clone(),
+            token: token.to_string(),
+        }
+    }
+}
+
+fn hash_scoped_db_precheck_scope(shape_version: i64, scope_json: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+
+    let mut hasher = Sha256::new();
+    hasher.update(shape_version.to_le_bytes());
+    hasher.update(b"\0");
+    hasher.update(scope_json.as_bytes());
+    let hash = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for b in hash {
+        let _ = Write::write_fmt(&mut hex, format_args!("{b:02x}"));
+    }
+    hex
+}
 
 /// Classify whether an error from `init_photos_service` or
 /// `resolve_libraries` indicates a stale session / routing state that
@@ -187,7 +302,7 @@ fn shared_library_notice_recently_checked(checked_at: Option<&str>, now_ts: i64)
 async fn maybe_notify_shared_libraries(
     selector: &crate::selection::LibrarySelector,
     photos_service: &mut crate::icloud::photos::PhotosService,
-    state_db: Option<&dyn state::StateDb>,
+    state_db: Option<&dyn state::SyncTokenStore>,
 ) {
     let Some(db) = state_db else {
         tracing::debug!("shared-library notice: no state DB available; skipping uncached probe");
@@ -481,10 +596,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     .await
     {
         Ok(result) => result,
-        Err(e)
-            if e.downcast_ref::<auth::error::AuthError>()
-                .is_some_and(auth::error::AuthError::is_two_factor_required) =>
-        {
+        Err(e) if classify_sync_auth_error(&e) == SyncAuthErrorClass::TwoFactorRequired => {
             let msg = format!(
                 "2FA required for {u}. Run: kei login get-code",
                 u = config.auth.username
@@ -494,6 +606,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 notifications::Event::TwoFaRequired,
                 &msg,
                 &config.auth.username,
+                None,
                 None,
             );
 
@@ -608,7 +721,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     // Skip for --dry-run so a preview doesn't create the DB or poison
     // sync tokens, which would cause a subsequent real sync to believe
     // nothing has changed and download 0 photos.
-    let state_db: Option<Arc<dyn state::StateDb>> = if config.runtime.dry_run {
+    let state_db: Option<Arc<dyn download::DownloadStore>> = if config.runtime.dry_run {
         None
     } else {
         let db_path = config.auth.cookie_directory.join(format!(
@@ -673,7 +786,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     }
                 }
 
-                Some(db as Arc<dyn state::StateDb>)
+                Some(db as Arc<dyn download::DownloadStore>)
             }
             Err(e) => {
                 anyhow::bail!("Could not open state database {}: {e}", db_path.display());
@@ -687,7 +800,9 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     maybe_notify_shared_libraries(
         &config.filters.selection.libraries,
         &mut photos_service,
-        state_db.as_deref(),
+        state_db
+            .as_deref()
+            .map(|db| db as &dyn state::SyncTokenStore),
     )
     .await;
 
@@ -876,6 +991,12 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         &config.download.folder_structure_albums,
         &config.download.folder_structure_smart_folders,
     );
+    let db_precheck_scope = DbPrecheckScope::from_config(
+        &config,
+        &library_states,
+        &build_download_config,
+        enum_config_hash.as_ref(),
+    )?;
     sd_notifier.notify_ready();
     let _systemd_watchdog_task = sd_notifier.start_watchdog_heartbeat(shutdown_token.clone());
     // Friendly-mode greeting. Lands above any future bar via
@@ -907,7 +1028,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
     let mut health = health::HealthStatus::new();
     let cycle_reporter =
         crate::cycle_reporter::CycleReporter::new(crate::cycle_reporter::CycleReporterConfig {
-            username: &config.auth.username,
             watch_mode: is_watch_mode,
             report_path: config.report.json.as_deref(),
             run_options: crate::report::RunOptions::from_config(&config),
@@ -947,11 +1067,32 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
         // cheap pre-check before refreshing album plans or running a sync.
         // No-change cycles should cost one CloudKit request, not a full
         // album/pass refresh per selected library.
-        let watch_precheck = if is_watch_mode {
-            check_changes_database(state_db.as_deref(), &library_states, &mut photos_service).await
+        let mut watch_precheck = if is_watch_mode {
+            check_changes_database(
+                state_db
+                    .as_deref()
+                    .map(|db| db as &dyn state::SyncTokenStore),
+                &library_states,
+                &mut photos_service,
+                &db_precheck_scope,
+            )
+            .await
         } else {
             WatchPrecheck::proceed_all()
         };
+
+        if !config.runtime.dry_run && !config.runtime.only_print_filenames {
+            if let Some(db) = state_db.as_deref() {
+                let drift = run_bounded_local_drift_probe(db, cycle_index).await;
+                if drift.marked_failed > 0 {
+                    tracing::warn!(
+                        marked_failed = drift.marked_failed,
+                        "Local drift probe found missing or damaged files; forcing this cycle to retry them"
+                    );
+                    watch_precheck = WatchPrecheck::proceed_all();
+                }
+            }
+        }
 
         if matches!(watch_precheck, WatchPrecheck::SkipAll) {
             cycle_reporter.report_skipped_watch_cycle(&mut health).await;
@@ -977,9 +1118,11 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 "Sync cycle starting",
                 &config.auth.username,
                 None,
+                None,
             );
 
             let cycle_started_at = std::time::Instant::now();
+            let cycle_wall_started_at = chrono::Utc::now();
             let cycle_result = run_cycle(
                 &cycle_library_states,
                 &config,
@@ -991,6 +1134,40 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 &shutdown_token,
             )
             .await?;
+            if let Some(db) = state_db.as_deref() {
+                let stats = state::SyncRunStats {
+                    assets_seen: cycle_result.stats.assets_seen,
+                    assets_downloaded: u64::try_from(cycle_result.stats.downloaded)
+                        .unwrap_or(u64::MAX),
+                    assets_failed: u64::try_from(cycle_result.stats.failed).unwrap_or(u64::MAX),
+                    enumeration_errors: u64::try_from(cycle_result.stats.enumeration_errors)
+                        .unwrap_or(u64::MAX),
+                    interrupted: cycle_result.stats.interrupted,
+                    api_total_at_start: cycle_result.stats.api_total_at_start,
+                    api_total_at_start_partial: cycle_result.stats.api_total_at_start_partial,
+                    inventory_drop_warnings: u64::try_from(
+                        cycle_result.stats.inventory_drop_warnings,
+                    )
+                    .unwrap_or(u64::MAX),
+                    inventory_drop_previous_total: cycle_result.stats.inventory_drop_previous_total,
+                    inventory_drop_current_total: cycle_result.stats.inventory_drop_current_total,
+                    inventory_drop_library: cycle_result.stats.inventory_drop_library.clone(),
+                };
+                match db.start_sync_run_at(cycle_wall_started_at).await {
+                    Ok(run_id) => {
+                        if let Err(e) = db.complete_sync_run(run_id, &stats).await {
+                            tracing::warn!(
+                                error = %e,
+                                run_id,
+                                "Failed to complete sync_runs ledger row"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to start sync_runs ledger row");
+                    }
+                }
+            }
 
             if let Some(token) = watch_precheck.db_sync_token_after_success() {
                 if !cycle_result.session_expired
@@ -999,7 +1176,12 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     && cycle_result.db_sync_token_advance_safe
                 {
                     if let Some(db) = state_db.as_deref() {
-                        store_db_sync_token(db, token).await;
+                        store_scoped_db_sync_token(
+                            db as &dyn state::SyncTokenStore,
+                            &db_precheck_scope,
+                            token,
+                        )
+                        .await;
                     }
                 } else {
                     tracing::debug!(
@@ -1011,12 +1193,12 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             cycle_reporter
                 .report_completed_cycle(
                     &mut health,
-                    crate::cycle_reporter::CycleReportInput {
-                        stats: &cycle_result.stats,
-                        failed_count: cycle_result.failed_count,
-                        session_expired: cycle_result.session_expired,
-                        elapsed: cycle_started_at.elapsed(),
-                    },
+                    crate::cycle_reporter::CycleFacts::new(
+                        &cycle_result.stats,
+                        cycle_result.failed_count,
+                        cycle_result.session_expired,
+                        cycle_started_at.elapsed(),
+                    ),
                 )
                 .await;
 
@@ -1047,8 +1229,8 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                         continue; // Restart entire cycle
                     }
                     Err(e)
-                        if e.downcast_ref::<auth::error::AuthError>()
-                            .is_some_and(auth::error::AuthError::is_two_factor_required) =>
+                        if classify_sync_auth_error(&e)
+                            == SyncAuthErrorClass::TwoFactorRequired =>
                     {
                         // 2FA is user action, not a failed attempt -- don't
                         // burn reauth_attempts so false wakeups from get-code
@@ -1064,6 +1246,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                             notifications::Event::TwoFaRequired,
                             &msg,
                             &config.auth.username,
+                            None,
                             None,
                         );
                         if !should_wait_for_2fa(is_watch_mode, &e) {
@@ -1092,6 +1275,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                             &format!("Re-authentication failed: {e}"),
                             &config.auth.username,
                             None,
+                            None,
                         );
                         return Err(e);
                     }
@@ -1113,18 +1297,17 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             }
         }
 
-        // Periodic local-vs-state reconciliation. Read-only walk that
-        // surfaces missing files via `tracing::warn!`. State rows are NEVER
-        // mutated here -- the manual `kei reconcile` subcommand still owns
-        // the failed-status transition. Long-running daemons drift between
-        // assets.local_path and what's on disk (manual rm, mount glitches,
-        // etc.); a periodic visible signal beats waiting for the next sync
-        // to stumble over the missing files.
+        // Periodic local-vs-state reconciliation. This full-catalog walk is
+        // read-only and surfaces missing or damaged files via `tracing::warn!`.
+        // The bounded pre-cycle probe owns automatic requeue for the rows it
+        // samples; `kei reconcile` remains the explicit full repair command
+        // for operators who want to sweep the whole state DB immediately.
         if is_watch_mode
             && should_reconcile_this_cycle(cycle_index, config.watch.reconcile_every_n_cycles)
         {
             if let Some(db) = state_db.as_ref() {
-                run_periodic_reconcile(db.as_ref(), cycle_index).await;
+                run_periodic_reconcile(db.as_ref() as &dyn state::ReportStateStore, cycle_index)
+                    .await;
             }
         }
 
@@ -1145,19 +1328,6 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
 
             sd_notifier.notify_status(&format!("Waiting {interval} seconds..."));
             tracing::info!(interval_secs = interval, "Waiting before next cycle");
-            // `interval` is u64 seconds; chrono Add panics on overflow.
-            // Skip the heartbeat for the (impossible-in-practice) case where
-            // the interval doesn't fit in a wall-clock instant.
-            if let Some(wake_at) = i64::try_from(interval)
-                .ok()
-                .and_then(chrono::Duration::try_seconds)
-                .and_then(|d| chrono::Local::now().checked_add_signed(d))
-            {
-                crate::personality::narration::sleeping_until_to_stderr(
-                    config.ui.personality_mode,
-                    wake_at,
-                );
-            }
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
                 () = shutdown_token.cancelled() => {
@@ -1232,7 +1402,6 @@ async fn maybe_write_offline_fake_sync_report(
 
     let reporter = crate::cycle_reporter::CycleReporter::<state::SqliteStateDb>::new(
         crate::cycle_reporter::CycleReporterConfig {
-            username: &config.auth.username,
             watch_mode: config.watch.interval.is_some(),
             report_path: Some(report_path),
             run_options: crate::report::RunOptions::from_config(config),
@@ -1261,12 +1430,12 @@ async fn maybe_write_offline_fake_sync_report(
     reporter
         .report_completed_cycle(
             &mut health,
-            crate::cycle_reporter::CycleReportInput {
-                stats: &stats,
-                failed_count: 0,
-                session_expired: false,
-                elapsed: std::time::Duration::from_millis(125),
-            },
+            crate::cycle_reporter::CycleFacts::new(
+                &stats,
+                0,
+                false,
+                std::time::Duration::from_millis(125),
+            ),
         )
         .await;
 
@@ -1311,10 +1480,7 @@ async fn reauth_with_srp(
     .await
     {
         Ok(result) => Ok(result),
-        Err(e)
-            if e.downcast_ref::<auth::error::AuthError>()
-                .is_some_and(auth::error::AuthError::is_two_factor_required) =>
-        {
+        Err(e) if classify_sync_auth_error(&e) == SyncAuthErrorClass::TwoFactorRequired => {
             let msg = format!(
                 "2FA required for {u}. Run: kei login get-code",
                 u = config.auth.username
@@ -1324,6 +1490,7 @@ async fn reauth_with_srp(
                 notifications::Event::TwoFaRequired,
                 &msg,
                 &config.auth.username,
+                None,
                 None,
             );
             wait_and_retry_2fa(&config.auth.cookie_directory, &config.auth.username, || {
@@ -1345,54 +1512,67 @@ async fn reauth_with_srp(
 }
 
 /// Walk every `downloaded` row in the state DB and warn when the
-/// recorded `local_path` is missing on disk. Read-only — no rows are mutated
-/// (the manual `kei reconcile` CLI still owns the `downloaded -> failed`
-/// transition). Triggered on a fixed cadence by the watch loop; surfaces
-/// long-running drift that the next sync would otherwise re-discover only
-/// after stumbling over the missing files.
+/// recorded `local_path` is missing or shorter than expected. Read-only - no
+/// rows are mutated by this periodic full-catalog walk. Triggered on a fixed
+/// cadence by the watch loop so operators can see drift outside the bounded
+/// pre-cycle probe.
 ///
 /// Errors from the DB scan are logged at `warn!` rather than propagated:
 /// the periodic walk is a diagnostic, not a load-bearing correctness gate,
 /// and a transient SQLite hiccup must not crash the watch daemon.
-async fn run_periodic_reconcile(db: &dyn state::StateDb, cycle_index: u64) {
-    use crate::commands::reconcile::{scan_missing, MissingAsset};
+async fn run_periodic_reconcile(db: &dyn state::ReportStateStore, cycle_index: u64) {
+    use crate::commands::reconcile::{scan_local_drift, LocalDriftAsset, LocalDriftKind};
     tracing::info!(
         cycle_index,
-        "Periodic reconciliation: scanning state DB for missing local files"
+        "Periodic reconciliation: scanning state DB for missing or damaged local files"
     );
     let mut sample_logged = 0usize;
     const SAMPLE_LOG_CAP: usize = 25;
     // Cap per-cycle log spam at SAMPLE_LOG_CAP missing entries; the
     // aggregate count is logged below regardless of how many fired.
-    let report_missing = |m: &MissingAsset| {
+    let report_drift = |m: &LocalDriftAsset| {
         if sample_logged < SAMPLE_LOG_CAP {
-            tracing::warn!(
-                asset_id = %m.id,
-                version_size = m.version_size.as_str(),
-                path = %m.local_path.display(),
-                "Reconcile: state row marks asset downloaded but local file is missing"
-            );
+            match m.kind {
+                LocalDriftKind::Missing => tracing::warn!(
+                    asset_id = %m.id,
+                    version_size = m.version_size.as_str(),
+                    path = %m.local_path.display(),
+                    "Reconcile: state row marks asset downloaded but local file is missing"
+                ),
+                LocalDriftKind::Truncated {
+                    actual_size,
+                    expected_size,
+                } => tracing::warn!(
+                    asset_id = %m.id,
+                    version_size = m.version_size.as_str(),
+                    path = %m.local_path.display(),
+                    actual_size,
+                    expected_size,
+                    "Reconcile: state row marks asset downloaded but local file is smaller than expected"
+                ),
+            }
             sample_logged += 1;
         }
     };
     let report_no_path = |id: &str| {
         tracing::debug!(asset_id = %id, "Reconcile: downloaded row has no local_path recorded");
     };
-    let scan = scan_missing(db, report_missing, report_no_path).await;
+    let scan = scan_local_drift(db, report_drift, report_no_path).await;
     match scan {
-        Ok((counts, missing)) => {
-            if missing.is_empty() && counts.no_path == 0 {
+        Ok((counts, drifted)) => {
+            if drifted.is_empty() && counts.no_path == 0 {
                 tracing::info!(
                     present = counts.present,
-                    "Periodic reconciliation: all downloaded files present on disk"
+                    "Periodic reconciliation: all downloaded files look present on disk"
                 );
             } else {
                 tracing::warn!(
                     present = counts.present,
                     missing = counts.missing,
+                    damaged = counts.damaged,
                     no_path = counts.no_path,
                     sample_logged,
-                    "Periodic reconciliation: drift detected; run `kei reconcile` to mark missing files for re-download"
+                    "Periodic reconciliation: drift detected; run `kei reconcile` to mark local drift for re-download"
                 );
             }
         }
@@ -1400,6 +1580,169 @@ async fn run_periodic_reconcile(db: &dyn state::StateDb, cycle_index: u64) {
             tracing::warn!(error = %e, "Periodic reconciliation scan failed; will retry on next interval");
         }
     }
+}
+
+const LOCAL_DRIFT_PROBE_CURSOR_KEY: &str = "local_drift_probe_offset_v1";
+const LOCAL_DRIFT_PROBE_PAGE_SIZE: u32 = 128;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct LocalDriftProbeOutcome {
+    scanned: u64,
+    drifted: u64,
+    marked_failed: u64,
+    mark_errors: u64,
+}
+
+/// Probe a bounded page of downloaded rows for local drift before each sync
+/// cycle. Unlike the opt-in full reconciliation walk, this runs by default
+/// and advances a cursor so watch mode eventually covers the catalog without
+/// turning every quiet incremental cycle into a full filesystem crawl.
+async fn run_bounded_local_drift_probe(
+    db: &dyn download::DownloadStore,
+    cycle_index: u64,
+) -> LocalDriftProbeOutcome {
+    let summary = match db.get_summary().await {
+        Ok(summary) => summary,
+        Err(e) => {
+            tracing::warn!(error = %e, "Local drift probe failed to read state summary");
+            return LocalDriftProbeOutcome::default();
+        }
+    };
+    if summary.downloaded == 0 {
+        return LocalDriftProbeOutcome::default();
+    }
+
+    let start_offset = match db.get_metadata(LOCAL_DRIFT_PROBE_CURSOR_KEY).await {
+        Ok(Some(raw)) => raw.parse::<u64>().unwrap_or(0).min(summary.downloaded),
+        Ok(None) => 0,
+        Err(e) => {
+            tracing::warn!(error = %e, "Local drift probe failed to read cursor");
+            0
+        }
+    };
+
+    let mut page = match db
+        .get_downloaded_page(start_offset, LOCAL_DRIFT_PROBE_PAGE_SIZE)
+        .await
+    {
+        Ok(page) => page,
+        Err(e) => {
+            tracing::warn!(error = %e, "Local drift probe failed to load downloaded page");
+            return LocalDriftProbeOutcome::default();
+        }
+    };
+    let offset = if page.is_empty() && start_offset > 0 {
+        match db.get_downloaded_page(0, LOCAL_DRIFT_PROBE_PAGE_SIZE).await {
+            Ok(first_page) => {
+                page = first_page;
+                0
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Local drift probe failed to wrap cursor");
+                return LocalDriftProbeOutcome::default();
+            }
+        }
+    } else {
+        start_offset
+    };
+
+    let scanned = u64::try_from(page.len()).unwrap_or(u64::MAX);
+    let next_offset = if page.is_empty()
+        || offset.saturating_add(scanned) >= summary.downloaded
+        || scanned < u64::from(LOCAL_DRIFT_PROBE_PAGE_SIZE)
+    {
+        0
+    } else {
+        offset.saturating_add(scanned)
+    };
+    if let Err(e) = db
+        .set_metadata(LOCAL_DRIFT_PROBE_CURSOR_KEY, &next_offset.to_string())
+        .await
+    {
+        tracing::warn!(error = %e, "Local drift probe failed to persist cursor");
+    }
+
+    let mut outcome = LocalDriftProbeOutcome {
+        scanned,
+        ..LocalDriftProbeOutcome::default()
+    };
+    for asset in page {
+        let (drift, no_path) = match crate::commands::reconcile::classify_local_drift(asset).await {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::warn!(error = %e, "Local drift probe failed to inspect a downloaded row");
+                continue;
+            }
+        };
+        if no_path {
+            continue;
+        }
+        let Some(drift) = drift else {
+            continue;
+        };
+        outcome.drifted = outcome.drifted.saturating_add(1);
+        match drift.kind {
+            crate::commands::reconcile::LocalDriftKind::Missing => tracing::warn!(
+                cycle_index,
+                asset_id = %drift.id,
+                version_size = drift.version_size.as_str(),
+                path = %drift.local_path.display(),
+                "Local drift probe found a missing downloaded file"
+            ),
+            crate::commands::reconcile::LocalDriftKind::Truncated {
+                actual_size,
+                expected_size,
+            } => tracing::warn!(
+                cycle_index,
+                asset_id = %drift.id,
+                version_size = drift.version_size.as_str(),
+                path = %drift.local_path.display(),
+                actual_size,
+                expected_size,
+                "Local drift probe found a truncated downloaded file"
+            ),
+        }
+        match db
+            .mark_failed(
+                &drift.library,
+                &drift.id,
+                drift.version_size.as_str(),
+                drift.kind.reason(),
+            )
+            .await
+        {
+            Ok(()) => outcome.marked_failed = outcome.marked_failed.saturating_add(1),
+            Err(e) => {
+                outcome.mark_errors = outcome.mark_errors.saturating_add(1);
+                tracing::warn!(
+                    error = %e,
+                    asset_id = %drift.id,
+                    version_size = drift.version_size.as_str(),
+                    "Local drift probe could not mark drifted file failed"
+                );
+            }
+        }
+    }
+
+    if outcome.drifted > 0 || outcome.mark_errors > 0 {
+        tracing::warn!(
+            cycle_index,
+            scanned = outcome.scanned,
+            drifted = outcome.drifted,
+            marked_failed = outcome.marked_failed,
+            mark_errors = outcome.mark_errors,
+            next_offset,
+            "Local drift probe completed with drift"
+        );
+    } else {
+        tracing::debug!(
+            cycle_index,
+            scanned = outcome.scanned,
+            next_offset,
+            "Local drift probe completed"
+        );
+    }
+    outcome
 }
 
 /// Should this watch cycle run a periodic local-vs-state reconciliation?
@@ -1438,10 +1781,7 @@ pub(crate) fn should_reconcile_this_cycle(cycle_index: u64, every_n: Option<u64>
 /// because the *reauth* branch fires mid-cycle, by which point a one-shot
 /// caller has long since detached and there is no operator to type a code.
 pub(crate) fn should_wait_for_2fa(is_watch_mode: bool, err: &anyhow::Error) -> bool {
-    is_watch_mode
-        && err
-            .downcast_ref::<auth::error::AuthError>()
-            .is_some_and(auth::error::AuthError::is_two_factor_required)
+    is_watch_mode && classify_sync_auth_error(err) == SyncAuthErrorClass::TwoFactorRequired
 }
 
 async fn refresh_needed_library_plans(
@@ -1502,9 +1842,16 @@ async fn refresh_needed_library_plans(
     }
 }
 
-async fn store_db_sync_token(db: &dyn state::StateDb, token: &str) {
-    if let Err(e) = db.set_metadata(DB_SYNC_TOKEN_KEY, token).await {
-        tracing::warn!(error = %e, "Failed to store db_sync_token");
+async fn store_scoped_db_sync_token(
+    db: &dyn state::SyncTokenStore,
+    scope: &DbPrecheckScope,
+    token: &str,
+) {
+    if let Err(e) = db
+        .upsert_scoped_db_sync_token(scope.to_state_row(token))
+        .await
+    {
+        tracing::warn!(error = %e, "Failed to store scoped db sync token");
     }
 }
 
@@ -1512,11 +1859,12 @@ async fn store_db_sync_token(db: &dyn state::StateDb, token: &str) {
 ///
 /// Returns `SkipAll` when a complete pre-check reports no selected-zone changes.
 /// An empty complete page still skips the cycle but keeps the previous
-/// `db_sync_token`, so the next watch wakeup rechecks from the same point.
+/// scoped DB token, so the next watch wakeup rechecks from the same point.
 async fn check_changes_database(
-    state_db: Option<&dyn state::StateDb>,
+    state_db: Option<&dyn state::SyncTokenStore>,
     library_states: &[LibraryState],
     photos_service: &mut crate::icloud::photos::PhotosService,
+    scope: &DbPrecheckScope,
 ) -> WatchPrecheck {
     let Some(db) = state_db else {
         return WatchPrecheck::proceed_all();
@@ -1524,35 +1872,80 @@ async fn check_changes_database(
     if library_states.is_empty() {
         return WatchPrecheck::SkipAll;
     }
-    for lib_state in library_states {
-        let has_token = match db.get_metadata(&lib_state.sync_token_key).await {
-            Ok(token) => token.is_some_and(|t| !t.is_empty()),
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    zone = %lib_state.zone_name,
-                    metadata_key = %lib_state.sync_token_key,
-                    "Failed to read zone sync token; proceeding with sync"
-                );
-                return WatchPrecheck::proceed_all();
-            }
-        };
-        if !has_token {
-            return WatchPrecheck::proceed_all();
+    let scoped_token = match db
+        .get_scoped_db_sync_token(
+            &scope.provider,
+            &scope.account,
+            scope.shape_version,
+            &scope.scope_hash,
+        )
+        .await
+    {
+        Ok(Some(token)) if !token.token.trim().is_empty() => token,
+        Ok(_) => {
+            return match photos_service.changes_database(None).await {
+                Ok(db_resp) if !db_resp.more_coming => WatchPrecheck::Proceed {
+                    changed_zones: None,
+                    db_sync_token_after_success: Some(db_resp.sync_token),
+                },
+                Ok(db_resp) => {
+                    tracing::debug!(
+                        zones = db_resp.zones.len(),
+                        "changes/database bootstrap had more pages; scoped db sync token not stored"
+                    );
+                    WatchPrecheck::proceed_all()
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        "changes/database bootstrap failed; proceeding with sync"
+                    );
+                    WatchPrecheck::proceed_all()
+                }
+            };
         }
-    }
-    let db_token = match db.get_metadata(DB_SYNC_TOKEN_KEY).await {
-        Ok(token) => token.filter(|t| !t.is_empty()),
         Err(e) => {
             tracing::warn!(
                 error = %e,
-                metadata_key = DB_SYNC_TOKEN_KEY,
-                "Failed to read changes/database sync token; proceeding with sync"
+                scope_hash = %scope.scope_hash,
+                "Failed to read scoped changes/database sync token; proceeding with sync"
             );
             return WatchPrecheck::proceed_all();
         }
     };
-    match photos_service.changes_database(db_token.as_deref()).await {
+    if serde_json::from_str::<serde_json::Value>(&scoped_token.scope_json).is_err() {
+        tracing::debug!(
+            scope_hash = %scope.scope_hash,
+            "Stored scoped changes/database scope JSON is invalid; proceeding with sync"
+        );
+        return WatchPrecheck::proceed_all();
+    }
+    if scoped_token.scope_json != scope.scope_json {
+        tracing::debug!(
+            scope_hash = %scope.scope_hash,
+            "Stored scoped changes/database scope JSON mismatch; proceeding with sync"
+        );
+        return WatchPrecheck::proceed_all();
+    }
+    if serde_json::from_str::<Vec<String>>(&scoped_token.selected_zones_json).is_err() {
+        tracing::debug!(
+            scope_hash = %scope.scope_hash,
+            "Stored scoped changes/database selected-zone JSON is invalid; proceeding with sync"
+        );
+        return WatchPrecheck::proceed_all();
+    }
+    if scoped_token.selected_zones_json != scope.selected_zones_json {
+        tracing::debug!(
+            scope_hash = %scope.scope_hash,
+            "Stored scoped changes/database selected zones mismatch; proceeding with sync"
+        );
+        return WatchPrecheck::proceed_all();
+    }
+
+    match photos_service
+        .changes_database(Some(scoped_token.token.as_str()))
+        .await
+    {
         Ok(db_resp) => {
             let selected_zones: rustc_hash::FxHashSet<&str> = library_states
                 .iter()
@@ -1582,10 +1975,10 @@ async fn check_changes_database(
                     };
                 }
                 if has_any_changed_zone {
-                    store_db_sync_token(db, &db_resp.sync_token).await;
+                    store_scoped_db_sync_token(db, scope, &db_resp.sync_token).await;
                 } else {
                     tracing::debug!(
-                        "changes/database returned an empty complete page; skipping without advancing db_sync_token"
+                        "changes/database returned an empty complete page; skipping without advancing scoped db sync token"
                     );
                 }
                 tracing::info!(
@@ -1752,9 +2145,7 @@ async fn reacquire_session_lock_after_idle(
         return Ok(());
     };
 
-    if e.downcast_ref::<auth::error::AuthError>()
-        .is_some_and(auth::error::AuthError::is_lock_contention)
-    {
+    if classify_sync_auth_error(&e) == SyncAuthErrorClass::LockContention {
         tracing::error!(
             error = %e,
             "Another kei process acquired the session lock while watch mode slept; stopping before the next sync cycle"
@@ -2243,6 +2634,61 @@ mod tests {
         // inappropriate SRP cycle.
         let e = anyhow::anyhow!("unrelated top-level error");
         assert!(!is_session_error(&e));
+    }
+
+    fn classify_sync_auth_error_for(err: auth::error::AuthError) -> SyncAuthErrorClass {
+        let err = anyhow::Error::new(err);
+        classify_sync_auth_error(&err)
+    }
+
+    #[test]
+    fn classify_sync_auth_error_detects_two_factor_required() {
+        assert_eq!(
+            classify_sync_auth_error_for(auth::error::AuthError::TwoFactorRequired),
+            SyncAuthErrorClass::TwoFactorRequired
+        );
+    }
+
+    #[test]
+    fn classify_sync_auth_error_detects_lock_contention() {
+        assert_eq!(
+            classify_sync_auth_error_for(auth::error::AuthError::LockContention(
+                "session.lock".into()
+            )),
+            SyncAuthErrorClass::LockContention
+        );
+    }
+
+    #[test]
+    fn classify_sync_auth_error_treats_failed_login_and_plain_anyhow_as_other() {
+        assert_eq!(
+            classify_sync_auth_error_for(auth::error::AuthError::FailedLogin(
+                "bad password".into()
+            )),
+            SyncAuthErrorClass::Other
+        );
+
+        let err = anyhow::anyhow!("plain failure");
+        assert_eq!(classify_sync_auth_error(&err), SyncAuthErrorClass::Other);
+    }
+
+    #[test]
+    fn classify_sync_auth_error_detects_context_wrapped_auth_errors() {
+        let two_factor =
+            anyhow::Error::new(auth::error::AuthError::TwoFactorRequired).context("initial auth");
+        assert_eq!(
+            classify_sync_auth_error(&two_factor),
+            SyncAuthErrorClass::TwoFactorRequired
+        );
+
+        let lock = anyhow::Error::new(auth::error::AuthError::LockContention(
+            "session.lock".into(),
+        ))
+        .context("watch idle reacquire");
+        assert_eq!(
+            classify_sync_auth_error(&lock),
+            SyncAuthErrorClass::LockContention
+        );
     }
 
     #[test]
@@ -2992,6 +3438,7 @@ mod tests {
         media: config::MediaSelection,
         per_pass_paths: bool,
         recent: Option<u32>,
+        file_match_policy: Option<crate::types::FileMatchPolicy>,
     }
 
     fn media_without_photo_downloads() -> config::MediaSelection {
@@ -3004,7 +3451,7 @@ mod tests {
 
     fn make_run_cycle_download_config_builder(
         download_dir: &std::path::Path,
-        db: Arc<dyn state::StateDb>,
+        db: Arc<dyn download::DownloadStore>,
     ) -> impl Fn(
         download::SyncMode,
         Arc<rustc_hash::FxHashSet<String>>,
@@ -3021,7 +3468,7 @@ mod tests {
 
     fn make_run_cycle_download_config_builder_with_options(
         download_dir: &std::path::Path,
-        db: Arc<dyn state::StateDb>,
+        db: Arc<dyn download::DownloadStore>,
         options: RunCycleDownloadConfigOptions,
     ) -> impl Fn(
         download::SyncMode,
@@ -3039,6 +3486,9 @@ mod tests {
             if options.per_pass_paths {
                 config.folder_structure_albums = Arc::from("{album}");
             }
+            if let Some(file_match_policy) = options.file_match_policy {
+                config.file_match_policy = file_match_policy;
+            }
             config.media = options.media;
             config.recent = options.recent;
             config.state_db = Some(Arc::clone(&db));
@@ -3052,7 +3502,7 @@ mod tests {
 
     fn make_recording_run_cycle_download_config_builder(
         download_dir: &std::path::Path,
-        db: Arc<dyn state::StateDb>,
+        db: Arc<dyn download::DownloadStore>,
         observed_modes: Arc<std::sync::Mutex<Vec<download::SyncMode>>>,
     ) -> impl Fn(
         download::SyncMode,
@@ -3460,9 +3910,11 @@ mod tests {
     // the world (waste) or (b) skip previously-failed assets (silent loss).
     // None of the four critical branches had a direct unit test before.
 
-    fn make_state_db() -> Arc<dyn state::StateDb> {
+    fn make_state_db() -> Arc<dyn download::DownloadStore> {
         Arc::new(state::SqliteStateDb::open_in_memory().expect("open in-memory state DB"))
     }
+
+    const SCOPED_DB_SYNC_TOKEN_FAILURE_KEY: &str = "scoped_db_sync_token";
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum MetadataSetFailure {
@@ -3480,13 +3932,14 @@ mod tests {
     }
 
     struct FailingMetadataSetDb {
-        inner: Arc<dyn state::StateDb>,
+        inner: Arc<dyn download::DownloadStore>,
         failure: MetadataSetFailure,
         get_failure: Option<MetadataSetFailure>,
         delete_prefix_failure: Option<&'static str>,
         message: &'static str,
         cancel_on_upsert: Option<CancellationToken>,
         replace_download_dir_on_upsert: Option<std::path::PathBuf>,
+        fail_mark_downloaded: bool,
     }
 
     impl std::fmt::Debug for FailingMetadataSetDb {
@@ -3502,7 +3955,7 @@ mod tests {
 
     impl FailingMetadataSetDb {
         fn new(
-            inner: Arc<dyn state::StateDb>,
+            inner: Arc<dyn download::DownloadStore>,
             failure: MetadataSetFailure,
             message: &'static str,
         ) -> Self {
@@ -3514,10 +3967,14 @@ mod tests {
                 message,
                 cancel_on_upsert: None,
                 replace_download_dir_on_upsert: None,
+                fail_mark_downloaded: false,
             }
         }
 
-        fn without_set_failure(inner: Arc<dyn state::StateDb>, message: &'static str) -> Self {
+        fn without_set_failure(
+            inner: Arc<dyn download::DownloadStore>,
+            message: &'static str,
+        ) -> Self {
             Self::new(
                 inner,
                 MetadataSetFailure::Exact("__unused_metadata_key__"),
@@ -3544,10 +4001,15 @@ mod tests {
             self.replace_download_dir_on_upsert = Some(path);
             self
         }
+
+        fn with_mark_downloaded_failure(mut self) -> Self {
+            self.fail_mark_downloaded = true;
+            self
+        }
     }
 
     #[async_trait::async_trait]
-    impl state::StateDb for FailingMetadataSetDb {
+    impl state::DownloadStateStore for FailingMetadataSetDb {
         #[cfg(test)]
         async fn should_download(
             &self,
@@ -3589,6 +4051,9 @@ mod tests {
             local_checksum: &str,
             download_checksum: Option<&str>,
         ) -> Result<(), state::error::StateError> {
+            if self.fail_mark_downloaded {
+                return Err(state::error::StateError::LockPoisoned(self.message.into()));
+            }
             self.inner
                 .mark_downloaded(
                     library,
@@ -3597,25 +4062,6 @@ mod tests {
                     local_path,
                     local_checksum,
                     download_checksum,
-                )
-                .await
-        }
-
-        async fn import_adopt(
-            &self,
-            record: &state::types::AssetRecord,
-            local_path: &std::path::Path,
-            local_checksum: &str,
-            imported_size: u64,
-            imported_mtime: Option<i64>,
-        ) -> Result<(), state::error::StateError> {
-            self.inner
-                .import_adopt(
-                    record,
-                    local_path,
-                    local_checksum,
-                    imported_size,
-                    imported_mtime,
                 )
                 .await
         }
@@ -3632,65 +4078,10 @@ mod tests {
                 .await
         }
 
-        async fn get_failed(
-            &self,
-        ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
-            self.inner.get_failed().await
-        }
-
-        async fn get_failed_sample(
-            &self,
-            limit: u32,
-        ) -> Result<(Vec<state::types::AssetRecord>, u64), state::error::StateError> {
-            self.inner.get_failed_sample(limit).await
-        }
-
         async fn get_pending(
             &self,
         ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
             self.inner.get_pending().await
-        }
-
-        async fn get_summary(&self) -> Result<state::types::SyncSummary, state::error::StateError> {
-            self.inner.get_summary().await
-        }
-
-        async fn get_downloaded_page(
-            &self,
-            offset: u64,
-            limit: u32,
-        ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
-            self.inner.get_downloaded_page(offset, limit).await
-        }
-
-        async fn start_sync_run(&self) -> Result<i64, state::error::StateError> {
-            self.inner.start_sync_run().await
-        }
-
-        async fn complete_sync_run(
-            &self,
-            run_id: i64,
-            stats: &state::types::SyncRunStats,
-        ) -> Result<(), state::error::StateError> {
-            self.inner.complete_sync_run(run_id, stats).await
-        }
-
-        async fn promote_orphaned_sync_runs(&self) -> Result<u64, state::error::StateError> {
-            self.inner.promote_orphaned_sync_runs().await
-        }
-
-        async fn begin_enum_progress(&self, zone: &str) -> Result<(), state::error::StateError> {
-            self.inner.begin_enum_progress(zone).await
-        }
-
-        async fn end_enum_progress(&self, zone: &str) -> Result<(), state::error::StateError> {
-            self.inner.end_enum_progress(zone).await
-        }
-
-        async fn list_interrupted_enumerations(
-            &self,
-        ) -> Result<Vec<String>, state::error::StateError> {
-            self.inner.list_interrupted_enumerations().await
         }
 
         async fn reset_failed(&self) -> Result<u64, state::error::StateError> {
@@ -3733,12 +4124,118 @@ mod tests {
             self.inner.get_downloaded_checksums().await
         }
 
+        async fn get_downloaded_local_paths(
+            &self,
+        ) -> Result<
+            std::collections::HashMap<(String, String, String), std::path::PathBuf>,
+            state::error::StateError,
+        > {
+            self.inner.get_downloaded_local_paths().await
+        }
+
         async fn get_attempt_counts(
             &self,
         ) -> Result<std::collections::HashMap<String, u32>, state::error::StateError> {
             self.inner.get_attempt_counts().await
         }
 
+        async fn touch_last_seen_many(
+            &self,
+            library: &str,
+            asset_ids: &[&str],
+        ) -> Result<(), state::error::StateError> {
+            self.inner.touch_last_seen_many(library, asset_ids).await
+        }
+
+        async fn mark_soft_deleted(
+            &self,
+            library: &str,
+            asset_id: &str,
+            deleted_at: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<(), state::error::StateError> {
+            self.inner
+                .mark_soft_deleted(library, asset_id, deleted_at)
+                .await
+        }
+
+        async fn mark_hidden_at_source(
+            &self,
+            library: &str,
+            asset_id: &str,
+        ) -> Result<(), state::error::StateError> {
+            self.inner.mark_hidden_at_source(library, asset_id).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl state::ReportStateStore for FailingMetadataSetDb {
+        async fn get_failed(
+            &self,
+        ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+            self.inner.get_failed().await
+        }
+
+        async fn get_failed_sample(
+            &self,
+            limit: u32,
+        ) -> Result<(Vec<state::types::AssetRecord>, u64), state::error::StateError> {
+            self.inner.get_failed_sample(limit).await
+        }
+
+        async fn get_failed_page(
+            &self,
+            offset: u64,
+            limit: u32,
+        ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+            self.inner.get_failed_page(offset, limit).await
+        }
+
+        async fn get_pending_page(
+            &self,
+            offset: u64,
+            limit: u32,
+        ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+            self.inner.get_pending_page(offset, limit).await
+        }
+
+        async fn get_summary(&self) -> Result<state::types::SyncSummary, state::error::StateError> {
+            self.inner.get_summary().await
+        }
+
+        async fn get_downloaded_page(
+            &self,
+            offset: u64,
+            limit: u32,
+        ) -> Result<Vec<state::types::AssetRecord>, state::error::StateError> {
+            self.inner.get_downloaded_page(offset, limit).await
+        }
+
+        async fn start_sync_run_at(
+            &self,
+            started_at: chrono::DateTime<chrono::Utc>,
+        ) -> Result<i64, state::error::StateError> {
+            self.inner.start_sync_run_at(started_at).await
+        }
+
+        async fn start_sync_run(&self) -> Result<i64, state::error::StateError> {
+            self.inner.start_sync_run().await
+        }
+
+        async fn complete_sync_run(
+            &self,
+            run_id: i64,
+            stats: &state::types::SyncRunStats,
+        ) -> Result<(), state::error::StateError> {
+            self.inner.complete_sync_run(run_id, stats).await
+        }
+
+        async fn promote_orphaned_sync_runs(&self) -> Result<u64, state::error::StateError> {
+            self.inner.promote_orphaned_sync_runs().await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl state::SyncTokenStore for FailingMetadataSetDb {
         async fn get_metadata(
             &self,
             key: &str,
@@ -3773,14 +4270,57 @@ mod tests {
             }
         }
 
-        async fn touch_last_seen_many(
+        async fn get_scoped_db_sync_token(
             &self,
-            library: &str,
-            asset_ids: &[&str],
-        ) -> Result<(), state::error::StateError> {
-            self.inner.touch_last_seen_many(library, asset_ids).await
+            provider: &str,
+            account: &str,
+            shape_version: i64,
+            scope_hash: &str,
+        ) -> Result<Option<state::ScopedDbSyncToken>, state::error::StateError> {
+            if self
+                .get_failure
+                .is_some_and(|failure| failure.matches(SCOPED_DB_SYNC_TOKEN_FAILURE_KEY))
+            {
+                Err(state::error::StateError::LockPoisoned(self.message.into()))
+            } else {
+                self.inner
+                    .get_scoped_db_sync_token(provider, account, shape_version, scope_hash)
+                    .await
+            }
         }
 
+        async fn upsert_scoped_db_sync_token(
+            &self,
+            token: state::ScopedDbSyncToken,
+        ) -> Result<(), state::error::StateError> {
+            if self.failure.matches(SCOPED_DB_SYNC_TOKEN_FAILURE_KEY) {
+                Err(state::error::StateError::LockPoisoned(self.message.into()))
+            } else {
+                self.inner.upsert_scoped_db_sync_token(token).await
+            }
+        }
+
+        async fn delete_scoped_db_sync_tokens(&self) -> Result<u64, state::error::StateError> {
+            self.inner.delete_scoped_db_sync_tokens().await
+        }
+
+        async fn begin_enum_progress(&self, zone: &str) -> Result<(), state::error::StateError> {
+            self.inner.begin_enum_progress(zone).await
+        }
+
+        async fn end_enum_progress(&self, zone: &str) -> Result<(), state::error::StateError> {
+            self.inner.end_enum_progress(zone).await
+        }
+
+        async fn list_interrupted_enumerations(
+            &self,
+        ) -> Result<Vec<String>, state::error::StateError> {
+            self.inner.list_interrupted_enumerations().await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl state::MembershipStore for FailingMetadataSetDb {
         async fn add_asset_album(
             &self,
             library: &str,
@@ -3807,25 +4347,149 @@ mod tests {
             self.inner.get_all_asset_people(library).await
         }
 
-        async fn mark_soft_deleted(
+        async fn upsert_album_container(
             &self,
             library: &str,
-            asset_id: &str,
-            deleted_at: Option<chrono::DateTime<chrono::Utc>>,
+            container_id: &str,
+            album_name: &str,
+            pass_kind: &str,
         ) -> Result<(), state::error::StateError> {
             self.inner
-                .mark_soft_deleted(library, asset_id, deleted_at)
+                .upsert_album_container(library, container_id, album_name, pass_kind)
                 .await
         }
 
-        async fn mark_hidden_at_source(
+        async fn mark_album_container_deleted(
             &self,
             library: &str,
-            asset_id: &str,
+            container_id: &str,
         ) -> Result<(), state::error::StateError> {
-            self.inner.mark_hidden_at_source(library, asset_id).await
+            self.inner
+                .mark_album_container_deleted(library, container_id)
+                .await
         }
 
+        async fn start_album_membership_snapshot(
+            &self,
+            library: &str,
+            container_id: &str,
+            enum_config_hash: Option<&str>,
+        ) -> Result<i64, state::error::StateError> {
+            self.inner
+                .start_album_membership_snapshot(library, container_id, enum_config_hash)
+                .await
+        }
+
+        async fn add_album_membership_to_snapshot(
+            &self,
+            library: &str,
+            container_id: &str,
+            generation: i64,
+            asset_record_name: &str,
+            master_record_name: Option<&str>,
+            source: &str,
+        ) -> Result<(), state::error::StateError> {
+            self.inner
+                .add_album_membership_to_snapshot(
+                    library,
+                    container_id,
+                    generation,
+                    asset_record_name,
+                    master_record_name,
+                    source,
+                )
+                .await
+        }
+
+        async fn upsert_album_membership_delta(
+            &self,
+            library: &str,
+            container_id: &str,
+            asset_record_name: &str,
+            master_record_name: Option<&str>,
+            source: &str,
+        ) -> Result<bool, state::error::StateError> {
+            self.inner
+                .upsert_album_membership_delta(
+                    library,
+                    container_id,
+                    asset_record_name,
+                    master_record_name,
+                    source,
+                )
+                .await
+        }
+
+        async fn mark_album_membership_deleted(
+            &self,
+            library: &str,
+            container_id: &str,
+            asset_record_name: &str,
+        ) -> Result<bool, state::error::StateError> {
+            self.inner
+                .mark_album_membership_deleted(library, container_id, asset_record_name)
+                .await
+        }
+
+        async fn complete_album_membership_snapshot(
+            &self,
+            library: &str,
+            container_id: &str,
+            generation: i64,
+        ) -> Result<(), state::error::StateError> {
+            self.inner
+                .complete_album_membership_snapshot(library, container_id, generation)
+                .await
+        }
+
+        async fn invalidate_album_membership_snapshot(
+            &self,
+            library: &str,
+            container_id: &str,
+        ) -> Result<(), state::error::StateError> {
+            self.inner
+                .invalidate_album_membership_snapshot(library, container_id)
+                .await
+        }
+
+        async fn selected_album_containers_have_complete_snapshots(
+            &self,
+            library: &str,
+            container_ids: &[&str],
+        ) -> Result<bool, state::error::StateError> {
+            self.inner
+                .selected_album_containers_have_complete_snapshots(library, container_ids)
+                .await
+        }
+
+        async fn get_live_album_memberships_for_asset(
+            &self,
+            library: &str,
+            asset_record_name: &str,
+        ) -> Result<Vec<state::db::AlbumMembershipRecord>, state::error::StateError> {
+            self.inner
+                .get_live_album_memberships_for_asset(library, asset_record_name)
+                .await
+        }
+
+        async fn get_live_selected_album_memberships_for_asset(
+            &self,
+            library: &str,
+            asset_record_name: &str,
+            selected_container_ids: &[&str],
+        ) -> Result<Vec<state::db::AlbumMembershipRecord>, state::error::StateError> {
+            self.inner
+                .get_live_selected_album_memberships_for_asset(
+                    library,
+                    asset_record_name,
+                    selected_container_ids,
+                )
+                .await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl state::MetadataRewriteStore for FailingMetadataSetDb {
         async fn record_metadata_write_failure(
             &self,
             library: &str,
@@ -4102,12 +4766,62 @@ mod tests {
         assert_eq!(db_token, expected_db);
     }
 
+    fn test_precheck_scope_for_states(states: &[LibraryState], scope_id: &str) -> DbPrecheckScope {
+        let mut zones: Vec<String> = states.iter().map(|s| s.zone_name.clone()).collect();
+        zones.sort();
+        let selected_zones_json = serde_json::to_string(&zones).expect("serialize zones");
+        let scope_json = serde_json::to_string(&serde_json::json!({
+            "test_scope": scope_id,
+            "selected_zones": zones,
+        }))
+        .expect("serialize scope");
+        DbPrecheckScope {
+            provider: SCOPED_DB_SYNC_TOKEN_PROVIDER.to_string(),
+            account: "test@example.com".to_string(),
+            shape_version: SCOPED_DB_SYNC_TOKEN_SHAPE_VERSION,
+            scope_hash: scope_id.to_string(),
+            selected_zones_json,
+            scope_json,
+        }
+    }
+
+    async fn seed_scoped_db_token(
+        db: &dyn state::SyncTokenStore,
+        scope: &DbPrecheckScope,
+        token: &str,
+    ) {
+        db.upsert_scoped_db_sync_token(scope.to_state_row(token))
+            .await
+            .expect("seed scoped db token");
+    }
+
+    async fn read_scoped_db_token(
+        db: &dyn state::SyncTokenStore,
+        scope: &DbPrecheckScope,
+    ) -> Option<state::ScopedDbSyncToken> {
+        db.get_scoped_db_sync_token(
+            &scope.provider,
+            &scope.account,
+            scope.shape_version,
+            &scope.scope_hash,
+        )
+        .await
+        .expect("read scoped db token")
+    }
+
     async fn check_single_library_changes_database(
-        db: Option<&dyn state::StateDb>,
+        db: Option<&dyn download::DownloadStore>,
         lib_state: &LibraryState,
         svc: &mut crate::icloud::photos::PhotosService,
+        scope: &DbPrecheckScope,
     ) -> WatchPrecheck {
-        check_changes_database(db, std::slice::from_ref(lib_state), svc).await
+        check_changes_database(
+            db.map(|db| db as &dyn state::SyncTokenStore),
+            std::slice::from_ref(lib_state),
+            svc,
+            scope,
+        )
+        .await
     }
 
     /// `more_coming=true` with empty zones must NOT skip the cycle.
@@ -4127,18 +4841,14 @@ mod tests {
             std::collections::HashMap::new(),
         );
 
-        let db: Arc<dyn state::StateDb> = make_state_db();
-        // Pre-populate a stored sync token so the function actually
-        // makes the changes/database HTTP call (the `has_token` early
-        // return otherwise short-circuits).
-        db.set_metadata("sync_token:PrimarySync", "zone-tok-1")
-            .await
-            .expect("set token");
-
+        let db: Arc<dyn download::DownloadStore> = make_state_db();
         let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
+        let scope = test_precheck_scope_for_states(std::slice::from_ref(&lib_state), "scope-more");
+        seed_scoped_db_token(db.as_ref(), &scope, "db-tok-prev").await;
 
         let precheck =
-            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc).await;
+            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc, &scope)
+                .await;
 
         assert!(
             matches!(
@@ -4150,21 +4860,18 @@ mod tests {
             ),
             "more_coming=true must not skip the cycle (more pages pending)"
         );
-        assert!(
-            db.get_metadata(DB_SYNC_TOKEN_KEY)
-                .await
-                .expect("read db_sync_token")
-                .is_none(),
-            "more_coming=true must defer db_sync_token advancement until the sync cycle succeeds"
-        );
+        let stored = read_scoped_db_token(db.as_ref(), &scope)
+            .await
+            .expect("scoped token should remain present");
+        assert_eq!(stored.token, "db-tok-prev");
     }
 
     /// Empty zones + `more_coming=false` still skip this watch cycle, but
-    /// must not advance `db_sync_token`.
+    /// must not advance the scoped DB token.
     /// A suspicious empty page should self-heal on the next wakeup by
     /// rechecking from the last persisted token.
     #[tokio::test]
-    async fn check_changes_database_empty_zones_skip_without_advancing_db_sync_token() {
+    async fn check_changes_database_empty_zones_skip_without_advancing_scoped_db_token() {
         use serde_json::json;
         let session = crate::test_helpers::MockPhotosSession::new().ok(json!({
             "syncToken": "db-tok-3",
@@ -4176,30 +4883,24 @@ mod tests {
             std::collections::HashMap::new(),
         );
 
-        let db: Arc<dyn state::StateDb> = make_state_db();
-        db.set_metadata("sync_token:PrimarySync", "zone-tok-prev")
-            .await
-            .expect("set token");
-        db.set_metadata(DB_SYNC_TOKEN_KEY, "db-tok-prev")
-            .await
-            .expect("seed previous db token");
-
+        let db: Arc<dyn download::DownloadStore> = make_state_db();
         let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
+        let scope = test_precheck_scope_for_states(std::slice::from_ref(&lib_state), "scope-empty");
+        seed_scoped_db_token(db.as_ref(), &scope, "db-tok-prev").await;
 
         let precheck =
-            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc).await;
+            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc, &scope)
+                .await;
 
         assert_eq!(
             precheck,
             WatchPrecheck::SkipAll,
             "empty zones + more_coming=false must skip the cycle"
         );
-        let stored = db
-            .get_metadata(DB_SYNC_TOKEN_KEY)
+        let stored = read_scoped_db_token(db.as_ref(), &scope)
             .await
-            .expect("read db_sync_token")
-            .expect("token should still be present");
-        assert_eq!(stored, "db-tok-prev");
+            .expect("scoped token should still be present");
+        assert_eq!(stored.token, "db-tok-prev");
     }
 
     /// A non-empty zones list MUST NOT skip — even
@@ -4221,23 +4922,20 @@ mod tests {
             std::collections::HashMap::new(),
         );
 
-        let db: Arc<dyn state::StateDb> = make_state_db();
-        db.set_metadata("sync_token:PrimarySync", "zone-tok-prev")
-            .await
-            .expect("set token");
-
+        let db: Arc<dyn download::DownloadStore> = make_state_db();
         let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
+        let scope =
+            test_precheck_scope_for_states(std::slice::from_ref(&lib_state), "scope-changed");
+        seed_scoped_db_token(db.as_ref(), &scope, "db-tok-prev").await;
 
         let precheck =
-            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc).await;
+            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc, &scope)
+                .await;
         assert_proceed_changed(&precheck, "PrimarySync", "db-tok-4");
-        assert!(
-            db.get_metadata(DB_SYNC_TOKEN_KEY)
-                .await
-                .expect("read db_sync_token")
-                .is_none(),
-            "changed-zone precheck must not advance db_sync_token before the sync succeeds"
-        );
+        let stored = read_scoped_db_token(db.as_ref(), &scope)
+            .await
+            .expect("scoped token should remain present");
+        assert_eq!(stored.token, "db-tok-prev");
     }
 
     #[tokio::test]
@@ -4255,23 +4953,16 @@ mod tests {
             std::collections::HashMap::new(),
         );
 
-        let db: Arc<dyn state::StateDb> = make_state_db();
-        db.set_metadata("sync_token:PrimarySync", "primary-tok-prev")
-            .await
-            .expect("set primary token");
-        db.set_metadata("sync_token:SharedSync-ABCD", "shared-tok-prev")
-            .await
-            .expect("set shared token");
-        db.set_metadata(DB_SYNC_TOKEN_KEY, "db-tok-prev")
-            .await
-            .expect("set db token");
+        let db: Arc<dyn download::DownloadStore> = make_state_db();
 
         let states = vec![
             make_library_state("PrimarySync", "sync_token:PrimarySync"),
             make_library_state("SharedSync-ABCD", "sync_token:SharedSync-ABCD"),
         ];
+        let scope = test_precheck_scope_for_states(&states, "scope-shared");
+        seed_scoped_db_token(db.as_ref(), &scope, "db-tok-prev").await;
 
-        let precheck = check_changes_database(Some(db.as_ref()), &states, &mut svc).await;
+        let precheck = check_changes_database(Some(db.as_ref()), &states, &mut svc, &scope).await;
         assert_proceed_changed(&precheck, "SharedSync-ABCD", "db-tok-shared");
     }
 
@@ -4290,113 +4981,167 @@ mod tests {
             std::collections::HashMap::new(),
         );
 
-        let db: Arc<dyn state::StateDb> = make_state_db();
-        db.set_metadata("sync_token:PrimarySync", "primary-tok-prev")
-            .await
-            .expect("set primary token");
-        db.set_metadata(DB_SYNC_TOKEN_KEY, "db-tok-prev")
-            .await
-            .expect("set db token");
-
+        let db: Arc<dyn download::DownloadStore> = make_state_db();
         let states = vec![make_library_state("PrimarySync", "sync_token:PrimarySync")];
+        let scope = test_precheck_scope_for_states(&states, "scope-unselected");
+        seed_scoped_db_token(db.as_ref(), &scope, "db-tok-prev").await;
 
-        let precheck = check_changes_database(Some(db.as_ref()), &states, &mut svc).await;
+        let precheck = check_changes_database(Some(db.as_ref()), &states, &mut svc, &scope).await;
         assert_eq!(precheck, WatchPrecheck::SkipAll);
-        let stored = db
-            .get_metadata(DB_SYNC_TOKEN_KEY)
+        let stored = read_scoped_db_token(db.as_ref(), &scope)
             .await
-            .expect("read db_sync_token")
             .expect("token persisted");
-        assert_eq!(stored, "db-tok-unselected");
+        assert_eq!(stored.token, "db-tok-unselected");
     }
 
-    /// No stored sync token at all must return false (don't
-    /// skip) without making the HTTP call. Pinning this prevents a future
-    /// refactor that flipped the early return from silently consuming an
-    /// Apple call slot on bootstrap.
+    /// No stored scoped DB token must not skip, but can capture a
+    /// changes/database token before the cycle. The token is only persisted
+    /// after the cycle completes cleanly, so concurrent changes remain safe.
     #[tokio::test]
-    async fn check_changes_database_no_stored_token_does_not_skip() {
-        let session = crate::test_helpers::MockPhotosSession::new();
+    async fn check_changes_database_no_stored_token_bootstraps_without_skipping() {
+        use serde_json::json;
+        let session = crate::test_helpers::MockPhotosSession::new().ok(json!({
+            "syncToken": "db-token-bootstrap",
+            "moreComing": false,
+            "zones": [
+                {
+                    "zoneID": {"zoneName": "PrimarySync"},
+                    "syncToken": "zone-token-bootstrap"
+                }
+            ]
+        }));
         let mut svc = crate::icloud::photos::PhotosService::for_testing(
             Box::new(session),
             std::collections::HashMap::new(),
         );
 
-        // Empty DB — no `sync_token:PrimarySync` set.
-        let db: Arc<dyn state::StateDb> = make_state_db();
+        // Empty DB - no scoped database pre-check row set.
+        let db: Arc<dyn download::DownloadStore> = make_state_db();
         let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
+        let scope =
+            test_precheck_scope_for_states(std::slice::from_ref(&lib_state), "scope-missing");
 
         let precheck =
-            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc).await;
+            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc, &scope)
+                .await;
         assert!(
             matches!(
                 precheck,
                 WatchPrecheck::Proceed {
                     changed_zones: None,
-                    db_sync_token_after_success: None
-                }
+                    db_sync_token_after_success: Some(ref token)
+                } if token == "db-token-bootstrap"
             ),
-            "no stored token must continue without a changes/database call"
+            "bootstrap token must be deferred until the cycle succeeds"
         );
     }
 
     #[tokio::test]
-    async fn check_changes_database_zone_token_read_failure_proceeds_without_precheck() {
+    async fn check_changes_database_scoped_token_read_failure_proceeds_without_precheck() {
         let session = crate::test_helpers::MockPhotosSession::new();
         let mut svc = crate::icloud::photos::PhotosService::for_testing(
             Box::new(session),
             std::collections::HashMap::new(),
         );
         let inner = make_state_db();
-        inner
-            .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
-            .await
-            .expect("seed token");
-        let db: Arc<dyn state::StateDb> = Arc::new(
-            FailingMetadataSetDb::without_set_failure(inner, "simulated zone-token read failure")
-                .with_get_failure(MetadataSetFailure::Exact("sync_token:PrimarySync")),
+        let db: Arc<dyn download::DownloadStore> = Arc::new(
+            FailingMetadataSetDb::without_set_failure(inner, "simulated scoped-token read failure")
+                .with_get_failure(MetadataSetFailure::Exact(SCOPED_DB_SYNC_TOKEN_FAILURE_KEY)),
         );
 
         let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
+        let scope =
+            test_precheck_scope_for_states(std::slice::from_ref(&lib_state), "scope-read-failure");
         let precheck =
-            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc).await;
+            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc, &scope)
+                .await;
 
         assert_eq!(
             precheck,
             WatchPrecheck::proceed_all(),
-            "metadata read failure should fall back to the safe full cycle path"
+            "scoped token read failure should fall back to the safe full cycle path"
         );
     }
 
     #[tokio::test]
-    async fn check_changes_database_db_token_read_failure_proceeds_without_precheck() {
+    async fn check_changes_database_legacy_db_token_without_scoped_row_does_not_skip() {
         let session = crate::test_helpers::MockPhotosSession::new();
         let mut svc = crate::icloud::photos::PhotosService::for_testing(
             Box::new(session),
             std::collections::HashMap::new(),
         );
-        let inner = make_state_db();
-        inner
-            .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
+        let db: Arc<dyn download::DownloadStore> = make_state_db();
+        db.set_metadata("sync_token:PrimarySync", "zone-tok-prev")
             .await
-            .expect("seed zone token");
-        inner
-            .set_metadata(DB_SYNC_TOKEN_KEY, "db-tok-prev")
+            .expect("seed legacy zone token");
+        db.set_metadata(DB_SYNC_TOKEN_KEY, "db-tok-prev")
             .await
-            .expect("seed db token");
-        let db: Arc<dyn state::StateDb> = Arc::new(
-            FailingMetadataSetDb::without_set_failure(inner, "simulated db-token read failure")
-                .with_get_failure(MetadataSetFailure::Exact(DB_SYNC_TOKEN_KEY)),
-        );
+            .expect("seed legacy db token");
 
         let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
+        let scope = test_precheck_scope_for_states(std::slice::from_ref(&lib_state), "scope-new");
         let precheck =
-            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc).await;
+            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc, &scope)
+                .await;
 
         assert_eq!(
             precheck,
             WatchPrecheck::proceed_all(),
-            "db token read failure should fall back to the safe full cycle path"
+            "legacy unscoped db tokens are not scoped proof"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_changes_database_scope_hash_mismatch_does_not_skip() {
+        let session = crate::test_helpers::MockPhotosSession::new();
+        let mut svc = crate::icloud::photos::PhotosService::for_testing(
+            Box::new(session),
+            std::collections::HashMap::new(),
+        );
+        let db: Arc<dyn download::DownloadStore> = make_state_db();
+        let states = vec![make_library_state("PrimarySync", "sync_token:PrimarySync")];
+        let narrow_scope = test_precheck_scope_for_states(&states, "recent-500");
+        let broad_scope = test_precheck_scope_for_states(&states, "recent-1000");
+        seed_scoped_db_token(db.as_ref(), &narrow_scope, "db-tok-narrow").await;
+
+        let precheck =
+            check_changes_database(Some(db.as_ref()), &states, &mut svc, &broad_scope).await;
+
+        assert_eq!(
+            precheck,
+            WatchPrecheck::proceed_all(),
+            "Phase 1 must require exact scope hash match"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_changes_database_corrupt_stored_scope_json_does_not_skip() {
+        let session = crate::test_helpers::MockPhotosSession::new();
+        let mut svc = crate::icloud::photos::PhotosService::for_testing(
+            Box::new(session),
+            std::collections::HashMap::new(),
+        );
+        let db: Arc<dyn download::DownloadStore> = make_state_db();
+        let states = vec![make_library_state("PrimarySync", "sync_token:PrimarySync")];
+        let scope = test_precheck_scope_for_states(&states, "corrupt-scope");
+        db.upsert_scoped_db_sync_token(state::ScopedDbSyncToken {
+            provider: scope.provider.clone(),
+            account: scope.account.clone(),
+            shape_version: scope.shape_version,
+            scope_hash: scope.scope_hash.clone(),
+            selected_zones_json: scope.selected_zones_json.clone(),
+            scope_json: "{not valid json".to_string(),
+            token: "db-tok-corrupt".to_string(),
+        })
+        .await
+        .expect("seed corrupt scoped token row");
+
+        let precheck = check_changes_database(Some(db.as_ref()), &states, &mut svc, &scope).await;
+
+        assert_eq!(
+            precheck,
+            WatchPrecheck::proceed_all(),
+            "corrupt stored scope JSON must fall back to enumeration"
         );
     }
 
@@ -4489,20 +5234,20 @@ mod tests {
         assert_eq!(failures, 0);
     }
 
-    /// A `set_metadata(DB_SYNC_TOKEN_KEY, ...)` write failure on the
+    /// A scoped-token write failure on the
     /// unselected-zone skip path must not break watch mode.
     #[tokio::test]
     async fn check_changes_database_unselected_zone_token_persist_failure_still_skips() {
         use serde_json::json;
         let inner = make_state_db();
-        inner
-            .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
-            .await
-            .expect("seed token");
-        let db: Arc<dyn state::StateDb> = Arc::new(FailingMetadataSetDb::new(
+        let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
+        let scope =
+            test_precheck_scope_for_states(std::slice::from_ref(&lib_state), "scope-write-fail");
+        seed_scoped_db_token(inner.as_ref(), &scope, "db-tok-prev").await;
+        let db: Arc<dyn download::DownloadStore> = Arc::new(FailingMetadataSetDb::new(
             inner,
-            MetadataSetFailure::Exact(DB_SYNC_TOKEN_KEY),
-            "simulated db_sync_token write failure",
+            MetadataSetFailure::Exact(SCOPED_DB_SYNC_TOKEN_FAILURE_KEY),
+            "simulated scoped db sync token write failure",
         ));
 
         let session = crate::test_helpers::MockPhotosSession::new().ok(json!({
@@ -4517,9 +5262,9 @@ mod tests {
             std::collections::HashMap::new(),
         );
 
-        let lib_state = make_library_state("PrimarySync", "sync_token:PrimarySync");
         let precheck =
-            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc).await;
+            check_single_library_changes_database(Some(db.as_ref()), &lib_state, &mut svc, &scope)
+                .await;
         assert_eq!(precheck, WatchPrecheck::SkipAll);
     }
 
@@ -4536,7 +5281,7 @@ mod tests {
     #[tokio::test]
     async fn preload_asset_groupings_partial_people_failure_keeps_albums() {
         struct PartialDb {
-            inner: Arc<dyn state::StateDb>,
+            inner: Arc<dyn download::DownloadStore>,
         }
 
         #[async_trait::async_trait]
@@ -4612,18 +5357,19 @@ mod tests {
         assert!(groupings.people.is_empty());
     }
 
-    // `should_store_sync_token` is the single decision gate
-    // protecting the sync-token from being advanced after a partial sync or
-    // a dry run. Both situations would lose change events on the next
-    // incremental cycle ("user data is sacred"). The matrix below pins every
-    // (outcome, dry_run) combination so a future refactor can't relax the
-    // contract without a failing test.
+    // CONTRACT: SYNC_TOKEN_ADVANCE_REQUIRES_CLEAN_CYCLE
+    // `should_store_sync_token` is the single decision gate protecting the
+    // sync-token from being advanced after a partial sync or a dry run. Both
+    // situations would lose change events on the next incremental cycle
+    // ("user data is sacred"). The matrix below pins every (outcome, dry_run)
+    // combination so a future refactor can't relax the contract without a
+    // failing test.
 
     /// A partial download failure MUST NOT advance the stored sync
     /// token. Otherwise the next incremental sync would skip past the
     /// failed assets' change events and never retry them.
     #[test]
-    fn sync_loop_partial_failure_does_not_advance_sync_token() {
+    fn contract_sync_token_advance_requires_clean_cycle_blocks_partial_failure() {
         let outcome = download::DownloadOutcome::PartialFailure { failed_count: 3 };
         assert!(
             !should_store_sync_token(&outcome, false),
@@ -4825,7 +5571,7 @@ mod tests {
             .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
             .await
             .expect("seed zone token");
-        let db: Arc<dyn state::StateDb> = Arc::new(FailingMetadataSetDb::new(
+        let db: Arc<dyn download::DownloadStore> = Arc::new(FailingMetadataSetDb::new(
             Arc::clone(&inner),
             MetadataSetFailure::Prefix(SYNC_TOKEN_PREFIX),
             "simulated sync-token write failure",
@@ -4869,6 +5615,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_cycle_published_file_state_write_failure_blocks_token() {
+        // CONTRACT: SYNC_TOKEN_ADVANCE_REQUIRES_CLEAN_CYCLE
+        // A published file with a failed state write is unsafe to skip on the
+        // next incremental cycle, even though the media bytes are on disk.
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = crate::start_wiremock_or_skip!();
+        let config = make_run_cycle_config();
+        let inner = make_state_db();
+        inner
+            .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
+            .await
+            .expect("seed zone token");
+        let db: Arc<dyn download::DownloadStore> = Arc::new(
+            FailingMetadataSetDb::without_set_failure(
+                Arc::clone(&inner),
+                "simulated mark_downloaded failure",
+            )
+            .with_mark_downloaded_failure(),
+        );
+        let download_dir = tempfile::tempdir().expect("download tempdir");
+        let (_session_dir, shared_session) = make_shared_session_for_run_cycle().await;
+
+        let master_record_name = "master-state-write-failure";
+        let body = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(body));
+        Mock::given(method("GET"))
+            .and(path("/photo.jpg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body)
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let album = make_full_album_with_session(
+            "PrimarySync",
+            crate::test_helpers::MockPhotosSession::new()
+                .ok(album_count_response(1))
+                .ok(full_album_page_with_download(
+                    "PrimarySync",
+                    master_record_name,
+                    "zone-tok-after-state-write-failure",
+                    &format!("{}/photo.jpg", server.uri()),
+                    body.len() as u64,
+                    &checksum,
+                )),
+        );
+        let lib_state =
+            make_run_cycle_library_state_with_album("PrimarySync", "sync_token:PrimarySync", album);
+        let states = vec![&lib_state];
+        let build_download_config =
+            make_run_cycle_download_config_builder(download_dir.path(), Arc::clone(&db));
+
+        let result = run_cycle(
+            &states,
+            &config,
+            Some(db.as_ref()),
+            false,
+            &build_download_config,
+            download::DownloadControls::download_hidden(),
+            &shared_session,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("run cycle");
+
+        let final_dir = download_dir.path().join("2023/11/14");
+        let final_paths = std::fs::read_dir(&final_dir)
+            .expect("final directory exists")
+            .map(|entry| entry.expect("final file entry").path())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            final_paths.len(),
+            1,
+            "expected one final file: {final_paths:?}"
+        );
+        assert_eq!(
+            std::fs::read(&final_paths[0]).expect("read local media file"),
+            body,
+            "media bytes must land before the state write fails"
+        );
+        assert_eq!(
+            result.failed_count, 1,
+            "state-write failure must make the cycle partial; stats: {:?}",
+            result.stats
+        );
+        assert_eq!(result.stats.state_write_failures, 1);
+        assert!(
+            !result.db_sync_token_advance_safe,
+            "database precheck token must not advance after a state-write failure"
+        );
+        assert_eq!(
+            inner
+                .get_metadata("sync_token:PrimarySync")
+                .await
+                .expect("read zone token")
+                .as_deref(),
+            Some("zone-tok-prev"),
+            "failed mark_downloaded must leave the old zone token in place for replay"
+        );
+        assert!(
+            inner
+                .get_downloaded_page(0, 10)
+                .await
+                .expect("downloaded rows")
+                .is_empty(),
+            "asset must not be marked fully downloaded when mark_downloaded fails"
+        );
+    }
+
+    #[tokio::test]
     async fn run_cycle_config_hash_purge_failure_forces_full_without_persisting_hash() {
         let config = make_run_cycle_config();
         let current_hash = download::compute_config_hash(&config);
@@ -4883,7 +5746,7 @@ mod tests {
             .set_metadata("sync_token:PrimarySync", "zone-tok-prev")
             .await
             .expect("seed zone token");
-        let db: Arc<dyn state::StateDb> = Arc::new(
+        let db: Arc<dyn download::DownloadStore> = Arc::new(
             FailingMetadataSetDb::without_set_failure(
                 Arc::clone(&inner),
                 "simulated token purge failure",
@@ -5215,7 +6078,7 @@ mod tests {
             .await
             .expect("seed zone token");
         let shutdown_token = CancellationToken::new();
-        let db: Arc<dyn state::StateDb> = Arc::new(
+        let db: Arc<dyn download::DownloadStore> = Arc::new(
             FailingMetadataSetDb::without_set_failure(Arc::clone(&inner), "unused")
                 .with_cancel_on_upsert(shutdown_token.clone()),
         );
@@ -5275,7 +6138,7 @@ mod tests {
         let inner = make_state_db();
         let download_dir = tempfile::tempdir().expect("download tempdir");
         let download_root = download_dir.path().to_path_buf();
-        let db: Arc<dyn state::StateDb> = Arc::new(
+        let db: Arc<dyn download::DownloadStore> = Arc::new(
             FailingMetadataSetDb::without_set_failure(Arc::clone(&inner), "unused")
                 .with_download_dir_replaced_on_upsert(download_root.clone()),
         );
@@ -5652,6 +6515,73 @@ mod tests {
         assert!(!should_reconcile_this_cycle(0, Some(1)));
     }
 
+    async fn seed_downloaded_for_local_drift_probe(
+        db: &state::SqliteStateDb,
+        id: &str,
+        path: &std::path::Path,
+        size: u64,
+    ) {
+        let record = crate::test_helpers::TestAssetRecord::new(id)
+            .checksum(&format!("ck_{id}"))
+            .filename(&format!("{id}.jpg"))
+            .size(size)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            id,
+            "original",
+            path,
+            &format!("ck_{id}"),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn bounded_local_drift_probe_marks_missing_file_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = state::SqliteStateDb::open_in_memory().unwrap();
+        let missing_path = dir.path().join("missing.jpg");
+        seed_downloaded_for_local_drift_probe(&db, "MISSING_PROBE", &missing_path, 100).await;
+
+        let outcome = run_bounded_local_drift_probe(&db, 1).await;
+
+        assert_eq!(outcome.scanned, 1);
+        assert_eq!(outcome.drifted, 1);
+        assert_eq!(outcome.marked_failed, 1);
+        let failed = db.get_failed().await.unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(&*failed[0].id, "MISSING_PROBE");
+        assert_eq!(
+            failed[0].last_error.as_deref(),
+            Some(crate::commands::reconcile::FILE_MISSING_REASON)
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_local_drift_probe_marks_truncated_file_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = state::SqliteStateDb::open_in_memory().unwrap();
+        let path = dir.path().join("truncated.jpg");
+        std::fs::write(&path, b"short").unwrap();
+        seed_downloaded_for_local_drift_probe(&db, "TRUNCATED_PROBE", &path, 100).await;
+
+        let outcome = run_bounded_local_drift_probe(&db, 1).await;
+
+        assert_eq!(outcome.scanned, 1);
+        assert_eq!(outcome.drifted, 1);
+        assert_eq!(outcome.marked_failed, 1);
+        let failed = db.get_failed().await.unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(&*failed[0].id, "TRUNCATED_PROBE");
+        assert_eq!(
+            failed[0].last_error.as_deref(),
+            Some(crate::commands::reconcile::FILE_TRUNCATED_REASON)
+        );
+    }
+
     // `should_wait_for_2fa` decides whether the reauth-time 2FA
     // branch parks the loop on a code prompt or surfaces the error. In
     // one-shot mode there is no operator at the keyboard; the error MUST
@@ -5786,7 +6716,7 @@ mod tests {
             .set_metadata(&format!("{SYNC_TOKEN_PREFIX}PrimarySync"), "old-zone-token")
             .await
             .expect("seed zone token");
-        let db: Arc<dyn state::StateDb> = Arc::new(
+        let db: Arc<dyn download::DownloadStore> = Arc::new(
             FailingMetadataSetDb::without_set_failure(
                 Arc::clone(&inner),
                 "simulated token purge failure",

@@ -14,8 +14,9 @@ pub mod types;
 
 #[cfg(test)]
 pub use db::ImportedRecord;
+pub(crate) use db::ScopedDbSyncToken;
 pub use db::{
     DownloadStateStore, ImportStateStore, MembershipStore, MetadataRewriteStore, ReportStateStore,
-    SqliteStateDb, StateDb, SyncTokenStore,
+    SqliteStateDb, SyncTokenStore,
 };
 pub use types::{AssetMetadata, AssetRecord, AssetStatus, MediaType, SyncRunStats, VersionSizeKey};
