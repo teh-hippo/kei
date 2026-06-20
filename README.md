@@ -85,7 +85,7 @@ kei list albums
 - Original photos and videos, plus Live Photos, RAW siblings, and edited versions when you ask for them.
 - Resumable downloads and checksum checks before files are marked complete.
 - One-shot sync, watch mode, Docker, systemd, launchd, and Windows service support.
-- Maintenance commands for status checks, verification, reconcile, reset, and existing-file import.
+- Maintenance commands for status checks, local diagnostics, manifest export, verification, reconcile, reset, and existing-file import.
 
 Today kei syncs iCloud Photos. Immich, Google Takeout, Nextcloud, and Ente support are on the roadmap.
 
@@ -151,8 +151,9 @@ Coming from `icloudpd`? Read [Migrating from icloudpd](docs/migration-from-iclou
 - [Service mode](https://github.com/rhoopr/kei/wiki/Service)
 - [Commands](https://github.com/rhoopr/kei/wiki/Home#commands)
 - [Credentials](https://github.com/rhoopr/kei/wiki/Credentials)
-- [Troubleshooting](https://github.com/rhoopr/kei/wiki/Troubleshooting)
-- [Manifest export](docs/manifest.md)
+- [Status](https://github.com/rhoopr/kei/wiki/Status)
+- [Doctor](https://github.com/rhoopr/kei/wiki/Doctor)
+- [Manifest export](https://github.com/rhoopr/kei/wiki/Manifest)
 - [Product charter](docs/product-charter.md)
 - [Roadmap](docs/roadmap.md)
 

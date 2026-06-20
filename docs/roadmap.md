@@ -138,27 +138,27 @@ Success criteria:
 
 ## Near-term milestones
 
-### v0.22 - Stability and reliability
+### v0.22 - Stability and reliability - shipped
 
-Goal: make normal sync, recovery, reporting, and token safety feel rock solid.
+v0.22 focused on normal sync safety, recovery, reporting, and token gates.
 
-User outcome: a user can trust routine sync, recover from interruption or
-failure, and tell whether their local backup is safe.
+Shipped work:
 
-Candidate work:
+- Normal sync retries known pending or failed asset-version rows before trusting
+  incremental progress.
+- Interrupted, token-unsafe, and failed state-write paths keep sync tokens from
+  advancing until the work is safe.
+- `kei status` shows active sync work and backup-safety state before completed
+  run history.
+- `kei reconcile` detects missing and truncated local files and can mark them
+  failed for re-download.
+- `kei manifest` exports the local state catalog without contacting iCloud.
+- The first `kei doctor` slice provides redacted local diagnostics and optional
+  live session checks.
+- Hard-delete recovery can use durable asset-to-master mappings when Apple only
+  sends an asset record name.
 
-- Normal sync stability.
-- Interrupted sync recovery.
-- Failed-download visibility and retry behavior.
-- State-write failure token-blocking regression coverage.
-- Active sync work in `kei status`.
-- Local missing or damaged file detection.
-- Manifest export as reliability/support tooling, only after core sync,
-  recovery, and reporting feel solid.
-- First `kei doctor` slice only if it directly helps prove or debug
-  reliability.
-
-Out of scope:
+Still out of scope:
 
 - General catalog query.
 - Local file deletion.
@@ -166,15 +166,6 @@ Out of scope:
 - Immich upload.
 - Provider expansion.
 - UI work.
-
-Success criteria:
-
-- Normal sync is stable enough to trust as the default path.
-- Interrupted sync resumes correctly.
-- Failed downloads are visible and recoverable.
-- Sync tokens do not advance after unsafe or incomplete work.
-- Status and reports explain whether the user is safe without debug logs.
-- Missing or damaged local files are visible during routine maintenance.
 
 ### v0.23 - Headless operations
 
@@ -219,7 +210,6 @@ Candidate work:
 - Large incremental sync streaming.
 - Full-library planning before download where it reduces waste.
 - Filtered sync follow-ups.
-- Targeted retry work if it did not fit v0.22.
 
 Out of scope:
 

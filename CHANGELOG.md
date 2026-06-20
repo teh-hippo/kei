@@ -1611,7 +1611,8 @@ The following Python icloudpd features are not yet available. Links go to tracki
 
 ---
 
-[Unreleased]: https://github.com/rhoopr/kei/compare/v0.21.8...HEAD
+[Unreleased]: https://github.com/rhoopr/kei/compare/v0.22.0...HEAD
+[0.22.0]: https://github.com/rhoopr/kei/compare/v0.21.8...v0.22.0
 [0.21.8]: https://github.com/rhoopr/kei/compare/v0.21.7...v0.21.8
 [0.21.7]: https://github.com/rhoopr/kei/compare/v0.21.6...v0.21.7
 [0.21.6]: https://github.com/rhoopr/kei/compare/v0.21.5...v0.21.6
