@@ -9,32 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-06-20
+
 ### Added
 
-- Added `kei doctor` with redacted text and JSON diagnostics for config parsing, local paths, state DB access, session presence, and recent health/report files. (fixes [#588])
-- Added `kei manifest --format json|csv` to export the local state catalog without iCloud auth or file writes. The export includes paths, asset IDs, versions, checksums, sizes, dates, libraries, albums, and status. (fixes [#590])
+- Added `kei doctor` with redacted text and JSON diagnostics for config parsing, local paths, state DB access, session presence, and recent health/report files. ([#600], fixes [#588])
+- Added `kei manifest --format json|csv` to export the local state catalog without iCloud auth or file writes. The export includes paths, asset IDs, versions, checksums, sizes, dates, libraries, albums, and status. ([#604], fixes [#590])
+
+### Changed
+
+- `kei sync` is now required for syncing. Running bare `kei` shows top-level command help instead of starting a sync, and sync-only flags are rejected outside sync-capable commands. ([#624], fixes [#605])
+- `kei status` now shows running sync work and full-enumeration progress markers before completed-run timestamps, so active work doesn't look finished just because a newer pass row completed. ([#600], fixes [#530])
+- `kei reconcile` now reports missing and truncated local files and can mark them failed so the next sync redownloads them through the normal path. ([#600], fixes [#550])
+- Count shortfalls from iCloud are now diagnostic when the records that were returned are otherwise complete; true pagination shortfalls still block token advancement. ([#625], fixes [#602])
+- Refactored password source handling, download config cloning, and import path derivation to reduce duplicated sync and import code. ([#618], [#619], [#620])
 
 ### Fixed
 
-- Normal incremental sync now retries known pending or failed asset-version rows with a targeted refresh pass instead of forcing full-library enumeration, and keeps sync-token advancement blocked when retry work is incomplete. (fixes [#506])
-- Published files left behind by a failed state write now keep the sync cycle partial when kei retries from the pending row, so zone and database sync tokens stay blocked until the file is recorded in state. (fixes [#515])
-- Notification scripts keep the existing `KEI_ICLOUD_USERNAME` and per-cycle `KEI_*` stat variables, and now also receive `KEI_REPORT_JSON` when `[report].json` is configured.
-- Loopback-bound wiremock and metrics tests now return early with an explicit skip line when a restricted sandbox forbids `127.0.0.1` binds, while normal CI hosts still run the tests strictly. (fixes [#479])
-- Added a lightweight `CONTRACT:` marker check for the sync-token advancement gate, with a matching contract test, so future refactors can't drop the safety invariant by accident. (fixes [#580])
-- Extended the lightweight `CONTRACT:` marker coverage to the `.part` publish path so no-overwrite file promotion stays tied to a named regression test. (fixes [#580])
-- `kei status` now shows running sync work and full-enumeration progress markers before completed-run timestamps, so active work doesn't look finished just because a newer pass row completed. (fixes [#530])
-- Incremental and watch syncs now probe a bounded page of downloaded rows for missing or truncated local files, mark drifted rows failed, and force the cycle to retry them through the normal download path. (fixes [#550])
-- Continued typed-error boundary cleanup for CLI parse exits, auth, service retry, sync-loop auth handling, download workers, incremental fallback, and CloudKit library initialization so help/error routing, retry, 2FA, lock-contention, expired-URL, sync-token, and 421 recovery decisions are pinned behind named classifiers. (fixes [#587])
-- CI, release, and contributor-surface hardening now cover the no-default-features aggregate check, Rust CI on pushes to `main`, service-smoke path filters for shared dispatch/config code, Homebrew release downloads that verify `SHA256SUMS.txt`, current local-gate docs, and required iCloud web-access/redaction guidance in issue and PR templates. (fixes [#585])
-- Cargo audit ignores now carry removal triggers, including the `paste` and transient `rand` advisory entries, so future dependency updates have an obvious cleanup point. (fixes [#585])
-- `.github/FUNDING.yml` now keeps only the configured sponsorship platform instead of the unused template placeholders. (fixes [#585])
-- `just full-test` now records the run start time at begin-run, guards begin-run state with the shared full-test lock, reports newer phases consistently in summaries and diffs, and prints local script-tool availability before long runs. (fixes [#583])
-- Added `just lint-scripts` and `just lint-workflows`, wired deterministic script syntax checks into `just gate` and aggregate CI, routed generated Python bytecode out of the repo tree, and kept shellcheck, shfmt, ruff, and actionlint as check-only optional local tooling until they are installed in every gate environment. (fixes [#583], fixes [#585])
-- `just full-test` now fails up front with a clear GNU/Linux userland message when required GNU `find`/`stat` behavior, `flock`, or `timeout` is unavailable. (fixes [#583])
-- The round-trip serializer gate now documents its heuristic limits and requires a reviewer rationale for no-inverse exceptions or emergency bypasses. (fixes [#583])
-- `just full-test` now quotes the configured Docker image consistently in Docker smoke commands, including the default-command smoke that runs through `bash -c`. (fixes [#583])
-- Encrypted-file credentials now use `.kei-state` directly. The old `.credential-key` auto-rename path was removed; users who still have that pre-0.6.2 key file must rename it to `.kei-state` manually before using the encrypted-file backend. (fixes [#613])
-- Startup no longer auto-copies config, cookies, or state from the old `icloudpd-rs` paths. Users with those pre-rename files should copy the needed files into `~/.config/kei` manually. (fixes [#606])
+- Normal incremental sync now retries known pending or failed asset-version rows with a targeted refresh pass instead of forcing full-library enumeration, and keeps sync-token advancement blocked when retry work is incomplete. ([#600], fixes [#506])
+- Published files left behind by a failed state write now keep the sync cycle partial when kei retries from the pending row, so zone and database sync tokens stay blocked until the file is recorded in state. ([#600], fixes [#515])
+- Incremental and watch syncs now probe a bounded page of downloaded rows for missing or truncated local files, mark drifted rows failed, and force the cycle to retry them through the normal download path. ([#600], fixes [#550])
+- Deferred-unfiled pagination accounting no longer treats unrelated album-side counts as missing records, while real unexplained shortfalls still block sync tokens. ([#603], fixes [#602])
+- Hard-delete tombstones that only include an asset record name can now resolve through durable per-library asset-to-master mappings, with sync-token advancement blocked when a mapping is missing or ambiguous. ([#632], fixes [#626])
+- Clean full retry enumerations now prune stale pending retry rows for assets that no longer exist, while dry-run, print-only, recent/date-limited, and canceled retry runs keep the conservative token block. ([#636], fixes [#626])
+- Docker images now route every current kei subcommand through the entrypoint before falling back to system commands, and a static test guards future subcommand drift. ([#637])
+- Notification scripts keep the existing `KEI_ICLOUD_USERNAME` and per-cycle `KEI_*` stat variables, and now also receive `KEI_REPORT_JSON` when `[report].json` is configured. ([#600])
+- Loopback-bound wiremock and metrics tests now return early with an explicit skip line when a restricted sandbox forbids `127.0.0.1` binds, while normal CI hosts still run the tests strictly. ([#600], fixes [#479])
+- Added lightweight `CONTRACT:` marker checks for sync-token advancement and `.part` no-overwrite publish invariants, each tied to regression tests. ([#600], fixes [#580])
+- Continued typed-error boundary cleanup for CLI parse exits, auth, service retry, sync-loop auth handling, download workers, incremental fallback, and CloudKit library initialization. ([#600], [#615], fixes [#587])
+- CI, release, local full-test, workflow, script-lint, and contributor-surface checks now cover more release-readiness and data-safety regressions. ([#600], fixes [#583], fixes [#585])
+- Cargo audit ignores now carry removal triggers, including the `paste` and transient `rand` advisory entries. ([#600], fixes [#585])
+- URL query building for iCloud photo requests now uses the `url` serializer instead of a separate encoding dependency. ([#617])
+
+### Removed
+
+- Encrypted-file credentials now use `.kei-state` directly. The old `.credential-key` auto-rename path was removed; users who still have that pre-0.6.2 key file must rename it to `.kei-state` manually before using the encrypted-file backend. ([#616], fixes [#613])
+- Startup no longer auto-copies config, cookies, or state from the old `icloudpd-rs` paths. Users with those pre-rename files should copy the needed files into `~/.config/kei` manually. ([#623], fixes [#606])
+- Removed the legacy session cookie parser, the global string interner, stale full-enumeration cleanup code, and low-value wrapper code and dependencies. ([#622], [#621], [#633], [#635])
 
 [#479]: https://github.com/rhoopr/kei/issues/479
 [#506]: https://github.com/rhoopr/kei/issues/506
@@ -47,8 +58,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [#587]: https://github.com/rhoopr/kei/issues/587
 [#588]: https://github.com/rhoopr/kei/issues/588
 [#590]: https://github.com/rhoopr/kei/issues/590
+[#600]: https://github.com/rhoopr/kei/pull/600
+[#602]: https://github.com/rhoopr/kei/issues/602
+[#603]: https://github.com/rhoopr/kei/pull/603
+[#604]: https://github.com/rhoopr/kei/pull/604
+[#605]: https://github.com/rhoopr/kei/issues/605
 [#606]: https://github.com/rhoopr/kei/issues/606
 [#613]: https://github.com/rhoopr/kei/issues/613
+[#615]: https://github.com/rhoopr/kei/pull/615
+[#616]: https://github.com/rhoopr/kei/pull/616
+[#617]: https://github.com/rhoopr/kei/pull/617
+[#618]: https://github.com/rhoopr/kei/pull/618
+[#619]: https://github.com/rhoopr/kei/pull/619
+[#620]: https://github.com/rhoopr/kei/pull/620
+[#621]: https://github.com/rhoopr/kei/pull/621
+[#622]: https://github.com/rhoopr/kei/pull/622
+[#623]: https://github.com/rhoopr/kei/pull/623
+[#624]: https://github.com/rhoopr/kei/pull/624
+[#625]: https://github.com/rhoopr/kei/pull/625
+[#626]: https://github.com/rhoopr/kei/issues/626
+[#632]: https://github.com/rhoopr/kei/pull/632
+[#633]: https://github.com/rhoopr/kei/pull/633
+[#635]: https://github.com/rhoopr/kei/pull/635
+[#636]: https://github.com/rhoopr/kei/pull/636
+[#637]: https://github.com/rhoopr/kei/pull/637
 
 ## [0.21.8] - 2026-06-10
 
