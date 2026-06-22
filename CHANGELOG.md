@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.1] - 2026-06-22
+
+### Fixed
+
+- Live Photo collision paths now stay stable across sync and import. kei now recognizes MOV companions derived from collision-suffixed still filenames, avoids adopting another asset's same-size bare file for pending rows, and imports kei-generated collision-family Live Photo MOV paths. ([#639], fixes [#638])
+
+[#638]: https://github.com/rhoopr/kei/issues/638
+[#639]: https://github.com/rhoopr/kei/pull/639
+
 ## [0.22.0] - 2026-06-20
 
 ### Added
@@ -1611,7 +1620,8 @@ The following Python icloudpd features are not yet available. Links go to tracki
 
 ---
 
-[Unreleased]: https://github.com/rhoopr/kei/compare/v0.22.0...HEAD
+[Unreleased]: https://github.com/rhoopr/kei/compare/v0.22.1...HEAD
+[0.22.1]: https://github.com/rhoopr/kei/compare/v0.22.0...v0.22.1
 [0.22.0]: https://github.com/rhoopr/kei/compare/v0.21.8...v0.22.0
 [0.21.8]: https://github.com/rhoopr/kei/compare/v0.21.7...v0.21.8
 [0.21.7]: https://github.com/rhoopr/kei/compare/v0.21.6...v0.21.7
