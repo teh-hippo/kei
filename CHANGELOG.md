@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Live Photo collision paths now stay stable across sync and import. kei now recognizes MOV companions derived from collision-suffixed still filenames, avoids adopting another asset's same-size bare file for pending rows, and imports kei-generated collision-family Live Photo MOV paths. ([#639], fixes [#638])
+- Updated the locked QUIC dependency used by the HTTP stack so release audit clears `RUSTSEC-2026-0185`.
 
 [#638]: https://github.com/rhoopr/kei/issues/638
 [#639]: https://github.com/rhoopr/kei/pull/639
