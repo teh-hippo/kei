@@ -827,7 +827,7 @@ impl PhotoAlbum {
                 .filter(|id| !seen_asset_records.contains(id))
                 .collect();
             if missing.is_empty() {
-                let _ = token_tx.send(None);
+                let _ = token_tx.send(base_token);
                 return;
             }
 
@@ -844,12 +844,15 @@ impl PhotoAlbum {
                     break;
                 }
                 let missing_before = missing.len();
-                match source
-                    .send_matching_assets_from_changes(&mut missing, &tx)
-                    .await
-                {
-                    Ok(()) => {
+                match source.matching_assets_from_changes(&mut missing).await {
+                    Ok(assets) => {
                         hydrated += missing_before.saturating_sub(missing.len());
+                        for asset in assets {
+                            if tx.send(Ok(asset)).await.is_err() {
+                                let _ = token_tx.send(None);
+                                return;
+                            }
+                        }
                     }
                     Err(e) => {
                         let _ = tx.send(Err(e)).await;
@@ -879,10 +882,7 @@ impl PhotoAlbum {
                 );
             }
 
-            // Cross-zone hydration currently replays full relation/source-zone
-            // scans. Suppress the owner zone token until incremental relation
-            // semantics are implemented.
-            let _ = token_tx.send(None);
+            let _ = token_tx.send(if missing.is_empty() { base_token } else { None });
         });
 
         (
@@ -986,11 +986,31 @@ impl PhotoAlbum {
         Ok(ids)
     }
 
-    async fn send_matching_assets_from_changes(
+    pub(crate) async fn hydrate_matching_assets_from_changes(
         &self,
         missing_asset_record_names: &mut FxHashSet<String>,
-        tx: &mpsc::Sender<anyhow::Result<PhotoAsset>>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<PhotoAsset>> {
+        let mut matched = self
+            .clone_for_task_without_sources()
+            .matching_assets_from_changes(missing_asset_record_names)
+            .await?;
+        for source in self.cross_zone_sources_for_task() {
+            if missing_asset_record_names.is_empty() {
+                break;
+            }
+            matched.extend(
+                source
+                    .matching_assets_from_changes(missing_asset_record_names)
+                    .await?,
+            );
+        }
+        Ok(matched)
+    }
+
+    async fn matching_assets_from_changes(
+        &self,
+        missing_asset_record_names: &mut FxHashSet<String>,
+    ) -> anyhow::Result<Vec<PhotoAsset>> {
         let source_zone: Arc<str> = Arc::from(self.zone_name());
         let mut buffer = DeltaRecordBuffer::new();
         let mut matched = Vec::new();
@@ -1017,10 +1037,7 @@ impl PhotoAlbum {
                 matched.push(asset);
             }
         }
-        for asset in matched {
-            tx.send(Ok(asset)).await?;
-        }
-        Ok(())
+        Ok(matched)
     }
 
     async fn scan_changes_zone<F>(&self, mut on_record: F) -> anyhow::Result<()>
@@ -1485,9 +1502,7 @@ impl PhotoAlbum {
                             .get_or_insert_with(Vec::new)
                             .extend(page_records);
                     }
-                    if let Some(mut asset_records) = asset_records {
-                        asset_records
-                            .sort_by(|left, right| left.record_name.cmp(&right.record_name));
+                    if let Some(asset_records) = asset_records {
                         let sibling_count = asset_records.len();
                         for (index, asset_rec) in asset_records.into_iter().enumerate() {
                             if let Some(n) = limit {
@@ -1530,8 +1545,6 @@ impl PhotoAlbum {
 
                 for (master_id, records) in page_assets {
                     if let Some(master) = pending_masters.remove(&master_id) {
-                        let mut records = records;
-                        records.sort_by(|left, right| left.record_name.cmp(&right.record_name));
                         let sibling_count = records.len();
                         for (index, asset_rec) in records.into_iter().enumerate() {
                             if let Some(n) = limit {
@@ -1554,8 +1567,6 @@ impl PhotoAlbum {
                         paired_masters.insert(master.record_name.clone(), master);
                         prune_paired_master_cache(&mut paired_masters, max_pending_records);
                     } else if let Some(master) = paired_masters.get(&master_id) {
-                        let mut records = records;
-                        records.sort_by(|left, right| left.record_name.cmp(&right.record_name));
                         for asset_rec in records {
                             if let Some(n) = limit {
                                 if total_sent >= u64::from(n) {
@@ -2440,13 +2451,65 @@ mod tests {
             vec![
                 (
                     "master-sibling".to_string(),
-                    "asset-sibling-a".to_string(),
+                    "asset-sibling-b".to_string(),
                     "master-sibling".to_string(),
                 ),
                 (
                     "master-sibling".to_string(),
-                    "asset-sibling-b".to_string(),
-                    "asset-sibling-b".to_string(),
+                    "asset-sibling-a".to_string(),
+                    "asset-sibling-a".to_string(),
+                ),
+            ]
+        );
+        assert_eq!(
+            token_rx.await.expect("sync token sender").as_deref(),
+            Some("token-full")
+        );
+    }
+
+    #[tokio::test]
+    async fn full_query_late_earlier_sibling_keeps_first_seen_master_state_id() {
+        use tokio_stream::StreamExt;
+
+        let mock = MockPhotosFlow::new()
+            .query_page(
+                vec![
+                    test_asset_record_for("asset-late-b", "master-late-earlier"),
+                    test_master_record("master-late-earlier"),
+                ],
+                Some("token-full"),
+            )
+            .query_page(
+                vec![test_asset_record_for("asset-late-a", "master-late-earlier")],
+                Some("token-full"),
+            )
+            .build();
+        let album = make_album_with_session(1, Box::new(mock));
+
+        let (stream, token_rx) = album.photo_stream_with_token(None, Some(2), 1);
+        tokio::pin!(stream);
+        let mut seen = Vec::new();
+        while let Some(result) = stream.next().await {
+            let asset = result.expect("late sibling asset should parse");
+            seen.push((
+                asset.id().to_string(),
+                asset.asset_record_name().to_string(),
+                asset.state_id().to_string(),
+            ));
+        }
+
+        assert_eq!(
+            seen,
+            vec![
+                (
+                    "master-late-earlier".to_string(),
+                    "asset-late-b".to_string(),
+                    "master-late-earlier".to_string(),
+                ),
+                (
+                    "master-late-earlier".to_string(),
+                    "asset-late-a".to_string(),
+                    "asset-late-a".to_string(),
                 ),
             ]
         );
@@ -3040,9 +3103,9 @@ mod tests {
             && asset.asset_record_name() == "asset-master-shared"
             && asset.source_zone() == Some("SharedSync-abc")));
         assert_eq!(
-            token_rx.await.expect("sync token sender"),
-            None,
-            "cross-zone hydration suppresses owner-zone token advancement"
+            token_rx.await.expect("sync token sender").as_deref(),
+            Some("owner-token"),
+            "fully resolved cross-zone hydration can keep the owner-zone token"
         );
         assert_eq!(
             owner_query_calls.load(std::sync::atomic::Ordering::SeqCst),
