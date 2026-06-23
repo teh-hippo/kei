@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.4] - 2026-06-23
+
+### Fixed
+
+- Selected-album incremental sync now recovers relation deltas that arrive before the matching asset record. kei hydrates the bounded missing relation, records the asset-to-master mapping, and keeps retry state scoped to the right iCloud library so safe cycles can advance their sync token. ([#646], fixes [#640], fixes [#645])
+
+[#640]: https://github.com/rhoopr/kei/issues/640
+[#645]: https://github.com/rhoopr/kei/issues/645
+[#646]: https://github.com/rhoopr/kei/pull/646
+
 ## [0.22.3] - 2026-06-23
 
 ### Fixed
@@ -1642,7 +1652,8 @@ The following Python icloudpd features are not yet available. Links go to tracki
 
 ---
 
-[Unreleased]: https://github.com/rhoopr/kei/compare/v0.22.3...HEAD
+[Unreleased]: https://github.com/rhoopr/kei/compare/v0.22.4...HEAD
+[0.22.4]: https://github.com/rhoopr/kei/compare/v0.22.3...v0.22.4
 [0.22.3]: https://github.com/rhoopr/kei/compare/v0.22.2...v0.22.3
 [0.22.2]: https://github.com/rhoopr/kei/compare/v0.22.1...v0.22.2
 [0.22.1]: https://github.com/rhoopr/kei/compare/v0.22.0...v0.22.1
