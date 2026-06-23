@@ -1354,7 +1354,7 @@ dependencies = [
 
 [[package]]
 name = "kei"
-version = "0.22.3"
+version = "0.22.4-dev"
 dependencies = [
  "aes-gcm",
  "anyhow",
