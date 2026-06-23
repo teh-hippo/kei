@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.3] - 2026-06-23
+
+### Fixed
+
+- Unmatched iCloud hard-delete tombstones for assets kei never tracked now leave local catalog state unchanged and still advance the incremental sync token. Real state write failures and mapped asset-to-master deletes still keep their safety checks. ([#642], fixes [#640])
+- Sibling `CPLAsset` records that share one `CPLMaster` are now paired and processed during full and incremental enumeration instead of being dropped as duplicates. ([#644], fixes [#643])
+
+[#640]: https://github.com/rhoopr/kei/issues/640
+[#642]: https://github.com/rhoopr/kei/pull/642
+[#643]: https://github.com/rhoopr/kei/issues/643
+[#644]: https://github.com/rhoopr/kei/pull/644
+
 ## [0.22.2] - 2026-06-23
 
 ### Fixed
@@ -1630,7 +1642,8 @@ The following Python icloudpd features are not yet available. Links go to tracki
 
 ---
 
-[Unreleased]: https://github.com/rhoopr/kei/compare/v0.22.2...HEAD
+[Unreleased]: https://github.com/rhoopr/kei/compare/v0.22.3...HEAD
+[0.22.3]: https://github.com/rhoopr/kei/compare/v0.22.2...v0.22.3
 [0.22.2]: https://github.com/rhoopr/kei/compare/v0.22.1...v0.22.2
 [0.22.1]: https://github.com/rhoopr/kei/compare/v0.22.0...v0.22.1
 [0.22.0]: https://github.com/rhoopr/kei/compare/v0.21.8...v0.22.0
