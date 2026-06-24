@@ -55,7 +55,7 @@ body:
     attributes:
       label: Version
       description: "Output of `kei --version`, or the Docker image tag."
-      placeholder: "kei 0.22.4"
+      placeholder: "kei 0.22.5"
     validations:
       required: true
 
