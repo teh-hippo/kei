@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.6] - 2026-06-25
+
+### Fixed
+
+- Incremental sync now refreshes aged iCloud download URLs and retries unfinished work in the same cycle after Apple returns HTTP 410. This covers transfers that failed plus queued tasks that were cancelled before they started, so recovered cycles can still advance their sync token. ([#650], fixes [#647])
+
+[#650]: https://github.com/rhoopr/kei/pull/650
+
 ## [0.22.5] - 2026-06-24
 
 ### Fixed
@@ -1661,7 +1669,8 @@ The following Python icloudpd features are not yet available. Links go to tracki
 
 ---
 
-[Unreleased]: https://github.com/rhoopr/kei/compare/v0.22.5...HEAD
+[Unreleased]: https://github.com/rhoopr/kei/compare/v0.22.6...HEAD
+[0.22.6]: https://github.com/rhoopr/kei/compare/v0.22.5...v0.22.6
 [0.22.5]: https://github.com/rhoopr/kei/compare/v0.22.4...v0.22.5
 [0.22.4]: https://github.com/rhoopr/kei/compare/v0.22.3...v0.22.4
 [0.22.3]: https://github.com/rhoopr/kei/compare/v0.22.2...v0.22.3
