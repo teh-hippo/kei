@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -130,6 +131,7 @@ struct FetcherRange {
     start: u64,
     end: u64,
     limit: Option<u32>,
+    suppress_token_on_limit: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,7 +197,13 @@ fn range_limit(limit: Option<u32>, start: u64, end: u64) -> Option<u32> {
     })
 }
 
-fn push_fetcher_range(ranges: &mut Vec<FetcherRange>, limit: Option<u32>, start: u64, end: u64) {
+fn push_fetcher_range(
+    ranges: &mut Vec<FetcherRange>,
+    limit: Option<u32>,
+    start: u64,
+    end: u64,
+    suppress_token_on_limit: bool,
+) {
     if start >= end {
         return;
     }
@@ -203,6 +211,7 @@ fn push_fetcher_range(ranges: &mut Vec<FetcherRange>, limit: Option<u32>, start:
         start,
         end,
         limit: range_limit(limit, start, end),
+        suppress_token_on_limit,
     });
 }
 
@@ -220,6 +229,7 @@ fn build_enumeration_plan(
                 start: 0,
                 end: u64::MAX,
                 limit,
+                suppress_token_on_limit: limit.is_some(),
             }],
         };
     };
@@ -229,6 +239,11 @@ fn build_enumeration_plan(
         determine_fetcher_count(total, page_size, concurrency * 2)
     } else {
         1
+    };
+    let suppress_token_on_limit = match (limit, total_count) {
+        (Some(lim), Some(total_count)) => u64::from(lim) < total_count,
+        (Some(_), None) => true,
+        (None, _) => false,
     };
     let initial_boundary_probe = profile.allow_initial_boundary_probe()
         && concurrency > 1
@@ -255,14 +270,27 @@ fn build_enumeration_plan(
                 start: boundary_start,
                 end: boundary_end,
                 limit: Some(1),
+                suppress_token_on_limit,
             });
-            push_fetcher_range(&mut ranges, limit, start, end.min(boundary_start));
-            push_fetcher_range(&mut ranges, limit, boundary_end, end);
+            push_fetcher_range(
+                &mut ranges,
+                limit,
+                start,
+                end.min(boundary_start),
+                suppress_token_on_limit,
+            );
+            push_fetcher_range(
+                &mut ranges,
+                limit,
+                boundary_end,
+                end,
+                suppress_token_on_limit,
+            );
             continue;
         } else if initial_boundary_probe && i > 0 {
             start = start.max(page_size as u64);
         }
-        push_fetcher_range(&mut ranges, limit, start, end);
+        push_fetcher_range(&mut ranges, limit, start, end, suppress_token_on_limit);
     }
 
     EnumerationPlan { page_size, ranges }
@@ -302,6 +330,35 @@ fn unanimous_fetcher_sync_token(album: &str, tokens: &[String]) -> Option<String
          blocking sync token advancement"
     );
     None
+}
+
+#[derive(Debug, Default)]
+struct FetcherSyncTokenCapture {
+    tokens: tokio::sync::Mutex<Vec<String>>,
+    suppressed: AtomicBool,
+}
+
+impl FetcherSyncTokenCapture {
+    async fn push(&self, token: String) {
+        self.tokens.lock().await.push(token);
+    }
+
+    fn suppress(&self) {
+        self.suppressed.store(true, Ordering::Relaxed);
+    }
+
+    async fn resolve(&self, album: &str) -> Option<String> {
+        if self.suppressed.load(Ordering::Relaxed) {
+            tracing::debug!(
+                album,
+                "Full enumeration stopped at the caller's limit; syncToken is not a complete-zone checkpoint"
+            );
+            return None;
+        }
+
+        let tokens = self.tokens.lock().await;
+        unanimous_fetcher_sync_token(album, &tokens)
+    }
 }
 
 /// Configuration for creating a `PhotoAlbum`, bundling all non-session fields.
@@ -715,8 +772,7 @@ impl PhotoAlbum {
         }
 
         let (token_tx, token_rx) = tokio::sync::oneshot::channel();
-        let fetcher_sync_tokens: Arc<tokio::sync::Mutex<Vec<String>>> =
-            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let fetcher_sync_tokens = Arc::new(FetcherSyncTokenCapture::default());
 
         let (stream, handles) = self.photo_stream_inner(
             limit,
@@ -740,8 +796,7 @@ impl PhotoAlbum {
             let final_token = if fetcher_panicked {
                 None
             } else {
-                let tokens = fetcher_sync_tokens.lock().await;
-                unanimous_fetcher_sync_token(&album_name, &tokens)
+                fetcher_sync_tokens.resolve(&album_name).await
             };
             let _ = token_tx.send(final_token);
         });
@@ -900,8 +955,7 @@ impl PhotoAlbum {
         treat_empty_tail_as_error: bool,
     ) -> (PhotoStream, tokio::sync::oneshot::Receiver<Option<String>>) {
         let (token_tx, token_rx) = tokio::sync::oneshot::channel();
-        let fetcher_sync_tokens: Arc<tokio::sync::Mutex<Vec<String>>> =
-            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let fetcher_sync_tokens = Arc::new(FetcherSyncTokenCapture::default());
 
         let (stream, handles) = self.photo_stream_inner(
             limit,
@@ -918,8 +972,7 @@ impl PhotoAlbum {
             let final_token = if fetcher_panicked {
                 None
             } else {
-                let tokens = fetcher_sync_tokens.lock().await;
-                unanimous_fetcher_sync_token(&album_name, &tokens)
+                fetcher_sync_tokens.resolve(&album_name).await
             };
             let _ = token_tx.send(final_token);
         });
@@ -1225,7 +1278,7 @@ impl PhotoAlbum {
         limit: Option<u32>,
         total_count: Option<u64>,
         profile: PhotoStreamProfile,
-        fetcher_sync_tokens: Option<Arc<tokio::sync::Mutex<Vec<String>>>>,
+        fetcher_sync_tokens: Option<Arc<FetcherSyncTokenCapture>>,
         preserve_blank_sync_tokens_for_diagnostics: bool,
         treat_empty_tail_as_error: bool,
     ) -> (PhotoStream, Vec<JoinHandle<()>>) {
@@ -1252,6 +1305,7 @@ impl PhotoAlbum {
                 range.start,
                 range.end,
                 range.limit,
+                range.suppress_token_on_limit,
                 fetcher_sync_tokens.clone(),
                 behavior,
             ));
@@ -1282,7 +1336,8 @@ impl PhotoAlbum {
         start_offset: u64,
         end_offset: u64,
         limit: Option<u32>,
-        fetcher_sync_tokens: Option<Arc<tokio::sync::Mutex<Vec<String>>>>,
+        suppress_token_on_limit: bool,
+        fetcher_sync_tokens: Option<Arc<FetcherSyncTokenCapture>>,
         behavior: FetcherBehavior,
     ) -> JoinHandle<()> {
         let session = self.session.clone_box();
@@ -1468,7 +1523,7 @@ impl PhotoAlbum {
                 }
 
                 if limit_reached {
-                    stopped_for_limit = true;
+                    stopped_for_limit = suppress_token_on_limit;
                     break;
                 }
 
@@ -1539,7 +1594,7 @@ impl PhotoAlbum {
                 );
 
                 if limit_reached {
-                    stopped_for_limit = true;
+                    stopped_for_limit = suppress_token_on_limit;
                     break;
                 }
 
@@ -1586,7 +1641,7 @@ impl PhotoAlbum {
                     }
                 }
                 if limit_reached {
-                    stopped_for_limit = true;
+                    stopped_for_limit = suppress_token_on_limit;
                     break;
                 }
                 let pending_record_count =
@@ -1601,6 +1656,10 @@ impl PhotoAlbum {
                         .await;
                     break;
                 }
+            }
+
+            if suppress_token_on_limit && limit.is_some_and(|n| total_sent >= u64::from(n)) {
+                stopped_for_limit = true;
             }
 
             // Surface any remaining unpaired records that couldn't be paired.
@@ -1634,12 +1693,14 @@ impl PhotoAlbum {
 
             if !enumeration_incomplete {
                 if let Some(shared) = &fetcher_sync_tokens {
-                    if let Some(token) = last_sync_token {
-                        shared.lock().await.push(token);
+                    if stopped_for_limit {
+                        shared.suppress();
+                    } else if let Some(token) = last_sync_token {
+                        shared.push(token).await;
                     } else if saw_blank_sync_token
                         && behavior.preserve_blank_sync_tokens_for_diagnostics
                     {
-                        shared.lock().await.push(String::new());
+                        shared.push(String::new()).await;
                     }
                 }
             }
@@ -2039,6 +2100,7 @@ mod tests {
                 start: 0,
                 end: 1000,
                 limit: Some(1000),
+                suppress_token_on_limit: true,
             }]
         );
         assert!(
@@ -2082,6 +2144,7 @@ mod tests {
                 start: 0,
                 end: 100,
                 limit: Some(100),
+                suppress_token_on_limit: false,
             }]
         );
     }
@@ -3179,8 +3242,9 @@ mod tests {
         assert_eq!(assets.len(), 1);
         assert_eq!(assets[0].id(), "master-owner");
         assert_eq!(
-            token_rx.await.expect("sync token sender").as_deref(),
-            Some("owner-token")
+            token_rx.await.expect("sync token sender"),
+            None,
+            "recent-limited streams stop before the full owner-zone checkpoint"
         );
         assert_eq!(
             owner_query_calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -3268,8 +3332,9 @@ mod tests {
         assert_eq!(ids.first().map(String::as_str), Some("master-0000"));
         assert_eq!(ids.last().map(String::as_str), Some("master-0099"));
         assert_eq!(
-            token_rx.await.expect("sync token sender").as_deref(),
-            Some("zone-token")
+            token_rx.await.expect("sync token sender"),
+            None,
+            "unknown-total recent streams stop at the caller's cap, not a confirmed EOF"
         );
         assert_eq!(
             session.offsets().as_slice(),
