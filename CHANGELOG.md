@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.7] - 2026-06-26
+
+### Fixed
+
+- Incremental sync now refreshes expired download URLs for selected-album assets that are discovered through relation hydration, so the retry pass can recover all unfinished work after HTTP 410 responses and advance sync tokens once the cycle is clean. ([#651], fixes [#647])
+
+[#651]: https://github.com/rhoopr/kei/pull/651
+
 ## [0.22.6] - 2026-06-25
 
 ### Fixed
@@ -1669,7 +1677,8 @@ The following Python icloudpd features are not yet available. Links go to tracki
 
 ---
 
-[Unreleased]: https://github.com/rhoopr/kei/compare/v0.22.6...HEAD
+[Unreleased]: https://github.com/rhoopr/kei/compare/v0.22.7...HEAD
+[0.22.7]: https://github.com/rhoopr/kei/compare/v0.22.6...v0.22.7
 [0.22.6]: https://github.com/rhoopr/kei/compare/v0.22.5...v0.22.6
 [0.22.5]: https://github.com/rhoopr/kei/compare/v0.22.4...v0.22.5
 [0.22.4]: https://github.com/rhoopr/kei/compare/v0.22.3...v0.22.4
