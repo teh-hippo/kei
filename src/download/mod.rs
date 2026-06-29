@@ -2656,6 +2656,22 @@ impl From<&DownloadTask> for RetryTaskKey {
     }
 }
 
+fn retry_hydrator_pass_index(
+    passes: &[crate::commands::AlbumPass],
+    pass_indices: &FxHashSet<usize>,
+) -> Option<usize> {
+    pass_indices
+        .iter()
+        .copied()
+        .filter(|pass_index| {
+            passes
+                .get(*pass_index)
+                .is_some_and(|pass| pass.kind != crate::commands::PassKind::Unfiled)
+        })
+        .min()
+        .or_else(|| (!passes.is_empty()).then_some(0))
+}
+
 fn take_matching_pending_retry_tasks<I>(
     tasks: I,
     pending_targets: &mut FxHashSet<PendingRetryTarget>,
@@ -2879,16 +2895,18 @@ async fn build_retry_download_tasks(
     Ok(tasks)
 }
 
-/// Refresh expired incremental CDN URLs from `/changes/zone` and rebuild only
-/// the task tuples that actually failed. This keeps recovery close to the
-/// delta that produced the stale URLs instead of waiting for the next watch
-/// interval or re-enumerating every selected album.
+/// Hydrate current incremental asset records and rebuild only the task tuples
+/// that actually failed with expired CDN URLs.
+///
+/// Replaying the same token-bounded `/changes/zone` delta can return the same
+/// signed URLs that just aged out. Hydration scans the current zone state
+/// without that old sync token so the retry pass starts from newly-issued URLs
+/// instead of immediately retrying the stale batch.
 async fn build_incremental_expired_url_retry_tasks(
     passes: &[crate::commands::AlbumPass],
     pass_configs: &[Arc<DownloadConfig>],
     retry_sources: &FxHashMap<RetryTaskKey, IncrementalRetrySource>,
     failed_tasks: &[DownloadTask],
-    zone_sync_token: &str,
     shutdown_token: CancellationToken,
 ) -> Result<Vec<DownloadTask>> {
     if failed_tasks.is_empty() {
@@ -2919,48 +2937,13 @@ async fn build_incremental_expired_url_retry_tasks(
 
     let mut tasks = Vec::with_capacity(requested_count);
     let mut task_planner = planner::TaskPlanner::new();
-    if !pass_indices_by_asset.is_empty() {
-        if pending_keys.is_empty() || shutdown_token.is_cancelled() {
-            return Ok(tasks);
-        }
-        let Some(pass) = passes.first() else {
-            return Ok(tasks);
-        };
-        let (mut change_stream, _token_rx) = pass.album.changes_stream(zone_sync_token);
-        while let Some(result) = change_stream.next().await {
-            if pending_keys.is_empty() || shutdown_token.is_cancelled() {
-                break;
-            }
-            let event = result?;
-            let Some(asset) = event.asset else {
-                continue;
-            };
-            let Some(pass_indices) = pass_indices_by_asset.remove(asset.asset_record_name()) else {
-                continue;
-            };
-            for pass_index in pass_indices {
-                let Some(pass_config) = pass_configs.get(pass_index) else {
-                    continue;
-                };
-                let plan = task_planner.plan_asset(&asset, pass_config).await;
-                if plan.filter_reason.is_some() {
-                    continue;
-                }
-                take_matching_retry_tasks(plan.tasks, &mut pending_keys, &mut tasks);
-            }
-            if pass_indices_by_asset.is_empty() {
-                break;
-            }
-        }
-    }
-
     if !pending_keys.is_empty()
         && !pass_indices_by_asset.is_empty()
         && !shutdown_token.is_cancelled()
     {
         let mut missing_by_hydrator: FxHashMap<usize, FxHashSet<String>> = FxHashMap::default();
         for (asset_record_name, pass_indices) in &pass_indices_by_asset {
-            let Some(pass_index) = pass_indices.iter().next().copied() else {
+            let Some(pass_index) = retry_hydrator_pass_index(passes, pass_indices) else {
                 continue;
             };
             missing_by_hydrator
@@ -6092,7 +6075,6 @@ async fn download_photos_incremental_collecting(
             &pass_configs,
             &retry_sources,
             &expired_retry_candidates,
-            zone_sync_token,
             shutdown_token.clone(),
         )
         .await
@@ -7153,6 +7135,46 @@ mod tests {
             _headers: &[(&str, &str)],
         ) -> anyhow::Result<Value> {
             self.responses
+                .lock()
+                .expect("poisoned")
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("unexpected extra changes/zone call"))
+        }
+
+        fn clone_box(&self) -> Box<dyn PhotosSession> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct SplitChangesZoneSession {
+        delta_responses: Arc<std::sync::Mutex<std::collections::VecDeque<Value>>>,
+        hydrate_responses: Arc<std::sync::Mutex<std::collections::VecDeque<Value>>>,
+    }
+
+    impl SplitChangesZoneSession {
+        fn new(delta_responses: Vec<Value>, hydrate_responses: Vec<Value>) -> Self {
+            Self {
+                delta_responses: Arc::new(std::sync::Mutex::new(delta_responses.into())),
+                hydrate_responses: Arc::new(std::sync::Mutex::new(hydrate_responses.into())),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PhotosSession for SplitChangesZoneSession {
+        async fn post(
+            &self,
+            _url: &str,
+            body: String,
+            _headers: &[(&str, &str)],
+        ) -> anyhow::Result<Value> {
+            let responses = if body.contains("\"syncToken\"") {
+                &self.delta_responses
+            } else {
+                &self.hydrate_responses
+            };
+            responses
                 .lock()
                 .expect("poisoned")
                 .pop_front()
@@ -10801,6 +10823,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incremental_expired_url_retry_hydrates_instead_of_replaying_stale_delta() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = crate::start_wiremock_or_skip!();
+        Mock::given(method("GET"))
+            .and(path("/expired-replay.jpg"))
+            .respond_with(ResponseTemplate::new(410))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let body = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46];
+        let checksum = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&body));
+        Mock::given(method("GET"))
+            .and(path("/fresh-hydrated-replay.jpg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(body)
+                    .insert_header("content-type", "image/jpeg"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let stale_url = format!("{}/expired-replay.jpg", server.uri());
+        let fresh_url = format!("{}/fresh-hydrated-replay.jpg", server.uri());
+        let mut stale_records = incremental_photo_records_with_url(
+            "URL_REPLAY_STALE",
+            "replay-stale.jpg",
+            &stale_url,
+            8,
+        );
+        stale_records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] =
+            json!(checksum.clone());
+        let mut fresh_records = incremental_photo_records_with_url(
+            "URL_REPLAY_STALE",
+            "replay-stale.jpg",
+            &fresh_url,
+            8,
+        );
+        fresh_records[0]["fields"]["resOriginalRes"]["value"]["fileChecksum"] = json!(checksum);
+
+        let session = SplitChangesZoneSession::new(
+            vec![
+                changes_zone_response(stale_records.clone(), "zone-token-next"),
+                changes_zone_response(stale_records, "zone-token-next"),
+            ],
+            vec![changes_zone_response(fresh_records, "zone-token-next")],
+        );
+        let passes = vec![AlbumPass {
+            kind: PassKind::Unfiled,
+            album: album_with_session("PrimarySync", "", Box::new(session)),
+            exclude_ids: Arc::new(FxHashSet::default()),
+        }];
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().expect("state db"));
+        let mut config = test_config();
+        let dir = TempDir::new().expect("temp dir");
+        config.directory = Arc::from(dir.path());
+        config.concurrent_downloads = 1;
+        config.recent = Some(10);
+        config.state_db = Some(db.clone());
+        config.sync_mode = SyncMode::Incremental {
+            zone_sync_token: "zone-token-prev".to_string(),
+        };
+
+        let result = download_photos_with_sync(
+            &Client::new(),
+            &passes,
+            Arc::new(config),
+            DownloadControls::download_hidden(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("expired URL retry should hydrate current records, not replay stale delta URLs");
+
+        assert!(matches!(result.outcome, DownloadOutcome::Success));
+        assert_eq!(result.stats.downloaded, 1);
+        assert_eq!(result.stats.failed, 0);
+        assert!(
+            !result.stats.interrupted,
+            "hydrated expired URL recovery should not leave the cycle interrupted"
+        );
+        assert_eq!(result.sync_token.as_deref(), Some("zone-token-next"));
+        let summary = db.get_summary().await.expect("summary");
+        assert_eq!(summary.downloaded, 1);
+        assert_eq!(summary.failed, 0);
+    }
+
+    #[tokio::test]
     async fn incremental_expired_url_retry_hydrates_relation_only_album_assets() {
         use base64::Engine as _;
         use sha2::{Digest, Sha256};
@@ -10847,7 +10962,6 @@ mod tests {
         let album_session = SharedChangesZoneSession::new(vec![
             changes_zone_response(relation_records(), "zone-token-next"),
             changes_zone_response(stale_records, "zone-token-next"),
-            changes_zone_response(relation_records(), "zone-token-next"),
             changes_zone_response(fresh_records, "zone-token-next"),
         ]);
         let passes = vec![AlbumPass {
