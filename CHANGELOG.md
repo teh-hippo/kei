@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.8] - 2026-06-29
+
+### Fixed
+
+- Bounded recent/date full syncs now save zone sync tokens when iCloud proves the bound didn't truncate enumeration, while still blocking token advancement when the bound actually cuts the stream short. ([#652])
+- Incremental sync now hydrates current asset records before retrying expired download URLs, so the retry pass doesn't replay the same stale delta URLs that just returned HTTP 410. ([#653], fixes [#647])
+
+[#647]: https://github.com/rhoopr/kei/issues/647
+[#652]: https://github.com/rhoopr/kei/pull/652
+[#653]: https://github.com/rhoopr/kei/pull/653
+
 ## [0.22.7] - 2026-06-26
 
 ### Fixed
