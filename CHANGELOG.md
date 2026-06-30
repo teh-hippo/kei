@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.9] - 2026-06-30
+
+### Added
+
+- `example.config.toml` now documents every config option with defaults, valid values, and short descriptions, and the README and migration docs point to it as the full config reference. ([#660], fixes [#657])
+
+### Fixed
+
+- Session-error recovery now retries with the saved iCloud session before stripping routing state and forcing SRP login, avoiding unnecessary reauth loops when the persisted session is still usable. ([#656], fixes [#655])
+- Incremental sync now refreshes aged iCloud download URLs before the first transfer when planning has taken long enough for the original URLs to go stale. ([#659])
+- `/healthz` now returns HTTP 200 before the first completed sync cycle while still reporting in JSON that no cycle has completed, and keeps HTTP 503 for known unhealthy states after health is established. ([#661], fixes [#658])
+
+[#655]: https://github.com/rhoopr/kei/issues/655
+[#656]: https://github.com/rhoopr/kei/pull/656
+[#657]: https://github.com/rhoopr/kei/issues/657
+[#658]: https://github.com/rhoopr/kei/issues/658
+[#659]: https://github.com/rhoopr/kei/pull/659
+[#660]: https://github.com/rhoopr/kei/pull/660
+[#661]: https://github.com/rhoopr/kei/pull/661
+
 ## [0.22.8] - 2026-06-29
 
 ### Fixed
@@ -1688,7 +1708,9 @@ The following Python icloudpd features are not yet available. Links go to tracki
 
 ---
 
-[Unreleased]: https://github.com/rhoopr/kei/compare/v0.22.7...HEAD
+[Unreleased]: https://github.com/rhoopr/kei/compare/v0.22.9...HEAD
+[0.22.9]: https://github.com/rhoopr/kei/compare/v0.22.8...v0.22.9
+[0.22.8]: https://github.com/rhoopr/kei/compare/v0.22.7...v0.22.8
 [0.22.7]: https://github.com/rhoopr/kei/compare/v0.22.6...v0.22.7
 [0.22.6]: https://github.com/rhoopr/kei/compare/v0.22.5...v0.22.6
 [0.22.5]: https://github.com/rhoopr/kei/compare/v0.22.4...v0.22.5
