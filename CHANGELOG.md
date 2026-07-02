@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.10] - 2026-07-02
+
+### Fixed
+
+- Pending incremental retries now hydrate current iCloud records before rebuilding download tasks, so retry queues with expired download URLs can refresh and finish instead of replaying stale URLs. ([#662])
+- Reauth now treats a successfully validated saved session as authenticated even when Apple still reports 2FA account flags, avoiding unnecessary live validation prompts for persisted sessions. ([#664], fixes [#655])
+- `kei login get-code` now reports that the existing session is already authenticated when the saved session or fresh validation cache is valid, instead of falling through to SRP and requesting another 2FA push. ([#665], fixes [#655])
+
+[#655]: https://github.com/rhoopr/kei/issues/655
+[#662]: https://github.com/rhoopr/kei/pull/662
+[#664]: https://github.com/rhoopr/kei/pull/664
+[#665]: https://github.com/rhoopr/kei/pull/665
+
 ## [0.22.9] - 2026-06-30
 
 ### Added
@@ -1708,7 +1721,8 @@ The following Python icloudpd features are not yet available. Links go to tracki
 
 ---
 
-[Unreleased]: https://github.com/rhoopr/kei/compare/v0.22.9...HEAD
+[Unreleased]: https://github.com/rhoopr/kei/compare/v0.22.10...HEAD
+[0.22.10]: https://github.com/rhoopr/kei/compare/v0.22.9...v0.22.10
 [0.22.9]: https://github.com/rhoopr/kei/compare/v0.22.8...v0.22.9
 [0.22.8]: https://github.com/rhoopr/kei/compare/v0.22.7...v0.22.8
 [0.22.7]: https://github.com/rhoopr/kei/compare/v0.22.6...v0.22.7
