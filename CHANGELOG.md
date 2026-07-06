@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.11] - 2026-07-06
+
+### Fixed
+
+- Incremental source deletes now prune pending/failed retry rows while preserving downloaded files as source-deleted catalog entries. Normal sync startup also clears already-tombstoned pending/failed rows, so stale pending counts from older runs self-heal without a wide full sync. ([#666], fixes [#663])
+
+[#663]: https://github.com/rhoopr/kei/issues/663
+[#666]: https://github.com/rhoopr/kei/pull/666
+
 ## [0.22.10] - 2026-07-02
 
 ### Fixed
