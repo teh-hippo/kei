@@ -9,15 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.12] - 2026-07-13
+
 ### Changed
 
-- State databases now use schema version 16 to track inconclusive provider verification. Older kei versions reject a version 16 database instead of opening it. To downgrade, restore a state DB backup made before the upgrade; downloaded media files are unchanged.
+- State databases now use schema version 16 to track inconclusive provider verification. Older kei versions reject a version 16 database instead of opening it. To downgrade, restore a state DB backup made before the upgrade; downloaded media files are unchanged. ([#667])
 
 ### Fixed
 
-- Full sync now proves natural EOF past iCloud count hints and repairs missing, blank, dropped, or incomplete pass-token evidence once in the same cycle. The previous provider checkpoint stays active when repair doesn't complete.
-- Pending retries now revalidate stored record identities directly. Confirmed source deletions remain in catalog history but leave actionable pending totals, while omitted or transient lookup results stay pending with a verification reason.
-- Provider checkpoints can advance after transfer failures when retry work is durable, without marking the local backup complete. Eligibility config reconciliation preserves the prior token through inventory and delta bridging, and path-only config drift keeps source tracking incremental.
+- Full sync now proves natural EOF past iCloud count hints and repairs missing, blank, dropped, or incomplete pass-token evidence once in the same cycle. The previous provider checkpoint stays active when repair doesn't complete. ([#667], [#668])
+- Pending retries now revalidate stored record identities directly. Confirmed source deletions remain in catalog history but leave actionable pending totals, while omitted or transient lookup results stay pending with a verification reason. ([#668], fixes [#663])
+- Provider checkpoints can advance after transfer failures when retry work is durable, without marking the local backup complete. Eligibility config reconciliation preserves the prior token through inventory and delta bridging, and path-only config drift keeps source tracking incremental. ([#667], [#668])
+
+[#667]: https://github.com/rhoopr/kei/pull/667
+[#668]: https://github.com/rhoopr/kei/pull/668
 
 ## [0.22.11] - 2026-07-06
 
