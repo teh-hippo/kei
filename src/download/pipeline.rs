@@ -674,14 +674,16 @@ async fn record_seen_for_forwarded_task(
     config: &DownloadConfig,
     asset: &PhotoAsset,
     task: &DownloadTask,
-) {
-    if let Err(e) = planner::upsert_seen_for_task(db, config, asset, task).await {
+) -> Result<(), crate::state::error::StateError> {
+    let result = planner::upsert_seen_for_task(db, config, asset, task).await;
+    if let Err(e) = &result {
         tracing::warn!(
             asset_id = %task.asset_id,
             error = %e,
             "Failed to record asset"
         );
     }
+    result
 }
 
 async fn backfill_downloaded_metadata_for_on_disk_skip(
@@ -1503,13 +1505,18 @@ where
                                 ) {
                                     Some(true) => {
                                         disposition = disposition.max(AssetDisposition::Forwarded);
-                                        record_seen_for_forwarded_task(
+                                        if record_seen_for_forwarded_task(
                                             db.as_ref(),
                                             config,
                                             &asset,
                                             &task,
                                         )
-                                        .await;
+                                        .await
+                                        .is_err()
+                                        {
+                                            state_write_failures_producer
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        }
                                         let size = task.size;
                                         if task_tx.send(task).await.is_err() {
                                             return skips;
@@ -1579,13 +1586,20 @@ where
                                                 );
                                                 disposition =
                                                     disposition.max(AssetDisposition::Forwarded);
-                                                record_seen_for_forwarded_task(
+                                                if record_seen_for_forwarded_task(
                                                     db.as_ref(),
                                                     config,
                                                     &asset,
                                                     &task,
                                                 )
-                                                .await;
+                                                .await
+                                                .is_err()
+                                                {
+                                                    state_write_failures_producer.fetch_add(
+                                                        1,
+                                                        std::sync::atomic::Ordering::Relaxed,
+                                                    );
+                                                }
                                                 let size = task.size;
                                                 if task_tx.send(task).await.is_err() {
                                                     return skips;
@@ -2221,7 +2235,7 @@ pub(super) async fn build_download_outcome(
             state_write_failures,
             enumeration_errors,
             elapsed_secs: started.elapsed().as_secs_f64(),
-            interrupted: shutdown_token.is_cancelled() || streaming_result.url_expired_abort,
+            interrupted: shutdown_token.is_cancelled(),
             ..super::SyncStats::default()
         };
         mark_producer_enumeration_incomplete(&mut stats, enumeration_incomplete);
@@ -2289,7 +2303,7 @@ pub(super) async fn build_download_outcome(
             sync_token_blocked: false,
             sync_token_blocked_reason: None,
             elapsed_secs: started.elapsed().as_secs_f64(),
-            interrupted: true,
+            interrupted: shutdown_token.is_cancelled(),
             rate_limited: streaming_result.rate_limit_observations,
             photos_downloaded: streaming_result.photos_downloaded,
             videos_downloaded: streaming_result.videos_downloaded,
@@ -2470,7 +2484,7 @@ pub(super) async fn build_download_outcome(
         sync_token_blocked: false,
         sync_token_blocked_reason: None,
         elapsed_secs: started.elapsed().as_secs_f64(),
-        interrupted: shutdown_token.is_cancelled() || pass_result.url_expired_abort,
+        interrupted: shutdown_token.is_cancelled(),
         rate_limited: streaming_result.rate_limit_observations
             + pass_result.rate_limit_observations,
         photos_downloaded: streaming_result.photos_downloaded + pass_result.photos_downloaded,
@@ -6570,7 +6584,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_url_abort_returns_interrupted_partial_failure() {
+    async fn expired_url_abort_returns_durable_partial_failure() {
         use crate::download::DownloadOutcome;
 
         let streaming_result = StreamingResult {
@@ -6583,12 +6597,12 @@ mod tests {
                 .await;
         assert!(
             matches!(outcome, DownloadOutcome::PartialFailure { failed_count: 1 }),
-            "expired CDN URL must stop the batch as an interrupted PartialFailure, got {outcome:?}"
+            "expired CDN URL must stop the batch as a PartialFailure, got {outcome:?}"
         );
         assert_eq!(stats.downloaded, 1);
         assert!(
-            stats.interrupted,
-            "expired URL aborts must not look like clean syncs"
+            !stats.interrupted,
+            "a durable transfer abort is not a process interruption"
         );
     }
 
@@ -6609,10 +6623,7 @@ mod tests {
             "expired CDN URL before any success must not be reported as a clean no-op, got {outcome:?}"
         );
         assert_eq!(stats.downloaded, 0);
-        assert!(
-            stats.interrupted,
-            "expired URL aborts must be visible as interrupted even with zero downloads"
-        );
+        assert!(!stats.interrupted);
     }
 
     #[tokio::test]
