@@ -793,7 +793,7 @@ fn sync_set_exif_datetime_embeds_date() {
         assert!(!jpeg_files.is_empty(), "should have at least one JPEG file");
 
         // Read XMP from the first JPEG and verify DateTimeOriginal is present
-        use xmp_toolkit::{xmp_ns, OpenFileOptions, XmpFile};
+        use xmp_toolkit::{OpenFileOptions, XmpFile, xmp_ns};
         let mut file = XmpFile::new().expect("xmp file handle");
         file.open_file(jpeg_files[0], OpenFileOptions::default().for_read())
             .expect("open JPEG for XMP read");
@@ -1100,10 +1100,9 @@ fn first_jpeg(dir: &&std::path::Path) -> std::path::PathBuf {
 #[test]
 #[ignore]
 fn sync_raw_policy_controls_raw_naming() {
-    let (username, password, cookie_dir) = common::require_preauth();
-
     common::with_auth_retry(|| {
         for variant in ["as-is", "prefer-raw", "prefer-jpeg"] {
+            let (username, password, cookie_dir) = common::require_preauth();
             let dir = tempdir().expect("tempdir");
             album_cmd_with_toml(
                 &username,
@@ -1137,10 +1136,9 @@ fn sync_raw_policy_controls_raw_naming() {
 #[test]
 #[ignore]
 fn sync_live_photo_mov_policy_controls_naming() {
-    let (username, password, cookie_dir) = common::require_preauth();
-
     common::with_auth_retry(|| {
         for policy in ["suffix", "original"] {
+            let (username, password, cookie_dir) = common::require_preauth();
             let dir = tempdir().expect("tempdir");
             album_cmd_with_toml(
                 &username,

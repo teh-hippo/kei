@@ -1015,8 +1015,7 @@ fn roundtrip_skip_videos_sync_skips_imported_photos() {
         // import-existing doesn't expose media selection as a flag. Use TOML
         // to force it.
         let test_data = tempdir().unwrap();
-        let media_filter_toml =
-            "[filters]\nalbums = [\"none\"]\nunfiled = true\nmedia = [\"photos\", \"live-photos\"]\n";
+        let media_filter_toml = "[filters]\nalbums = [\"none\"]\nunfiled = true\nmedia = [\"photos\", \"live-photos\"]\n";
         let toml_path = write_kei_toml(test_data.path(), download_dir, media_filter_toml);
 
         let recent = ROUNDTRIP_RECENT.to_string();
@@ -1192,10 +1191,14 @@ fn default_used_when_no_toml_no_cli_flag() {
             .success()
             .get_output()
             .clone();
-        let summary = parse_summary(&String::from_utf8_lossy(&out.stdout));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let summary = parse_summary(&stdout);
         assert!(
             summary.matched > 0,
-            "no-toml/no-flag default did not match the fixture: {summary:?}"
+            "no-toml/no-flag default did not match the fixture: {summary:?}\n\
+             stdout:\n{stdout}\n\
+             stderr:\n{stderr}"
         );
     });
 }
