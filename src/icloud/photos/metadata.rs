@@ -261,7 +261,7 @@ mod tests {
     fn extract_location_from_plist() {
         let mut dict = plist::Dictionary::new();
         dict.insert("lat".into(), PlistValue::Real(10.0));
-        dict.insert("lng".into(), PlistValue::Real(-20.0));
+        dict.insert("lon".into(), PlistValue::Real(-20.0));
         dict.insert("alt".into(), PlistValue::Real(5.0));
         let bp = bplist(PlistValue::Dictionary(dict));
         let m = extract(

@@ -97,8 +97,8 @@ pub struct Location {
 
 /// Decode `locationEnc` or `locationV2Enc` fields.
 ///
-/// Both contain a binary plist dict with `lat: f64`, `lng: f64`, `alt: f64`
-/// keys. Returns `None` if decoding fails or lat/lng are absent.
+/// Both contain a binary plist dict with `lat: f64`, `lon: f64`, `alt: f64`
+/// keys. Returns `None` if decoding fails or lat/lon are absent.
 pub fn decode_location(fields: &Value, key: &str) -> Option<Location> {
     let entry = fields.get(key)?;
     if entry.is_null() {
@@ -108,7 +108,7 @@ pub fn decode_location(fields: &Value, key: &str) -> Option<Location> {
     let value = PlistValue::from_reader(Cursor::new(&bytes)).ok()?;
     let dict = value.into_dictionary()?;
     let latitude = dict.get("lat").and_then(plist_to_f64)?;
-    let longitude = dict.get("lng").and_then(plist_to_f64)?;
+    let longitude = dict.get("lon").and_then(plist_to_f64)?;
     let altitude = dict.get("alt").and_then(plist_to_f64);
     Some(Location {
         latitude,
@@ -239,7 +239,7 @@ mod tests {
     fn decode_location_roundtrip_with_altitude() {
         let mut dict = plist::Dictionary::new();
         dict.insert("lat".into(), PlistValue::Real(37.7749));
-        dict.insert("lng".into(), PlistValue::Real(-122.4194));
+        dict.insert("lon".into(), PlistValue::Real(-122.4194));
         dict.insert("alt".into(), PlistValue::Real(17.0));
         let bplist = bplist_from(PlistValue::Dictionary(dict));
         let fields = json!({
@@ -255,7 +255,7 @@ mod tests {
     fn decode_location_without_altitude() {
         let mut dict = plist::Dictionary::new();
         dict.insert("lat".into(), PlistValue::Real(1.0));
-        dict.insert("lng".into(), PlistValue::Real(2.0));
+        dict.insert("lon".into(), PlistValue::Real(2.0));
         let bplist = bplist_from(PlistValue::Dictionary(dict));
         let fields = json!({
             "locationEnc": {"value": b64(&bplist), "type": "ENCRYPTED_BYTES"}
@@ -272,7 +272,7 @@ mod tests {
     #[test]
     fn decode_location_missing_lat_returns_none() {
         let mut dict = plist::Dictionary::new();
-        dict.insert("lng".into(), PlistValue::Real(2.0));
+        dict.insert("lon".into(), PlistValue::Real(2.0));
         let bplist = bplist_from(PlistValue::Dictionary(dict));
         let fields = json!({
             "locationEnc": {"value": b64(&bplist), "type": "ENCRYPTED_BYTES"}
@@ -285,11 +285,11 @@ mod tests {
         // Build v1 with bad coords, v2 with good coords — fallback must pick v2.
         let mut d1 = plist::Dictionary::new();
         d1.insert("lat".into(), PlistValue::Real(1.0));
-        d1.insert("lng".into(), PlistValue::Real(1.0));
+        d1.insert("lon".into(), PlistValue::Real(1.0));
         let bp1 = bplist_from(PlistValue::Dictionary(d1));
         let mut d2 = plist::Dictionary::new();
         d2.insert("lat".into(), PlistValue::Real(42.0));
-        d2.insert("lng".into(), PlistValue::Real(-7.0));
+        d2.insert("lon".into(), PlistValue::Real(-7.0));
         let bp2 = bplist_from(PlistValue::Dictionary(d2));
         let fields = json!({
             "locationEnc": {"value": b64(&bp1), "type": "ENCRYPTED_BYTES"},

@@ -8556,7 +8556,7 @@ mod tests {
 
         let mut loc_dict = plist::Dictionary::new();
         loc_dict.insert("lat".into(), plist::Value::Real(37.7749));
-        loc_dict.insert("lng".into(), plist::Value::Real(-122.4194));
+        loc_dict.insert("lon".into(), plist::Value::Real(-122.4194));
         loc_dict.insert("alt".into(), plist::Value::Real(17.0));
         let loc_bp = bplist(plist::Value::Dictionary(loc_dict));
 
