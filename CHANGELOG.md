@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Bounded and fallback full syncs now run targeted pending-asset revalidation after source enumeration, so provider-confirmed deletions clear stale pending rows without requiring an incremental checkpoint. ([#663])
+- Metadata-only iCloud edits (favourite, rating, keywords, caption, GPS) now refresh the downloaded catalogue and queue any enabled sidecar or EXIF rewrite when the media bytes are unchanged, across full and incremental syncs, instead of being skipped. ([#674])
+
+[#674]: https://github.com/rhoopr/kei/issues/674
 
 ## [0.22.12] - 2026-07-13
 

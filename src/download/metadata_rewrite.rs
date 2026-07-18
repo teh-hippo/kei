@@ -12,10 +12,9 @@ use chrono::{DateTime, Local};
 use tokio_util::sync::CancellationToken;
 
 use crate::download::filter::MetadataPayload;
-use crate::icloud::photos::PhotoAsset;
-use crate::state::{MetadataRewriteStore, VersionSizeKey};
+use crate::state::MetadataRewriteStore;
 
-use super::{DownloadConfig, DownloadContext};
+use super::DownloadConfig;
 
 bitflags::bitflags! {
     /// Per-tag write toggles. `any_embed()` drives the `.part`-and-modify-before-rename
@@ -282,49 +281,6 @@ fn plan_metadata_write(
     }
 
     write
-}
-
-/// Persist a metadata-rewrite marker for each candidate version whose
-/// metadata drifted from the stored hash, or that already carries a marker
-/// from a prior sync. No-op when metadata writing is off or the state DB
-/// is absent.
-pub(super) async fn tag_if_needed<D>(
-    state_db: Option<&D>,
-    config: &DownloadConfig,
-    asset: &PhotoAsset,
-    candidates: &[(VersionSizeKey, &str)],
-    ctx: &DownloadContext,
-) where
-    D: MetadataRewriteStore + ?Sized,
-{
-    if !MetadataFlags::from(config).has_any_write() {
-        return;
-    }
-    let Some(db) = state_db else {
-        return;
-    };
-    let new_hash = asset.metadata().metadata_hash.as_deref();
-    let library = asset.source_zone().unwrap_or(config.library.as_ref());
-    for &(vs, _) in candidates {
-        if !ctx.needs_metadata_rewrite(library, asset.state_id(), vs, new_hash) {
-            continue;
-        }
-        tracing::info!(
-            asset_id = %asset.id(),
-            version_size = vs.as_str(),
-            "Metadata-only change detected; tagging for rewrite"
-        );
-        if let Err(e) = db
-            .record_metadata_write_failure(library, asset.state_id(), vs.as_str())
-            .await
-        {
-            tracing::warn!(
-                asset_id = %asset.id(),
-                error = %e,
-                "Failed to set metadata rewrite marker"
-            );
-        }
-    }
 }
 
 /// Maximum assets processed per metadata-rewrite invocation. Bounds worst-case

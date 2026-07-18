@@ -22,8 +22,8 @@ pub(crate) use limiter::BandwidthLimiter;
 
 use pipeline::{
     AUTH_ERROR_THRESHOLD, MetadataFlags, PassConfig, PassResult, StreamRuntime, StreamingResult,
-    build_download_outcome, format_duration, log_sync_summary, run_download_pass,
-    stream_and_download_from_stream,
+    build_download_outcome, format_duration, log_sync_summary, refresh_downloaded_metadata_on_skip,
+    run_download_pass, stream_and_download_from_stream,
 };
 
 pub(crate) use filter::AssetGroupings;
@@ -6638,6 +6638,14 @@ async fn download_photos_incremental_collecting_inner(
     let phase_started = Instant::now();
     let pass_configs = build_pass_configs(passes, config);
     let mut retry_sources: FxHashMap<RetryTaskKey, UrlRetrySource> = FxHashMap::default();
+    // Metadata-only edits leave the bytes unchanged, so the planner emits no
+    // task. Preload download state once so those skips can still refresh the
+    // catalogue and queue sidecar rewrites.
+    let skip_ctx = if controls.run_mode.downloads_files() {
+        Some(preload_download_context(config).await)
+    } else {
+        None
+    };
 
     for (asset, pass_index) in &downloadable_assets {
         #[allow(
@@ -6709,6 +6717,15 @@ async fn download_photos_incremental_collecting_inner(
 
         if plan.tasks.is_empty() {
             skip_breakdown.on_disk += 1;
+            if let Some(ctx) = &skip_ctx {
+                refresh_downloaded_metadata_on_skip(
+                    config.state_db.as_deref(),
+                    effective_config,
+                    asset,
+                    ctx,
+                )
+                .await;
+            }
         }
         tasks.extend(plan.tasks);
     }

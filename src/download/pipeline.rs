@@ -686,47 +686,61 @@ async fn record_seen_for_forwarded_task(
     result
 }
 
-async fn backfill_downloaded_metadata_for_on_disk_skip(
+/// Reconcile the catalogue for an already-downloaded asset whose bytes are
+/// unchanged. When the source metadata has drifted from the stored hash (or the
+/// hash is missing), rewrite the stored metadata via `upsert_seen` and, if a
+/// metadata writer is enabled, mark the version so the sidecar/EXIF rewrite
+/// runs. The marker is set before the catalogue write so a crash between the two
+/// leaves the drift detectable on the next sync.
+pub(super) async fn refresh_downloaded_metadata_on_skip(
     state_db: Option<&dyn DownloadStore>,
     config: &DownloadConfig,
     asset: &PhotoAsset,
     ctx: &DownloadContext,
 ) {
-    if !ctx.has_downloaded_without_metadata_hash() {
-        return;
-    }
     let Some(db) = state_db else {
         return;
     };
     let library = effective_asset_library(asset, config);
-    let downloaded_versions = ctx
+    let Some(downloaded_versions) = ctx
         .downloaded_ids
         .get(library)
-        .and_then(|assets| assets.get(asset.state_id()));
-    let Some(downloaded_versions) = downloaded_versions else {
+        .and_then(|assets| assets.get(asset.state_id()))
+    else {
         return;
     };
-    let version_hashes = ctx
-        .downloaded_metadata_hashes
-        .get(library)
-        .and_then(|assets| assets.get(asset.state_id()));
+    let new_hash = asset.metadata().metadata_hash.as_deref();
+    let queue_rewrite = MetadataFlags::from(config).has_any_write();
 
     for derived in derive_expected_paths(asset, config) {
-        let version_size = derived.version_size.as_str();
-        let has_metadata_hash =
-            version_hashes.is_some_and(|hashes| hashes.contains_key(version_size));
-        if !downloaded_versions.contains(version_size) || has_metadata_hash {
+        let version_size = derived.version_size;
+        let vs = version_size.as_str();
+        if !downloaded_versions.contains(vs)
+            || !ctx.needs_metadata_rewrite(library, asset.state_id(), version_size, new_hash)
+        {
             continue;
         }
 
-        let record = asset_record_for_derived_path(Arc::from(library), asset, &derived);
+        if queue_rewrite
+            && let Err(e) = db
+                .record_metadata_write_failure(library, asset.state_id(), vs)
+                .await
+        {
+            tracing::warn!(
+                asset_id = %asset.id(),
+                version_size = vs,
+                error = %e,
+                "Failed to mark metadata rewrite for skipped downloaded asset"
+            );
+        }
 
+        let record = asset_record_for_derived_path(Arc::from(library), asset, &derived);
         if let Err(e) = db.upsert_seen(&record).await {
             tracing::warn!(
                 asset_id = %asset.id(),
-                version_size,
+                version_size = vs,
                 error = %e,
-                "Failed to backfill metadata for skipped downloaded asset"
+                "Failed to refresh metadata for skipped downloaded asset"
             );
         }
     }
@@ -1352,15 +1366,6 @@ where
                         // interrupted sync is adopted when the matching file
                         // is already on disk; if adoption fails, the touched
                         // flush still lets stuck-pipeline recovery promote it.
-                        let candidates = extract_skip_candidates(&asset, config.as_ref());
-                        metadata_rewrite::tag_if_needed(
-                            producer_state_db.as_deref(),
-                            config,
-                            &asset,
-                            &candidates,
-                            &download_ctx,
-                        )
-                        .await;
                         let adoption = adopt_pending_on_disk_skip(
                             producer_state_db.as_deref(),
                             config,
@@ -1375,7 +1380,7 @@ where
                                 std::sync::atomic::Ordering::Relaxed,
                             );
                         }
-                        backfill_downloaded_metadata_for_on_disk_skip(
+                        refresh_downloaded_metadata_on_skip(
                             producer_state_db.as_deref(),
                             config,
                             &asset,
@@ -1540,7 +1545,7 @@ where
                                                 path = %existing_path.display(),
                                                 "Skipping (state path exists on disk)"
                                             );
-                                            backfill_downloaded_metadata_for_on_disk_skip(
+                                            refresh_downloaded_metadata_on_skip(
                                                 producer_state_db.as_deref(),
                                                 config,
                                                 &asset,
@@ -6731,6 +6736,61 @@ mod tests {
         assert!(
             child.is_cancelled(),
             "child must reflect parent cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_downloaded_metadata_on_skip_reconciles_drifted_catalogue() {
+        use crate::state::SqliteStateDb;
+        use crate::state::types::AssetMetadata;
+        use crate::test_helpers::{TestAssetRecord, TestPhotoAsset};
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let record = TestAssetRecord::new("SKIP_1")
+            .checksum("ck")
+            .metadata(AssetMetadata {
+                is_favorite: true,
+                ..Default::default()
+            })
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "SKIP_1",
+            "original",
+            std::path::Path::new("/photos/a.jpg"),
+            "local",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut config = DownloadConfig::test_default();
+        config.set_exif_rating = true;
+        config.state_db = Some(db.clone());
+        let ctx = preload_download_context(&config).await;
+
+        // Same bytes, but the source no longer marks it a favourite.
+        let asset = TestPhotoAsset::new("SKIP_1").orig_checksum("ck").build();
+        refresh_downloaded_metadata_on_skip(config.state_db.as_deref(), &config, &asset, &ctx)
+            .await;
+
+        let (is_favorite, marker): (i64, Option<i64>) = {
+            let conn = db.acquire_lock("verify skip refresh").unwrap();
+            conn.query_row(
+                "SELECT is_favorite, metadata_write_failed_at FROM assets WHERE id = 'SKIP_1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            is_favorite, 0,
+            "the skip path must refresh the stale catalogue row from the source"
+        );
+        assert!(
+            marker.is_some(),
+            "an enabled metadata writer must queue the sidecar rewrite"
         );
     }
 }
