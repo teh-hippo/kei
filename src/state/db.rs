@@ -3344,12 +3344,31 @@ impl SqliteStateDb {
             let exists: i64 = conn
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM assets WHERE status = 'downloaded' \
-                     AND metadata_hash IS NULL)",
+                     AND is_deleted = 0 AND metadata_hash IS NULL)",
                     [],
                     |row| row.get(0),
                 )
                 .map_err(|e| StateError::query("has_downloaded_without_metadata_hash", e))?;
             Ok(exists != 0)
+        })
+        .await
+    }
+
+    /// Clear the stored `metadata_hash` for every live downloaded asset so the
+    /// next sync re-arms the metadata-backfill full enumeration. Soft-deleted
+    /// rows are skipped: never re-enumerated, they would otherwise be stranded
+    /// forcing full enumeration forever. Returns the number of rows cleared.
+    pub(crate) async fn invalidate_downloaded_metadata_hashes(&self) -> Result<usize, StateError> {
+        self.with_conn("invalidate_downloaded_metadata_hashes", move |conn| {
+            let changed = conn
+                .execute(
+                    "UPDATE assets SET metadata_hash = NULL \
+                     WHERE status = 'downloaded' AND is_deleted = 0 \
+                     AND metadata_hash IS NOT NULL",
+                    [],
+                )
+                .map_err(|e| StateError::query("invalidate_downloaded_metadata_hashes", e))?;
+            Ok(changed)
         })
         .await
     }
@@ -8524,6 +8543,94 @@ mod tests {
                 .unwrap();
         }
         assert!(db.has_downloaded_without_metadata_hash().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn has_downloaded_without_metadata_hash_skips_soft_deleted() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+        let rec = TestAssetRecord::new("D1").build();
+        db.upsert_seen(&rec).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "D1",
+            "original",
+            Path::new("/a.jpg"),
+            "h",
+            None,
+        )
+        .await
+        .unwrap();
+        {
+            let conn = db.acquire_lock("test").unwrap();
+            conn.execute("UPDATE assets SET metadata_hash = NULL WHERE id = 'D1'", [])
+                .unwrap();
+        }
+        db.mark_soft_deleted("PrimarySync", "D1", None)
+            .await
+            .unwrap();
+        // A soft-deleted row is never re-enumerated, so its NULL hash must not drive full enumeration.
+        assert!(!db.has_downloaded_without_metadata_hash().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn invalidate_downloaded_metadata_hashes_clears_only_downloaded_hashes() {
+        let db = SqliteStateDb::open_in_memory().unwrap();
+
+        // A downloaded row carrying a stale hash from an older decoder.
+        let downloaded = TestAssetRecord::new("D1").build();
+        db.upsert_seen(&downloaded).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "D1",
+            "original",
+            Path::new("/d1.jpg"),
+            "c1",
+            None,
+        )
+        .await
+        .unwrap();
+        db.update_metadata_hash("PrimarySync", "D1", "original", "stale-hash")
+            .await
+            .unwrap();
+
+        // A soft-deleted row must keep its hash: never re-enumerated, clearing it would strand it forever.
+        let deleted = TestAssetRecord::new("DEL").build();
+        db.upsert_seen(&deleted).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "DEL",
+            "original",
+            Path::new("/del.jpg"),
+            "c2",
+            None,
+        )
+        .await
+        .unwrap();
+        db.update_metadata_hash("PrimarySync", "DEL", "original", "del-hash")
+            .await
+            .unwrap();
+        db.mark_soft_deleted("PrimarySync", "DEL", None)
+            .await
+            .unwrap();
+
+        // A pending row must be left alone.
+        let pending = TestAssetRecord::new("P1").build();
+        db.upsert_seen(&pending).await.unwrap();
+
+        assert!(!db.has_downloaded_without_metadata_hash().await.unwrap());
+
+        let cleared = db.invalidate_downloaded_metadata_hashes().await.unwrap();
+        assert_eq!(
+            cleared, 1,
+            "only the live downloaded row's hash is cleared (deleted/pending untouched)"
+        );
+        assert!(
+            db.has_downloaded_without_metadata_hash().await.unwrap(),
+            "clearing the hash re-arms the metadata-backfill full enumeration"
+        );
+
+        // Idempotent: nothing left to clear on a second pass.
+        assert_eq!(db.invalidate_downloaded_metadata_hashes().await.unwrap(), 0);
     }
 
     #[test]

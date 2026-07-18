@@ -799,6 +799,21 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                     }
                 }
 
+                // --refresh-metadata: clear stored hashes so this sync re-arms the metadata-backfill full enumeration.
+                if config.runtime.refresh_metadata {
+                    match db.invalidate_downloaded_metadata_hashes().await {
+                        Ok(count) => tracing::info!(
+                            count,
+                            "Refresh metadata: cleared stored metadata hashes to re-apply \
+                             corrected metadata to downloaded assets without re-downloading"
+                        ),
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "Failed to clear metadata hashes for --refresh-metadata"
+                        ),
+                    }
+                }
+
                 Some(db as Arc<dyn download::DownloadStore>)
             }
             Err(e) => {
@@ -873,14 +888,7 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
             media: config.filters.media,
             skip_created_before,
             skip_created_after,
-            set_exif_datetime: config.metadata.set_exif_datetime,
-            set_exif_rating: config.metadata.set_exif_rating,
-            set_exif_gps: config.metadata.set_exif_gps,
-            set_exif_description: config.metadata.set_exif_description,
-            #[cfg(feature = "xmp")]
-            embed_xmp: config.metadata.embed_xmp,
-            #[cfg(feature = "xmp")]
-            xmp_sidecar: config.metadata.xmp_sidecar,
+            metadata: config.metadata,
             concurrent_downloads: config.download.threads_num as usize,
             recent: config.filters.recent,
             recent_scope: config.filters.recent_scope,
@@ -1148,6 +1156,18 @@ pub(crate) async fn run_sync(globals: &config::GlobalArgs, args: SyncArgs) -> an
                 &shutdown_token,
             )
             .await?;
+            // Drain every tagged rewrite now so the one-off --refresh-metadata migration finishes in this run.
+            if config.runtime.refresh_metadata
+                && let Some(db) = state_db.as_deref()
+            {
+                download::drain_pending_metadata_rewrites(
+                    db,
+                    &config.metadata,
+                    Arc::clone(&cfg_temp_suffix),
+                    &shutdown_token,
+                )
+                .await;
+            }
             if let Some(db) = state_db.as_deref() {
                 let stats = state::SyncRunStats {
                     assets_seen: cycle_result.stats.assets_seen,

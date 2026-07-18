@@ -141,6 +141,15 @@ kei import-existing
 kei sync
 ```
 
+### Refresh metadata after a fix
+
+If a kei upgrade fixes a metadata decode or capture bug, re-apply the corrected
+metadata to media you already downloaded, without downloading it again:
+
+```sh
+kei sync --refresh-metadata
+```
+
 Coming from `icloudpd`? Read [Migrating from icloudpd](docs/migration-from-icloudpd.md).
 
 ## Docs

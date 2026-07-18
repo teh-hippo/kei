@@ -361,14 +361,16 @@ pub struct UiConfig {
     pub friendly_request: Option<bool>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct MetadataConfig {
     pub set_exif_datetime: bool,
     pub set_exif_rating: bool,
     pub set_exif_gps: bool,
     pub set_exif_description: bool,
+    /// Embed the full XMP packet into the file bytes on supported formats.
     #[cfg(feature = "xmp")]
     pub embed_xmp: bool,
+    /// Write a `.xmp` sidecar file next to each downloaded media file.
     #[cfg(feature = "xmp")]
     pub xmp_sidecar: bool,
 }
@@ -382,6 +384,7 @@ pub struct ImportConfig {
 pub struct RuntimeConfig {
     pub dry_run: bool,
     pub only_print_filenames: bool,
+    pub refresh_metadata: bool,
 }
 
 /// Load a TOML config file. Returns `Ok(None)` if the file doesn't exist
@@ -1567,6 +1570,7 @@ impl Config {
             runtime: RuntimeConfig {
                 dry_run: sync.dry_run,
                 only_print_filenames: sync.only_print_filenames,
+                refresh_metadata: sync.refresh_metadata,
             },
         })
     }
@@ -4072,6 +4076,7 @@ mod tests {
         // Misc
         assert!(!cfg.runtime.dry_run);
         assert!(!cfg.runtime.only_print_filenames);
+        assert!(!cfg.runtime.refresh_metadata);
         // Notifications
         assert!(cfg.notifications.script.is_none());
     }

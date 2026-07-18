@@ -1607,6 +1607,16 @@ where
                                                 path = %existing_path.display(),
                                                 "Skipping (state path exists on disk)"
                                             );
+                                            let candidates =
+                                                extract_skip_candidates(&asset, config.as_ref());
+                                            metadata_rewrite::tag_if_needed(
+                                                producer_state_db.as_deref(),
+                                                config,
+                                                &asset,
+                                                &candidates,
+                                                &download_ctx,
+                                            )
+                                            .await;
                                             backfill_downloaded_metadata_for_on_disk_skip(
                                                 producer_state_db.as_deref(),
                                                 config,
@@ -2152,6 +2162,7 @@ async fn finalize_streaming_download(
                 metadata_flags,
                 Arc::clone(&config.temp_suffix),
                 &pipeline_shutdown,
+                false,
             )
             .await;
         }
@@ -4875,14 +4886,7 @@ mod tests {
             media: crate::config::MediaSelection::all(),
             skip_created_before: None,
             skip_created_after: None,
-            set_exif_datetime: false,
-            set_exif_rating: false,
-            set_exif_gps: false,
-            set_exif_description: false,
-            #[cfg(feature = "xmp")]
-            embed_xmp: false,
-            #[cfg(feature = "xmp")]
-            xmp_sidecar: false,
+            metadata: crate::config::MetadataConfig::default(),
             concurrent_downloads: 10,
             recent: None,
             recent_scope: crate::cli::RecentScope::Global,
@@ -4963,14 +4967,7 @@ mod tests {
             media: crate::config::MediaSelection::all(),
             skip_created_before: None,
             skip_created_after: None,
-            set_exif_datetime: false,
-            set_exif_rating: false,
-            set_exif_gps: false,
-            set_exif_description: false,
-            #[cfg(feature = "xmp")]
-            embed_xmp: false,
-            #[cfg(feature = "xmp")]
-            xmp_sidecar: false,
+            metadata: crate::config::MetadataConfig::default(),
             concurrent_downloads: 1,
             recent: None,
             recent_scope: crate::cli::RecentScope::Global,
@@ -5531,6 +5528,93 @@ mod tests {
         assert!(
             !db.has_downloaded_without_metadata_hash().await.unwrap(),
             "on-disk skip must backfill metadata_hash for existing downloaded rows"
+        );
+    }
+
+    /// An on-disk-skipped asset whose stored hash was cleared must be tagged for rewrite, not just catalogue-backfilled.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn on_disk_skip_tags_metadata_rewrite_after_hash_cleared() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::SqliteStateDb;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        fn existing_asset() -> PhotoAsset {
+            TestPhotoAsset::new("REWRITE")
+                .filename("rewrite.jpg")
+                .item_type("public.jpeg")
+                .orig_file_type("public.jpeg")
+                .orig_size(1234)
+                .orig_url("https://p01.icloud-content.com/rewrite.jpg")
+                .orig_checksum("ck_rewrite")
+                .build()
+        }
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = std::sync::Arc::from(dir.path());
+        config.state_db = Some(db.clone());
+        // Metadata writing must be on for the rewrite tagging to be active.
+        config.metadata.set_exif_datetime = true;
+        let config = Arc::new(config);
+
+        let asset = existing_asset();
+        let target_path = crate::download::filter::expected_paths_for(&asset, config.as_ref())
+            .first()
+            .expect("test asset must derive an expected path")
+            .path
+            .clone();
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&target_path, vec![0u8; 1234]).unwrap();
+
+        let record = crate::test_helpers::TestAssetRecord::new("REWRITE")
+            .checksum("ck_rewrite")
+            .filename("rewrite.jpg")
+            .size(1234)
+            .build();
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            "REWRITE",
+            "original",
+            &target_path,
+            "sha256",
+            None,
+        )
+        .await
+        .unwrap();
+        // Simulate the post-`--refresh-metadata` state: the stored hash is cleared.
+        db.clear_metadata_hash_for_test("PrimarySync", "REWRITE", "original");
+        assert!(db.has_downloaded_without_metadata_hash().await.unwrap());
+
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(existing_asset())]),
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .expect("sync must complete");
+
+        assert_eq!(
+            result.downloaded, 0,
+            "existing file should not be re-downloaded"
+        );
+        assert!(
+            logs_contain("Metadata-only change detected; tagging for rewrite"),
+            "on-disk skip must tag the asset for metadata rewrite after the stored hash is cleared"
+        );
+        assert!(
+            !db.has_downloaded_without_metadata_hash().await.unwrap(),
+            "the on-disk skip must also backfill the catalogue metadata_hash"
         );
     }
 

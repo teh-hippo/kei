@@ -56,15 +56,21 @@ impl MetadataFlags {
 
 impl From<&DownloadConfig> for MetadataFlags {
     fn from(config: &DownloadConfig) -> Self {
+        Self::from(&config.metadata)
+    }
+}
+
+impl From<&crate::config::MetadataConfig> for MetadataFlags {
+    fn from(metadata: &crate::config::MetadataConfig) -> Self {
         let mut flags = Self::empty();
-        flags.set(Self::DATETIME, config.set_exif_datetime);
-        flags.set(Self::RATING, config.set_exif_rating);
-        flags.set(Self::GPS, config.set_exif_gps);
-        flags.set(Self::DESCRIPTION, config.set_exif_description);
+        flags.set(Self::DATETIME, metadata.set_exif_datetime);
+        flags.set(Self::RATING, metadata.set_exif_rating);
+        flags.set(Self::GPS, metadata.set_exif_gps);
+        flags.set(Self::DESCRIPTION, metadata.set_exif_description);
         #[cfg(feature = "xmp")]
         {
-            flags.set(Self::EMBED_XMP, config.embed_xmp);
-            flags.set(Self::XMP_SIDECAR, config.xmp_sidecar);
+            flags.set(Self::EMBED_XMP, metadata.embed_xmp);
+            flags.set(Self::XMP_SIDECAR, metadata.xmp_sidecar);
         }
         flags
     }
@@ -341,14 +347,17 @@ pub(super) async fn run_pending<D>(
     metadata_flags: MetadataFlags,
     temp_suffix: Arc<str>,
     shutdown_token: &CancellationToken,
+    drain_all: bool,
 ) -> usize
 where
     D: MetadataRewriteStore + ?Sized,
 {
-    let pending = match db
-        .get_pending_metadata_rewrites(METADATA_REWRITE_BATCH)
-        .await
-    {
+    let batch_limit = if drain_all {
+        usize::MAX
+    } else {
+        METADATA_REWRITE_BATCH
+    };
+    let pending = match db.get_pending_metadata_rewrites(batch_limit).await {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(error = %e, "Failed to load pending metadata rewrites");
@@ -643,7 +652,7 @@ mod tests {
 
         let flags = MetadataFlags::RATING | MetadataFlags::EMBED_XMP;
         let token = CancellationToken::new();
-        run_pending(&db, flags, Arc::from(".meta-tmp"), &token).await;
+        run_pending(&db, flags, Arc::from(".meta-tmp"), &token, true).await;
 
         // Marker must be gone; row must still be `downloaded`.
         let remaining = db.get_pending_metadata_rewrites(32).await.unwrap();
@@ -724,7 +733,7 @@ mod tests {
 
         let flags = MetadataFlags::RATING | MetadataFlags::EMBED_XMP;
         let token = CancellationToken::new();
-        run_pending(&db, flags, Arc::from(".meta-tmp"), &token).await;
+        run_pending(&db, flags, Arc::from(".meta-tmp"), &token, false).await;
 
         let still_pending = db.get_pending_metadata_rewrites(32).await.unwrap();
         assert_eq!(
@@ -773,7 +782,7 @@ mod tests {
         let flags = MetadataFlags::RATING | MetadataFlags::EMBED_XMP;
         let token = CancellationToken::new();
         token.cancel();
-        let deferred = run_pending(&db, flags, Arc::from(".meta-tmp"), &token).await;
+        let deferred = run_pending(&db, flags, Arc::from(".meta-tmp"), &token, false).await;
 
         assert_eq!(
             deferred, 1,
