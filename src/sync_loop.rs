@@ -3441,6 +3441,20 @@ mod tests {
         )
     }
 
+    /// The `assetDate`/`addedDate` embedded by [`full_album_page_with_download`].
+    const RUN_CYCLE_ASSET_DATE_MS: i64 = 1_700_000_000_000;
+
+    /// The local-time `%Y/%m/%d` folder the pipeline derives for [`RUN_CYCLE_ASSET_DATE_MS`].
+    fn run_cycle_expected_date_dir() -> String {
+        use chrono::TimeZone;
+        chrono::Local
+            .timestamp_millis_opt(RUN_CYCLE_ASSET_DATE_MS)
+            .single()
+            .expect("valid asset timestamp")
+            .format("%Y/%m/%d")
+            .to_string()
+    }
+
     fn full_album_page_with_download(
         zone: &str,
         record_name: &str,
@@ -3479,8 +3493,8 @@ mod tests {
                             "value": {"recordName": record_name, "zoneID": {"zoneName": zone}},
                             "type": "REFERENCE"
                         },
-                        "assetDate": {"value": 1700000000000i64, "type": "TIMESTAMP"},
-                        "addedDate": {"value": 1700000000000i64, "type": "TIMESTAMP"}
+                        "assetDate": {"value": RUN_CYCLE_ASSET_DATE_MS, "type": "TIMESTAMP"},
+                        "addedDate": {"value": RUN_CYCLE_ASSET_DATE_MS, "type": "TIMESTAMP"}
                     },
                     "recordChangeTag": "ct-asset"
                 }
@@ -5961,7 +5975,7 @@ mod tests {
         .await
         .expect("run cycle");
 
-        let final_dir = download_dir.path().join("2023/11/14");
+        let final_dir = download_dir.path().join(run_cycle_expected_date_dir());
         let final_paths = std::fs::read_dir(&final_dir)
             .expect("final directory exists")
             .map(|entry| entry.expect("final file entry").path())
@@ -7019,7 +7033,11 @@ mod tests {
             "interrupted cycle must leave the old zone token in place for replay"
         );
         assert!(
-            !download_dir.path().join("2023/11/14/photo.jpg").exists(),
+            !download_dir
+                .path()
+                .join(run_cycle_expected_date_dir())
+                .join("photo.jpg")
+                .exists(),
             "test must not pass by completing the download before cancellation"
         );
     }
