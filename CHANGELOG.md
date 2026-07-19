@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A metadata-only iCloud edit (favourite, rating, keywords, caption, GPS) on an unchanged file now refreshes the catalogue on the on-disk skip path when the source metadata has drifted from the stored hash, not only when the hash is missing. The queued sidecar or EXIF rewrite then reads the corrected values instead of replaying stale ones. ([#674])
 - Already-downloaded assets are now tagged for metadata rewrite on the state-confirmed on-disk skip path, so corrected metadata reaches both the catalogue and the sidecar when an asset is revisited during a full enumeration. Previously that skip path refreshed the catalogue row but never re-applied the sidecar. ([#673])
 - Bounded and fallback full syncs now run targeted pending-asset revalidation after source enumeration, so provider-confirmed deletions clear stale pending rows without requiring an incremental checkpoint. ([#663])
 - Legacy pending rows with a live iCloud master now recover their missing asset identity and retry, so bounded syncs can finish old downloads without a wide photo enumeration. ([#663])
@@ -22,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Live pending assets excluded by the current filters now remain cataloged as policy-excluded without retrying or making backup status unsafe, and return to pending when a later sync selects them. ([#663])
 
 [#673]: https://github.com/rhoopr/kei/issues/673
+[#674]: https://github.com/rhoopr/kei/issues/674
 [#687]: https://github.com/rhoopr/kei/issues/687
 
 ## [0.22.12] - 2026-07-13
