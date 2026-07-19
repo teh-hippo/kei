@@ -753,19 +753,31 @@ async fn record_seen_for_forwarded_task(
     result
 }
 
+/// Refresh the stored catalogue for an already-downloaded asset whose bytes are
+/// unchanged but whose source metadata has drifted (a metadata-only edit) or
+/// was never hashed. Runs regardless of whether local metadata writers are
+/// enabled, since the catalogue is core state; `tag_if_needed` separately marks
+/// the file for sidecar/EXIF rewrite when a writer is on. Reuses `upsert_seen`,
+/// which rewrites the metadata columns and hash while preserving download state,
+/// so a queued rewrite reads the corrected catalogue rather than stale values.
 async fn backfill_downloaded_metadata_for_on_disk_skip(
     state_db: Option<&dyn DownloadStore>,
     config: &DownloadConfig,
     asset: &PhotoAsset,
+    candidates: &[(VersionSizeKey, &str)],
     ctx: &DownloadContext,
 ) {
-    if !ctx.has_downloaded_without_metadata_hash() {
-        return;
-    }
     let Some(db) = state_db else {
         return;
     };
     let library = effective_asset_library(asset, config);
+    let new_hash = asset.metadata().metadata_hash.as_deref();
+    if !candidates
+        .iter()
+        .any(|&(vs, _)| ctx.needs_metadata_rewrite(library, asset.state_id(), vs, new_hash))
+    {
+        return;
+    }
     let downloaded_versions = ctx
         .downloaded_ids
         .get(library)
@@ -773,16 +785,12 @@ async fn backfill_downloaded_metadata_for_on_disk_skip(
     let Some(downloaded_versions) = downloaded_versions else {
         return;
     };
-    let version_hashes = ctx
-        .downloaded_metadata_hashes
-        .get(library)
-        .and_then(|assets| assets.get(asset.state_id()));
 
     for derived in derive_expected_paths(asset, config) {
-        let version_size = derived.version_size.as_str();
-        let has_metadata_hash =
-            version_hashes.is_some_and(|hashes| hashes.contains_key(version_size));
-        if !downloaded_versions.contains(version_size) || has_metadata_hash {
+        let version_size = derived.version_size;
+        if !downloaded_versions.contains(version_size.as_str())
+            || !ctx.needs_metadata_rewrite(library, asset.state_id(), version_size, new_hash)
+        {
             continue;
         }
 
@@ -791,9 +799,9 @@ async fn backfill_downloaded_metadata_for_on_disk_skip(
         if let Err(e) = db.upsert_seen(&record).await {
             tracing::warn!(
                 asset_id = %asset.id(),
-                version_size,
+                version_size = version_size.as_str(),
                 error = %e,
-                "Failed to backfill metadata for skipped downloaded asset"
+                "Failed to refresh metadata for skipped downloaded asset"
             );
         }
     }
@@ -1446,6 +1454,7 @@ where
                             producer_state_db.as_deref(),
                             config,
                             &asset,
+                            &candidates,
                             &download_ctx,
                         )
                         .await;
@@ -1621,6 +1630,7 @@ where
                                                 producer_state_db.as_deref(),
                                                 config,
                                                 &asset,
+                                                &candidates,
                                                 &download_ctx,
                                             )
                                             .await;
@@ -5615,6 +5625,86 @@ mod tests {
         assert!(
             !db.has_downloaded_without_metadata_hash().await.unwrap(),
             "the on-disk skip must also backfill the catalogue metadata_hash"
+        );
+    }
+
+    /// #674 regression: a metadata-only edit drifts the source hash from the
+    /// stored hash. On the on-disk skip the catalogue must be refreshed to the
+    /// edited source metadata (not left stale) without re-downloading, so a
+    /// queued rewrite applies corrected values instead of replaying old ones.
+    #[tokio::test]
+    async fn on_disk_skip_refreshes_catalogue_on_metadata_drift() {
+        use crate::download::DownloadConfig;
+        use crate::icloud::photos::PhotoAsset;
+        use crate::state::SqliteStateDb;
+        use futures_util::stream;
+        use std::sync::Arc;
+
+        let db = Arc::new(SqliteStateDb::open_in_memory().unwrap());
+        let dir = TempDir::new().unwrap();
+        let mut config = DownloadConfig::test_default();
+        config.directory = Arc::from(dir.path());
+        config.metadata.set_exif_rating = true;
+        config.state_db = Some(db.clone());
+        let config = Arc::new(config);
+
+        // Downloaded while a favourite; the source has since dropped it.
+        let stored: PhotoAsset = TestPhotoAsset::new("DRIFT")
+            .filename("drift.jpg")
+            .orig_size(1000)
+            .orig_checksum("ck_drift")
+            .favorite(true)
+            .build();
+        let edited: PhotoAsset = TestPhotoAsset::new("DRIFT")
+            .filename("drift.jpg")
+            .orig_size(1000)
+            .orig_checksum("ck_drift")
+            .favorite(false)
+            .build();
+
+        let derived = derive_expected_paths(&stored, config.as_ref())
+            .into_iter()
+            .next()
+            .unwrap();
+        fs::create_dir_all(derived.path.parent().unwrap()).unwrap();
+        fs::write(&derived.path, vec![0u8; 1000]).unwrap();
+        let record = asset_record_for_derived_path(Arc::from("PrimarySync"), &stored, &derived);
+        db.upsert_seen(&record).await.unwrap();
+        db.mark_downloaded(
+            "PrimarySync",
+            stored.state_id(),
+            derived.version_size.as_str(),
+            &derived.path,
+            "local-checksum",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let result = stream_and_download_from_stream(
+            &reqwest::Client::new(),
+            stream::iter(vec![Ok::<PhotoAsset, anyhow::Error>(edited)]),
+            &config,
+            DownloadControls::download_hidden(),
+            1,
+            CancellationToken::new(),
+            StreamRuntime::new(None, None),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.downloaded, 0, "unchanged bytes must not re-download");
+        let refreshed = db.get_downloaded_page(0, 1).await.unwrap().remove(0);
+        assert!(
+            !refreshed.metadata.is_favorite,
+            "the on-disk skip must refresh the stale catalogue to the edited source metadata"
+        );
+        assert_eq!(
+            fs::read_dir(derived.path.parent().unwrap())
+                .unwrap()
+                .count(),
+            1,
+            "the refresh must not create a suffixed duplicate"
         );
     }
 
