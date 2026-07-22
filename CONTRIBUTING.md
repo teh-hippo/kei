@@ -5,8 +5,9 @@ Contributions are welcome. For anything beyond a small fix, open an issue first 
 ## Workflow
 
 1. Fork the repo and create a branch from `main`.
-2. Make your changes.
-3. Run the pre-push gate:
+2. Run `mise install` to install the project rust-analyzer version.
+3. Make your changes.
+4. Run the pre-push gate:
    ```sh
    just gate
    ```
@@ -32,7 +33,7 @@ Contributions are welcome. For anything beyond a small fix, open an issue first 
    typos
    bash scripts/check-roundtrip-gate.sh
    ```
-4. Open a pull request against `main`.
+5. Open a pull request against `main`.
 
 All changes go through PRs - no direct commits to `main`.
 
